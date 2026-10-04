@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/hearth-ai/hearth/governance/schemas/handover.schema.json",
+  "title": "Hearth generational handover manifest",
+  "description": "Emitted by an agent (or human) before its session ends ('generative death'). The successor is rehydrated from INVARIANTS.md + this manifest + the task DAG — never from a transcript.",
+  "type": "object",
+  "required": ["generation_id", "timestamp", "lifecycle_status", "trigger", "task_id", "workspace", "epistemic_ledger", "active_blockers", "unfulfilled_mandates"],
+  "additionalProperties": false,
+  "properties": {
+    "generation_id": {"type": "string", "pattern": "^gen-[0-9]{3,}-[a-z0-9-]+$"},
+    "parent_generation": {"type": ["string", "null"]},
+    "timestamp": {"type": "string", "format": "date-time"},
+    "lifecycle_status": {"enum": ["ORDERLY_APOPTOSIS", "TASK_COMPLETE", "FRICTION_ABORT", "CRASH_RECOVERY"]},
+    "trigger": {"enum": ["CONTEXT_THRESHOLD_REACHED", "MILESTONE_VERIFIED", "EPISTEMIC_FRICTION", "BUDGET_EXHAUSTED", "MANUAL"]},
+    "task_id": {"type": "string", "description": "Task id from governance/tasks.json"},
+    "workspace": {
+      "type": "object",
+      "required": ["branch", "base_commit", "head_commit"],
+      "additionalProperties": false,
+      "properties": {
+        "branch": {"type": "string"},
+        "base_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+        "head_commit": {"type": "string", "pattern": "^[0-9a-f]{7,40}$"},
+        "uncommitted_diff_stat": {"type": "string"}
+      }
+    },
+    "constraints_touched": {
+      "type": "array",
+      "description": "Invariant ids (governance/INVARIANTS.md) this work relies on or affects — copied verbatim, never paraphrased.",
+      "items": {"type": "string", "pattern": "^INV-[A-Z0-9-]+$"}
+    },
+    "epistemic_ledger": {
+      "type": "object",
+      "required": ["hypotheses_validated", "hypotheses_falsified"],
+      "additionalProperties": false,
+      "properties": {
+        "hypotheses_validated": {"type": "array", "items": {"$ref": "#/$defs/hypothesis"}},
+        "hypotheses_falsified": {"type": "array", "items": {"$ref": "#/$defs/hypothesis"}},
+        "open_questions": {"type": "array", "items": {"type": "string"}}
+      }
+    },
+    "procedures": {
+      "type": "array",
+      "description": "Exact commands that build/test/benchmark this work (behaviour-equivalence lane: keep runnable).",
+      "items": {"type": "string"}
+    },
+    "measurements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["metric", "value", "unit", "conditions"],
+        "properties": {
+          "metric": {"type": "string"}, "value": {"type": "number"}, "unit": {"type": "string"},
+          "conditions": {"type": "string"}, "kind": {"enum": ["measured", "simulated"]}
+        }
+      }
+    },
+    "active_blockers": {"type": "array", "items": {"type": "string"}},
+    "unfulfilled_mandates": {"type": "array", "items": {"type": "string"}}
+  },
+  "$defs": {
+    "hypothesis": {
+      "type": "object",
+      "required": ["claim", "evidence", "verdict"],
+      "additionalProperties": false,
+      "properties": {
+        "claim": {"type": "string"},
+        "evidence": {"type": "string"},
+        "verdict": {"enum": ["CONFIRMED", "REJECTED", "INCONCLUSIVE"]}
+      }
+    }
+  }
+}

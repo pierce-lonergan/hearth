@@ -1,0 +1,29 @@
+# Build products (prefer building outside the tree: scripts/build.ps1 / HEARTH_DATA)
+build/
+out/
+*.obj
+*.o
+*.exe
+*.dll
+*.so
+*.dylib
+*.pdb
+*.ilk
+*.exp
+*.lib
+python/hearth/lib/
+
+# Models and benchmark data never live in the repo (INV-DATA)
+*.hearth
+*.usage
+*.hrtr
+*.safetensors
+*.gguf
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+.venv/
