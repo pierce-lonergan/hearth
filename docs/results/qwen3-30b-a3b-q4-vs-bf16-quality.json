@@ -1,0 +1,22 @@
+{
+ "ref": {
+  "path": "C:/Users/Pierce Lonergan/hearth-data/qwen3-30b-a3b-bf16.hearth",
+  "ppl": 11.162168974751692,
+  "tokens": 4095,
+  "seconds": 106.70577049255371,
+  "prefill_tok_s": 38.37655621713319,
+  "gb_read": 195.44408064,
+  "hit_rate": 0.9906323750813802
+ },
+ "test": {
+  "path": "C:/Users/Pierce Lonergan/hearth-data/qwen3-30b-a3b-q4.hearth",
+  "ppl": 11.453605649516863,
+  "tokens": 4095,
+  "seconds": 54.052160024642944,
+  "prefill_tok_s": 75.7601546012786,
+  "gb_read": 14.15061504,
+  "hit_rate": 0.9972756703694662
+ },
+ "mean_kl_ref_test": 0.024666039273142815,
+ "top1_agree": 0.9323565323565324
+}
