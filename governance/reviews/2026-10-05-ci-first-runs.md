@@ -33,3 +33,17 @@ The workflows written in round 1 had never run on GitHub. Results on `main`:
    in hx_platform.h or make `platform_posix.c` return stable copies (bounded cache).
 3. `test_pool` takes 720–1000 s on 2–3 core CI runners (spin-calibration and 200k-dispatch
    stress); add a CI-sized mode.
+
+## Run 37385029923 (e0102aa, hardening round 2) — C tests fail on small CI runners
+
+All builds succeed; failures are test-environment assumptions that do not show on the
+32-thread development machine:
+
+* `engine/tests/test_model.c:2955` (gcc, clang, asan, msvc): "with the threshold at 0
+  regions get all 4 threads" assumes 4 CPUs; GitHub runners have 2–4 and the engine caps
+  threads at the logical CPU count. Fix: derive the expectation from `hx_num_cpus()` or
+  skip below 4.
+* `engine/tests/test_pool.c:1036` (msvc): stall-threshold timing assertion ("held 1150 us:
+  stall, not slow") — load/scheduler dependent; covered by R3-pool's move of timing
+  assertions behind an opt-in perf mode.
+* macos arm64: as above plus the open Darwin items.
