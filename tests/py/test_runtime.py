@@ -1149,6 +1149,7 @@ def test_read_metadata_agrees_with_container_reader(tmp_path):
 
 
 def test_chat_template_rendering():
+    pytest.importorskip("jinja2")
     tpl = ("{{ bos_token }}{% for m in messages %}{% if m['role'] == 'system' %}[S]{{ m['content'] }}"
            "{% elif m['role'] == 'user' %}[U]{{ m['content'] }}{% else %}[A]{% generation %}{{ m['content'] }}"
            "{% endgeneration %}{{ eos_token }}{% endif %}{% endfor %}"
@@ -2084,6 +2085,7 @@ def test_server_timeout_is_validated(tmp_path):
 
 
 def test_server_rejects_messages_it_cannot_render():
+    pytest.importorskip("jinja2")
     image = [{"role": "user", "content": [{"type": "image_url", "image_url": {"url": "x"}}]}]
     with running_server(server_engine()) as srv:
         for path, extra in (("/v1/chat/completions", {}), ("/v1/messages", {})):

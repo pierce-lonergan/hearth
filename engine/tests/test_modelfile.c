@@ -496,8 +496,9 @@ static void gen_tensors(model *m, int small) {
         int dt = (int)rndn(7), nd = 1 + (int)rndn(4);
         for (int k = 0; k < nd; k++) sh[k] = 1 + rndn(4);
         sh[nd - 1] = (dt == 3 || dt == 4) ? 64u << rndn(2) : 1 + rndn(9);
-        snprintf(name, sizeof name, chance(20) ? "x%d.%s" : "zz.extra.%d.%s", x,
-                 chance(50) ? "w" : "a_long_tensor_name_padded_out_to_exactly_seventy_nine_characters_xxxxxx");
+        if (snprintf(name, sizeof name, chance(20) ? "x%d.%s" : "zz.extra.%d.%s", x,
+                     chance(50) ? "w" : "a_long_tensor_name_padded_out_to_exactly_seventy_nine_characters_xxxxxx") < 0)
+            name[0] = 0;   /* over-long names are truncated on purpose; the writer stores at most 79 chars */
         name[HX_NAME_LEN - 1] = 0;
         add_tensor(m, name, dt, nd, sh);
     }
@@ -1257,7 +1258,7 @@ static void test_slab_layout(void) {
             CHECK(hx_slab_layout(dt, (int64_t)D, (int64_t)F, &g, &u, &d) == want && u == b && d == c,
                   "layout dtype %d D %llu F %llu", dt, (unsigned long long)D, (unsigned long long)F);
         }
-    hx_slab_view v;
+    hx_slab_view v = {0};
     hx_slab_view_make(NULL, &v, 0, &v);
     CHECK(v.gate == NULL, "hx_slab_view_make(NULL mf)");
 }

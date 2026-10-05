@@ -132,9 +132,14 @@ HX_INLINE void ld16(int dt, const void *w, int64_t i, __m256 *lo, __m256 *hi) {
 HX_INLINE __m128 w_one(int dt, const void *w, int64_t i) {   /* element i as f32 in lane 0, exact */
     if (dt == HEARTH_F32) return _mm_load_ss((const float *)w + i);
     {
-        int h = ((const uint16_t *)w)[i];
-        if (dt == HEARTH_F16) return _mm_cvtph_ps(_mm_cvtsi32_si128(h));
-        return _mm_castsi128_ps(_mm_cvtsi32_si128(h << 16));
+        const uint32_t h = ((const uint16_t *)w)[i];
+        if (dt == HEARTH_F16) return _mm_cvtph_ps(_mm_cvtsi32_si128((int)h));
+        {
+            const uint32_t bits = h << 16;   /* unsigned: shifting into bit 31 of an int is UB */
+            float f;
+            memcpy(&f, &bits, sizeof f);
+            return _mm_set_ss(f);
+        }
     }
 }
 

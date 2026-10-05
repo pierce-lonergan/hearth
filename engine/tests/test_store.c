@@ -259,7 +259,10 @@ static void make_spec(spec *s, const char *name, int L, int E, int D, int F, int
             s->alias[i] = t;
         }
     }
-    snprintf(s->path, sizeof s->path, "%s/%s%s", g_dir, g_tag, name);
+    if (snprintf(s->path, sizeof s->path, "%s/%s%s", g_dir, g_tag, name) >= (int)sizeof s->path) {
+        fprintf(stderr, "test_store: scratch path too long: %s\n", g_dir);
+        exit(2);
+    }
 }
 
 /* --------------------------------------------------------- store helpers */

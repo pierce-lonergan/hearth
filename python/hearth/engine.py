@@ -82,6 +82,7 @@ class HearthStats(Structure):
         ("read_s", c_double),
         ("evictions", c_uint64),
         ("cache_slots", c_int), ("cache_resident", c_int), ("cache_pinned", c_int),
+        ("read_errors", c_uint64),
     ]
 
 
