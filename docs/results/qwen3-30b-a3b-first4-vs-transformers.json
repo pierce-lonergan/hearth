@@ -1,0 +1,27 @@
+{
+ "f32": {
+  "max_abs_err": 1.33514404296875e-05,
+  "rel_err": 5.978337753731466e-07,
+  "top1_agree": 1.0,
+  "mean_kl": 2.2514074160540076e-08,
+  "routing_set_agree": 1.0,
+  "tokens": 96,
+  "batch_vs_sequential_bit_identical": true
+ },
+ "bf16": {
+  "max_abs_err": 1.33514404296875e-05,
+  "rel_err": 5.978337753731466e-07,
+  "top1_agree": 1.0,
+  "mean_kl": 2.2514074160540076e-08,
+  "routing_set_agree": 1.0,
+  "tokens": 96
+ },
+ "q4": {
+  "max_abs_err": 1.605250597000122,
+  "rel_err": 0.0718778669834137,
+  "top1_agree": 0.9166666666666666,
+  "mean_kl": 0.015565131790935993,
+  "routing_set_agree": 0.8723958333333334,
+  "tokens": 96
+ }
+}
