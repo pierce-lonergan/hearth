@@ -2,39 +2,352 @@
   "$comment": "Hearth roadmap as a task DAG. governance/tools/waves.py validates it and computes topological waves. Each task owns a disjoint set of paths; workers never edit outside them. status: todo | active | review | done | blocked.",
   "version": 1,
   "tasks": [
-    {"id": "T01-platform", "title": "Platform layer + persistent thread pool", "deps": [],
-     "owns": ["engine/src/platform_win.c", "engine/src/platform_posix.c", "engine/src/pool.c", "engine/tests/test_platform.c", "engine/tests/test_pool.c"],
-     "accept": ["hx_platform.h and hx_pool.h fully implemented", "direct I/O read verified", "pool dispatch overhead measured"], "status": "todo"},
-    {"id": "T02-kernels", "title": "Quantizers + scalar/AVX2/AVX-512 kernels, bit-identical", "deps": [],
-     "owns": ["engine/src/quant.c", "engine/src/quant_avx2.c", "engine/src/quant_avx512.c", "engine/tests/test_quant.c"],
-     "accept": ["INV-DET-3 at kernel level", "batched == single (INV-DET-2)", "GB/s per core reported"], "status": "todo"},
-    {"id": "T03-pymodel", "title": "Python format, quant, reference forward, synth, HF converter", "deps": [],
-     "owns": ["python/hearth/quant.py", "python/hearth/format.py", "python/hearth/reference.py", "python/hearth/synth.py", "python/hearth/convert.py", "python/hearth/_native.py", "tests/py/test_format.py", "tests/py/test_reference.py", "tests/py/test_convert.py"],
-     "accept": ["reference == transformers for 5 architectures (INV-NUM-1)", "writer/reader round trip", "FP8 block dequant"], "status": "todo"},
-    {"id": "T04-sim", "title": "Trace-driven cache / I/O / roofline simulator", "deps": [],
-     "owns": ["python/hearth/sim/", "tests/py/test_sim.py", "docs/SIMULATOR.md"],
-     "accept": ["policies LRU/LFU/pinned/Belady", "speculative union amortization", "calibrated against engine measurements"], "status": "todo"},
-    {"id": "T05-governance", "title": "Governance tooling: waves, handover validation, golden lock, mutation testing, CI", "deps": [],
-     "owns": ["governance/tools/", "governance/README.md", "CONTRIBUTING.md", ".github/workflows/"],
-     "accept": ["waves.py on this file", "check_golden.py", "mutate.py kills mutants in a demo"], "status": "todo"},
-    {"id": "T06-store", "title": "Model file reader + tiered expert store (async I/O, LFU, pinning, mirrors)", "deps": ["T01-platform"],
-     "owns": ["engine/src/modelfile.c", "engine/src/store.c", "engine/tests/test_modelfile.c", "engine/tests/test_store.c"],
-     "accept": ["INV-FMT fuzz", "store never deadlocks at minimum slots", "measured NVMe GB/s"], "status": "todo"},
-    {"id": "T07-runtime", "title": "Python runtime: native loader, Engine, generation, spec decoding, chat, server, CLI", "deps": [],
-     "owns": ["python/hearth/__init__.py", "python/hearth/__main__.py", "python/hearth/engine.py", "python/hearth/generate.py", "python/hearth/chat.py", "python/hearth/server.py", "python/hearth/cli.py", "tests/py/test_runtime.py"],
-     "accept": ["ctypes structs match hearth.h", "prompt-lookup speculative decoding lossless"], "status": "todo"},
-    {"id": "T08-forward", "title": "Forward pass (GQA+MLA, all routers), batched eval, prefetch, trace, public API, bench tool", "deps": ["T01-platform", "T02-kernels", "T06-store", "T03-pymodel"],
-     "owns": ["engine/src/hx_model.h", "engine/src/model.c", "engine/src/api.c", "engine/tools/hearth_bench.c", "engine/tests/test_model.c"],
-     "accept": ["golden tests pass", "expert compute overlaps I/O"], "status": "todo"},
-    {"id": "T09-integrate", "title": "Full build, golden tests, benchmarks on reference hardware, simulator calibration", "deps": ["T08-forward", "T07-runtime", "T04-sim", "T05-governance"],
-     "owns": ["docs/BENCHMARKS.md", "scripts/"], "accept": ["all tests green", "measured numbers recorded with hardware"], "status": "todo"},
-    {"id": "T10-review", "title": "Adversarial review council + mutation testing + fixes", "deps": ["T09-integrate"],
-     "owns": [], "accept": ["no confirmed correctness findings open"], "status": "todo"},
-    {"id": "R01-cuda", "title": "CUDA/HIP backend: VRAM expert tier, W4A16 GEMV, GPUDirect Storage path", "deps": ["T09-integrate"], "owns": ["engine/src/backend_cuda.cu"], "accept": ["bit-identical to CPU kernels or documented tolerance"], "status": "todo"},
-    {"id": "R02-vulkan-metal", "title": "Vulkan and Metal backends", "deps": ["R01-cuda"], "owns": [], "accept": [], "status": "todo"},
-    {"id": "R03-lowbit", "title": "Q3 (Hadamard-rotated, E8 lattice) and heat-aware per-expert precision", "deps": ["T09-integrate"], "owns": [], "accept": ["perplexity delta reported", "opt-in (INV-LOSSLESS-DEFAULT)"], "status": "todo"},
-    {"id": "R04-swarm", "title": "Swarm mode: pool RAM/NVMe of several machines over LAN (expert-parallel workers)", "deps": ["T09-integrate"], "owns": [], "accept": [], "status": "todo"},
-    {"id": "R05-prefill", "title": "Expert-major chunked prefill with AVX-512 VNNI/AMX tiled GEMM", "deps": ["T09-integrate"], "owns": [], "accept": ["prefill tok/s vs baseline"], "status": "todo"},
-    {"id": "R06-adaptive", "title": "Opt-in adaptive top-k and cache-aware routing with measured quality impact", "deps": ["R03-lowbit"], "owns": [], "accept": ["INV-LOSSLESS-DEFAULT"], "status": "todo"}
+    {
+      "id": "T01-platform",
+      "title": "Platform layer + persistent thread pool",
+      "deps": [],
+      "owns": [
+        "engine/src/platform_win.c",
+        "engine/src/platform_posix.c",
+        "engine/src/pool.c",
+        "engine/tests/test_platform.c",
+        "engine/tests/test_pool.c"
+      ],
+      "accept": [
+        "hx_platform.h and hx_pool.h fully implemented",
+        "direct I/O read verified",
+        "pool dispatch overhead measured"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T02-kernels",
+      "title": "Quantizers + scalar/AVX2/AVX-512 kernels, bit-identical",
+      "deps": [],
+      "owns": [
+        "engine/src/quant.c",
+        "engine/src/quant_avx2.c",
+        "engine/src/quant_avx512.c",
+        "engine/tests/test_quant.c"
+      ],
+      "accept": [
+        "INV-DET-3 at kernel level",
+        "batched == single (INV-DET-2)",
+        "GB/s per core reported"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T03-pymodel",
+      "title": "Python format, quant, reference forward, synth, HF converter",
+      "deps": [],
+      "owns": [
+        "python/hearth/quant.py",
+        "python/hearth/format.py",
+        "python/hearth/reference.py",
+        "python/hearth/synth.py",
+        "python/hearth/convert.py",
+        "python/hearth/_native.py",
+        "tests/py/test_format.py",
+        "tests/py/test_reference.py",
+        "tests/py/test_convert.py"
+      ],
+      "accept": [
+        "reference == transformers for 5 architectures (INV-NUM-1)",
+        "writer/reader round trip",
+        "FP8 block dequant"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T04-sim",
+      "title": "Trace-driven cache / I/O / roofline simulator",
+      "deps": [],
+      "owns": [
+        "python/hearth/sim/",
+        "tests/py/test_sim.py",
+        "docs/SIMULATOR.md"
+      ],
+      "accept": [
+        "policies LRU/LFU/pinned/Belady",
+        "speculative union amortization",
+        "calibrated against engine measurements"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T05-governance",
+      "title": "Governance tooling: waves, handover validation, golden lock, mutation testing, CI",
+      "deps": [],
+      "owns": [
+        "governance/tools/",
+        "governance/README.md",
+        "CONTRIBUTING.md",
+        ".github/workflows/",
+        "governance/decisions/",
+        "tests/py/test_governance.py"
+      ],
+      "accept": [
+        "waves.py on this file",
+        "check_golden.py",
+        "mutate.py kills mutants in a demo"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T06-store",
+      "title": "Model file reader + tiered expert store (async I/O, LFU, pinning, mirrors)",
+      "deps": [
+        "T01-platform"
+      ],
+      "owns": [
+        "engine/src/modelfile.c",
+        "engine/src/store.c",
+        "engine/tests/test_modelfile.c",
+        "engine/tests/test_store.c"
+      ],
+      "accept": [
+        "INV-FMT fuzz",
+        "store never deadlocks at minimum slots",
+        "measured NVMe GB/s"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T07-runtime",
+      "title": "Python runtime: native loader, Engine, generation, spec decoding, chat, server, CLI",
+      "deps": [],
+      "owns": [
+        "python/hearth/__init__.py",
+        "python/hearth/__main__.py",
+        "python/hearth/engine.py",
+        "python/hearth/generate.py",
+        "python/hearth/chat.py",
+        "python/hearth/server.py",
+        "python/hearth/cli.py",
+        "tests/py/test_runtime.py"
+      ],
+      "accept": [
+        "ctypes structs match hearth.h",
+        "prompt-lookup speculative decoding lossless"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T08-forward",
+      "title": "Forward pass (GQA+MLA, all routers), batched eval, prefetch, trace, public API, bench tool",
+      "deps": [
+        "T01-platform",
+        "T02-kernels",
+        "T06-store",
+        "T03-pymodel"
+      ],
+      "owns": [
+        "engine/src/hx_model.h",
+        "engine/src/model.c",
+        "engine/src/api.c",
+        "engine/tools/hearth_bench.c",
+        "engine/tests/test_model.c"
+      ],
+      "accept": [
+        "golden tests pass",
+        "expert compute overlaps I/O"
+      ],
+      "status": "done"
+    },
+    {
+      "id": "T09-integrate",
+      "title": "Full build, golden tests, benchmarks on reference hardware, simulator calibration",
+      "deps": [
+        "H03-forward",
+        "H04-sim",
+        "H05-governance",
+        "T07-runtime"
+      ],
+      "owns": [
+        "docs/BENCHMARKS.md",
+        "scripts/"
+      ],
+      "accept": [
+        "all tests green",
+        "measured numbers recorded with hardware"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "T10-review",
+      "title": "Adversarial review council + mutation testing + fixes",
+      "deps": [
+        "T09-integrate"
+      ],
+      "owns": [],
+      "accept": [
+        "no confirmed correctness findings open"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "R01-cuda",
+      "title": "CUDA/HIP backend: VRAM expert tier, W4A16 GEMV, GPUDirect Storage path",
+      "deps": [
+        "T09-integrate"
+      ],
+      "owns": [
+        "engine/src/backend_cuda.cu"
+      ],
+      "accept": [
+        "bit-identical to CPU kernels or documented tolerance"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "R02-vulkan-metal",
+      "title": "Vulkan and Metal backends",
+      "deps": [
+        "R01-cuda"
+      ],
+      "owns": [],
+      "accept": [],
+      "status": "todo"
+    },
+    {
+      "id": "R03-lowbit",
+      "title": "Q3 (Hadamard-rotated, E8 lattice) and heat-aware per-expert precision",
+      "deps": [
+        "T09-integrate"
+      ],
+      "owns": [],
+      "accept": [
+        "perplexity delta reported",
+        "opt-in (INV-LOSSLESS-DEFAULT)"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "R04-swarm",
+      "title": "Swarm mode: pool RAM/NVMe of several machines over LAN (expert-parallel workers)",
+      "deps": [
+        "T09-integrate"
+      ],
+      "owns": [],
+      "accept": [],
+      "status": "todo"
+    },
+    {
+      "id": "R05-prefill",
+      "title": "Expert-major chunked prefill with AVX-512 VNNI/AMX tiled GEMM",
+      "deps": [
+        "T09-integrate"
+      ],
+      "owns": [],
+      "accept": [
+        "prefill tok/s vs baseline"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "R06-adaptive",
+      "title": "Opt-in adaptive top-k and cache-aware routing with measured quality impact",
+      "deps": [
+        "R03-lowbit"
+      ],
+      "owns": [],
+      "accept": [
+        "INV-LOSSLESS-DEFAULT"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "H01-store",
+      "title": "Store hardening: prefetch wake-up, count_uses, read_errors, atomic usage file, canonical tensor validation",
+      "deps": [
+        "T06-store",
+        "H02-platform-pool"
+      ],
+      "owns": [
+        "engine/src/store.c",
+        "engine/src/modelfile.c",
+        "engine/tests/test_store.c",
+        "engine/tests/test_modelfile.c"
+      ],
+      "accept": [
+        "no open critical/major findings"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "H02-platform-pool",
+      "title": "Platform/pool hardening: hx_file_replace, hx_pool_for_n, yielding spin, 32-thread dispatch latency",
+      "deps": [
+        "T01-platform"
+      ],
+      "owns": [
+        "engine/src/platform_win.c",
+        "engine/src/platform_posix.c",
+        "engine/src/platform_common.inc",
+        "engine/src/pool.c",
+        "engine/tests/test_platform.c",
+        "engine/tests/test_pool.c"
+      ],
+      "accept": [
+        "no open critical/major findings"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "H03-forward",
+      "title": "Forward hardening: adopt count_uses/for_n, read_errors ABI, parallel attention value pass, I/O error path",
+      "deps": [
+        "H01-store",
+        "H02-platform-pool"
+      ],
+      "owns": [
+        "engine/src/model.c",
+        "engine/src/api.c",
+        "engine/src/hx_model.h",
+        "engine/tools/hearth_bench.c",
+        "engine/tests/test_model.c",
+        "python/hearth/engine.py"
+      ],
+      "accept": [
+        "golden green"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "H04-sim",
+      "title": "Simulator hardening: prefetch byte accounting tests, feasibility tests, latent-MoE param reconciliation",
+      "deps": [
+        "T04-sim"
+      ],
+      "owns": [
+        "python/hearth/sim/",
+        "tests/py/test_sim.py",
+        "docs/SIMULATOR.md"
+      ],
+      "accept": [
+        "mutation score >= 85% on core/feasibility"
+      ],
+      "status": "todo"
+    },
+    {
+      "id": "H05-governance",
+      "title": "Governance hardening: golden lock verified from base revision, CODEOWNERS, .inc mutation support",
+      "deps": [
+        "T05-governance"
+      ],
+      "owns": [
+        "governance/tools/",
+        "governance/README.md",
+        "governance/decisions/",
+        ".github/",
+        "CONTRIBUTING.md",
+        "tests/py/test_governance.py"
+      ],
+      "accept": [
+        "a PR cannot weaken its own golden check"
+      ],
+      "status": "todo"
+    }
   ]
 }

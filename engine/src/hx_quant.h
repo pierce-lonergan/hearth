@@ -52,7 +52,7 @@ const void *hx_act_prepare(int wdtype, const float *x, int64_t n, void *act);
  *   act: T prepared activations, consecutive, each hx_act_bytes(wdtype, n_cols) bytes
  *        (for float dtypes: T f32 vectors of n_cols, consecutive)
  *   Y: Y[t*ldy + r]
- * Must equal, for every (t, r), the T=1 result (NUMERICS §3). */
+ * Must equal, for every (t, r), the T=1 result (NUMERICS §3). NaN results are stored as 0x7fc00000. */
 typedef void (*hx_matmul_fn)(const void *W, int64_t n_cols, const void *act, int T,
                              float *Y, int64_t ldy, int64_t r0, int64_t r1);
 

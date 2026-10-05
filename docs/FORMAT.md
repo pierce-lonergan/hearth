@@ -140,7 +140,7 @@ for Q8/Q4 (writers fall back to F16 otherwise). `nbytes` must equal
 ### 4.1 Canonical tensor names
 
 Global: `tok_embd [V,D]`, `out_norm [D]`, `lm_head [V,D]` (absent when tied),
-`rope_inv_freq [rope_dim/2]` (F32, **always present**; the converter computes it
+`rope_inv_freq [rope_dim/2]` (F32, **present iff rope_dim > 0**; the converter computes it
 with the source framework's own RoPE-scaling code so the engine never needs to
 know YaRN/NTK/Llama3 variants).
 
@@ -151,7 +151,7 @@ Per block `blk.{i}.` (i = 0..n_layers-1):
 | `attn_norm`, `ffn_norm` | [D] | always |
 | `attn_q` | [H*hd, D] | GQA; MLA when q_lora_rank = 0 (then [H*(nope+rope), D]) |
 | `attn_k`, `attn_v` | [Hkv*hd, D] | GQA |
-| `attn_q_bias` | [H*hd] | qkv_bias |
+| `attn_q_bias` | [H*hd] | qkv_bias (GQA only; MLA ignores qkv_bias and qk_norm) |
 | `attn_k_bias`, `attn_v_bias` | [Hkv*hd] | qkv_bias |
 | `attn_q_norm` | [hd] (qk_norm=1) or [H*hd] (qk_norm=2) | qk_norm |
 | `attn_k_norm` | [hd] (qk_norm=1) or [Hkv*hd] (qk_norm=2) | qk_norm |
@@ -168,10 +168,10 @@ Per block `blk.{i}.` (i = 0..n_layers-1):
 | `moe_router_bias` | [E] (F32) | score_bias |
 | `shexp_gate`, `shexp_up` | [Fs, D] | shared_ffn_dim > 0 |
 | `shexp_down` | [D, Fs] | shared_ffn_dim > 0 |
-| `shexp_gate_inp` | [1, D] | shared_gate |
+| `shexp_gate_inp` | [1, D] | shared_gate and shared_ffn_dim > 0 |
 
 Norm weights, biases, `rope_inv_freq`, `moe_router` and `moe_router_bias` are
-always F32. Other matrices may be any dtype.
+always F32. Other matrices may be F32, F16, BF16, Q8 or Q4.
 
 ## 5. Expert directory and slabs
 
@@ -186,6 +186,10 @@ always F32. Other matrices may be any dtype.
 | 24 | u64 | reserved = 0 |
 
 Different experts MAY use different dtypes (per-expert mixed precision).
+
+The preamble, metadata, directories, tensors and physical slabs must not overlap.
+Entries sharing an offset must have equal `nbytes` and `dtype`, and at most one of them
+may have flag bit 0 clear.
 
 A slab holds one routed expert's SwiGLU FFN: `gate [F,D]`, `up [F,D]`, `down [D,F]`.
 
@@ -236,3 +240,6 @@ u32 magic 0x52545248 ("HRTR")   u32 version 1
 u32 n_layers  u32 n_experts  u32 top_k  u32 n_moe_layers
 then per evaluated token: u16 ids[n_moe_layers * top_k]   (MoE layers in order, each top-k sorted by rank)
 ```
+
+Readers (route replay) require version 1, `n_experts`, `top_k` and `n_moe_layers`
+equal to the model's, and `n_layers >= n_moe_layers`.

@@ -32,13 +32,16 @@ typedef struct hx_store hx_store;
 
 typedef struct hx_store_opts {
     uint64_t cache_bytes;        /* DRAM budget for slots; raised to the minimum (see below) if smaller */
-    int n_io_threads;            /* >= 1 */
+    int n_io_threads;            /* 1..64; out-of-range values are clamped (warning); the minimum
+                                    slot count uses the clamped value */
     int direct_io;               /* 1 = unbuffered reads */
     int policy;                  /* HEARTH_POLICY_LRU / HEARTH_POLICY_LFU */
     float heat_decay;            /* per-token multiplicative decay for LFU heat (default 0.995) */
     const char *usage_in;        /* optional heat profile (FORMAT.md §8) */
     const char *usage_out;       /* optional: written on close */
-    float pin_fraction;          /* 0..0.9: fraction of slots pinned with hottest experts (needs usage_in) */
+    float pin_fraction;          /* 0..0.9: pinned = (int)(pin_fraction * n_slots) hottest experts (needs
+                                    usage_in), capped so the minimum slot count stays unpinned and at the
+                                    number of profiled experts */
     int warm_start;              /* fill remaining slots with next-hottest experts at open */
     const char *const *mirrors;  /* extra copies of the model file */
     int n_mirrors;
@@ -52,11 +55,17 @@ void      hx_store_close(hx_store *s);   /* joins readers; writes usage_out if s
  * Miss: makes sure a demand read is queued (promoting a queued/in-flight prefetch),
  * returns NULL. Call again later (e.g. after hx_store_wait_any). */
 const void *hx_store_try_acquire(hx_store *s, int layer, int expert);
-/* Blocking variant: returns the slab once resident (pinned). Never NULL for valid ids. */
+/* Blocking variant: returns the slab once resident (pinned). NULL only if the expert could not
+ * be read on any attempt or mirror (an I/O error; retried after the next hx_store_tick). */
 const void *hx_store_acquire(hx_store *s, int layer, int expert);
 /* Unpin (refcount--). */
 void hx_store_release(hx_store *s, int layer, int expert);
-/* Block until some read completes or timeout_us elapses. */
+/* Count n additional uses (heat, hits) of an expert the caller currently holds - for batches where
+ * one acquire serves n (token, rank) activations. */
+void hx_store_count_uses(hx_store *s, int layer, int expert, uint32_t n);
+/* Returns at once if a demand read the caller asked for completed or failed since the caller last
+ * looked at that expert and since the previous wait_any; otherwise blocks until some read completes
+ * or timeout_us elapses (also when nothing is pending, so a polling loop never spins). */
 void hx_store_wait_any(hx_store *s, uint32_t timeout_us);
 /* Low-priority hints. Ignored for resident/in-flight experts; may be dropped when
  * no slot can be evicted without hurting demand traffic. */
@@ -72,6 +81,7 @@ typedef struct hx_store_stats {
     uint64_t bytes_read, reads;
     uint64_t read_ns;            /* summed reader busy time */
     uint64_t stall_ns;           /* time callers spent blocked in acquire/wait_any */
+    uint64_t read_errors;        /* failed slab reads (after retries / mirrors) */
     int n_slots, resident, pinned;
     uint64_t slot_bytes;
 } hx_store_stats;

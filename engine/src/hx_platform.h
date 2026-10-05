@@ -51,11 +51,12 @@
 #define HX_ALIGN_UP(x, a) (((x) + ((a) - 1)) & ~((uint64_t)(a) - 1))
 
 /* ---------------------------------------------------------------- memory */
-/* Aligned heap allocation; align must be a power of two. Returns NULL on failure. */
+/* Aligned heap allocation; align must be a power of two (else NULL). size 0 returns a valid
+ * minimal block. Returns NULL on failure. */
 void *hx_aligned_alloc(size_t align, size_t size);
 void  hx_aligned_free(void *p);
 /* Large page-aligned allocation straight from the OS (VirtualAlloc / mmap),
- * zero-filled. try_huge: attempt large/huge pages, silently fall back. */
+ * zero-filled. try_huge: attempt large/huge pages, silently fall back. size 0 -> NULL. */
 void *hx_alloc_large(size_t size, int try_huge);
 void  hx_free_large(void *p, size_t size);
 /* Physical RAM in bytes, and currently available RAM in bytes (best effort). */
@@ -64,6 +65,7 @@ uint64_t hx_ram_available(void);
 
 /* ----------------------------------------------------------------- time */
 uint64_t hx_now_ns(void);          /* monotonic */
+/* Never returns early; may overshoot by the OS timer granularity (~0.5 ms on Windows). */
 void     hx_sleep_us(uint32_t us);
 
 /* --------------------------------------------------------------- threads */
@@ -92,7 +94,7 @@ void hx_mutex_unlock(hx_mutex *m);
 void hx_cond_init(hx_cond *c);
 void hx_cond_destroy(hx_cond *c);
 void hx_cond_wait(hx_cond *c, hx_mutex *m);
-/* Returns 0 if signalled, 1 on timeout. */
+/* Returns 0 if signalled, 1 on timeout. Windows rounds the timeout up to whole milliseconds. */
 int  hx_cond_timedwait(hx_cond *c, hx_mutex *m, uint32_t timeout_us);
 void hx_cond_signal(hx_cond *c);
 void hx_cond_broadcast(hx_cond *c);
@@ -129,10 +131,14 @@ void     hx_file_close(hx_file *f);
 int64_t  hx_file_size(hx_file *f);
 int      hx_file_is_direct(const hx_file *f);
 /* Positional read/write; thread-safe on the same hx_file (no shared file pointer).
+ * Windows opens handles with FILE_FLAG_OVERLAPPED and waits per request: a synchronous
+ * handle serialises concurrent reads (measured 0.62 vs 5.73 GB/s at 16 threads).
  * Loops until n bytes or EOF. Returns bytes transferred, or -1 on error. */
 int64_t  hx_file_pread(hx_file *f, void *buf, size_t n, uint64_t off);
 int64_t  hx_file_pwrite(hx_file *f, const void *buf, size_t n, uint64_t off);
 int      hx_path_exists(const char *path);
+/* Atomically replace dst with tmp (MoveFileExW REPLACE_EXISTING / rename). 0 on success. */
+int      hx_file_replace(const char *tmp_path, const char *dst_path);
 
 /* ------------------------------------------------------------ cpu features */
 typedef struct hx_cpu {
@@ -141,7 +147,9 @@ typedef struct hx_cpu {
     int neon, dotprod;
     char brand[64];
 } hx_cpu;
-const hx_cpu *hx_cpu_features(void);   /* detected once, cached; includes OS XSAVE support checks */
+/* Detected once and cached; includes OS XSAVE support checks. Returns the process-wide cache
+ * (a non-const object): tests may override fields while single-threaded to simulate older CPUs. */
+const hx_cpu *hx_cpu_features(void);
 
 /* ------------------------------------------------------- half conversions */
 float    hx_f16_to_f32(uint16_t h);

@@ -24,7 +24,8 @@ typedef void (*hx_task_fn)(void *ctx, int tid, int nthreads);
 typedef void (*hx_range_fn)(void *ctx, int64_t begin, int64_t end, int tid);
 
 /* n_threads includes the calling thread (spawns n_threads-1 workers). n_threads >= 1.
- * Workers spin for ~spin_us microseconds after finishing a task before sleeping. */
+ * Workers spin for ~spin_us microseconds after finishing a task before sleeping; while spinning
+ * they yield the CPU every few microseconds so descheduled siblings and the caller can run. */
 hx_pool *hx_pool_create(int n_threads, int spin_us);
 void     hx_pool_destroy(hx_pool *p);
 int      hx_pool_size(const hx_pool *p);
@@ -36,6 +37,9 @@ void hx_pool_run(hx_pool *p, hx_task_fn fn, void *ctx);
 /* Dynamic parallel-for over [0, n) in chunks of `chunk` items (last may be short).
  * Each chunk is processed by exactly one thread. chunk >= 1. */
 void hx_pool_for(hx_pool *p, int64_t n, int64_t chunk, hx_range_fn fn, void *ctx);
+/* Same, but wakes and waits for at most max_threads threads (incl. the caller), so small
+ * regions don't pay for the whole pool. max_threads <= 1 runs on the caller only. */
+void hx_pool_for_n(hx_pool *p, int max_threads, int64_t n, int64_t chunk, hx_range_fn fn, void *ctx);
 
 /* Deterministic static split helper: contiguous balanced partition of n items. */
 HX_INLINE void hx_split(int64_t n, int tid, int nt, int64_t *b, int64_t *e) {

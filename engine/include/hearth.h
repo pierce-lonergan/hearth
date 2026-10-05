@@ -66,7 +66,7 @@ typedef struct hearth_options {
     const char *mirror_paths[8];   /* optional byte-identical copies on other drives */
     int n_mirrors;
     double cache_gb;               /* DRAM budget for routed experts in GiB (default 8.0); clamped up to a safe minimum */
-    int n_threads;                 /* compute threads incl. caller (0 = number of physical cores) */
+    int n_threads;                 /* compute threads incl. caller (0 = physical cores; capped at logical CPUs) */
     int n_io_threads;              /* expert reader threads (0 = 8) */
     int direct_io;                 /* 1 = bypass OS page cache (default), 0 = buffered */
     int policy;                    /* HEARTH_POLICY_* (default LFU) */
@@ -106,12 +106,13 @@ typedef struct hearth_stats {
     double   attn_s, moe_s, dense_s, stall_s; /* stall = compute waiting on expert I/O */
     uint64_t expert_uses;           /* (token, layer, expert) activations */
     uint64_t expert_loads_unique;   /* distinct (layer, expert) fetches needed per forward call, summed */
-    uint64_t cache_hits, cache_misses;
+    uint64_t cache_hits, cache_misses; /* per (token, layer, expert) activation: hits + misses = expert_uses */
     uint64_t prefetch_issued, prefetch_used, prefetch_wasted;
     uint64_t bytes_read;            /* bytes read from storage for experts */
     double   read_s;                /* summed reader-thread busy time */
     uint64_t evictions;
     int      cache_slots, cache_resident, cache_pinned;
+    uint64_t read_errors;           /* failed expert reads */
 } hearth_stats;
 
 /* ---- lifecycle --------------------------------------------------------- */
@@ -127,7 +128,8 @@ HEARTH_API int hearth_info(hearth_engine *e, hearth_model_info *out);
  * appending them to the KV cache. n may exceed max_batch (processed in chunks).
  * logits: NULL, or room for vocab floats (all_logits = 0: last token only) or
  * n*vocab floats (all_logits = 1, row-major per token).
- * Returns 0 on success, negative on error (e.g. KV capacity exceeded). */
+ * Returns 0 on success, negative on error (e.g. KV capacity exceeded); a failed call leaves pos,
+ * the routing trace and all counters unchanged. */
 HEARTH_API int hearth_eval(hearth_engine *e, const int32_t *tokens, int n, float *logits, int all_logits);
 HEARTH_API int hearth_pos(hearth_engine *e);
 HEARTH_API int hearth_reset(hearth_engine *e);            /* pos = 0 */
@@ -150,7 +152,8 @@ HEARTH_API size_t hearth_row_bytes(int dtype, int64_t n_cols);
 HEARTH_API int hearth_quantize(int dtype, const float *src, int64_t n_rows, int64_t n_cols, void *dst, int n_threads);
 HEARTH_API int hearth_dequantize(int dtype, const void *src, int64_t n_rows, int64_t n_cols, float *dst);
 /* Reference matvec/matmul through the dispatched kernels (for tests/tools).
- * X is T x n_cols f32 (row-major), Y is T x n_rows. Follows docs/NUMERICS.md §3. */
+ * X is T x n_cols f32 (row-major), Y is T x n_rows. Follows docs/NUMERICS.md §3.
+ * Returns 0 ok, -1 bad arguments, -2 ISA unavailable on this CPU/build, -3 allocation failure. */
 HEARTH_API int hearth_matmul(int dtype, const void *W, int64_t n_rows, int64_t n_cols,
                              const float *X, int T, float *Y, int isa);
 HEARTH_API int hearth_cpu_isa(void); /* best ISA supported by this CPU */

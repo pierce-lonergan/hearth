@@ -53,6 +53,10 @@ y[r] = acc
 
 Bias (if any) is added afterwards: `y[r] = y[r] + b[r]`.
 
+A NaN result is stored as the canonical quiet NaN `0x7fc00000`. (IEEE 754 does not
+fix which NaN operand an add/mul propagates and compilers commute SIMD operands, so
+raw payloads would depend on ISA and batching.) Bit-identity therefore covers NaNs.
+
 **Batched** `Y = W X` (T tokens) must produce, for every (token, row), exactly the
 value the single-token matvec produces. This is what makes prefill, speculative
 verification and decode agree bit for bit.
@@ -68,7 +72,8 @@ verification and decode agree bit for bit.
   `c = cosf(θ) * rope_attn_factor`; `s = sinf(θ) * rope_attn_factor`;
   `(a, b) → (a*c - b*s, b*c + a*s)` where `(a,b)` = `(x[j], x[j+rope_dim/2])`
   for NEOX style, `(x[2j], x[2j+1])` for GPT-J style. Only the first `rope_dim`
-  dims of each head are rotated (MLA: the `qk_rope_dim` part).
+  dims of each head are rotated. MLA: the first `rope_dim` (<= `qk_rope_dim`) dims of
+  `q_pe` and `kpe` are rotated; `rope_dim = 0` rotates nothing.
 
 ## 5. Forward pass (one token at position `pos`)
 

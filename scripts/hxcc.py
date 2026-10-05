@@ -110,7 +110,8 @@ def main() -> int:
         out = data_dir() / "build" / "hxcc" / out
     out = out.resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    tag = hashlib.sha1(str(out).encode()).hexdigest()[:10]
+    # Per-process object dir: concurrent builds of the same output name must not collide.
+    tag = hashlib.sha1(f"{out}|{os.getpid()}".encode()).hexdigest()[:10]
     objdir = out.parent / f".obj-{out.stem}-{tag}"
     objdir.mkdir(parents=True, exist_ok=True)
 
@@ -171,7 +172,8 @@ def main() -> int:
         if r.returncode:
             return r.returncode
 
-    print(f"hxcc: built {out}")
+    shutil.rmtree(objdir, ignore_errors=True)
+    print(f"hxcc: built {out}", flush=True)
     if a.run:
         r = subprocess.run([str(out)] + run_args)
         return r.returncode

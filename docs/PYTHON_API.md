@@ -115,11 +115,26 @@ class Engine:
                  policy="lfu", prefetch="shared", prefetch_extra=0, usage_in=None, usage_out=None,
                  pin_fraction=0.0, warm_start=False, max_seq=0, max_batch=0, isa="auto",
                  mirrors=(), verbose=0): ...
+    # int options must be in [0, 2**31-1] (ValueError; TypeError for non-integers);
+    # pin_fraction in [0, 1]; cache_gb finite >= 0
     info: dict
     def eval(self, tokens, all_logits=False) -> np.ndarray   # [vocab] or [n, vocab]
     pos: int
+    kv_capacity: int   # max_seq > 0 ? min(max_seq, info['max_seq']) : min(info['max_seq'], 4096)
     def reset(self); def rewind(self, pos)
     def stats(self) -> dict; def reset_stats(self)
     def trace_start(self, path); def trace_stop(self); def route_replay(self, path)
     def close(self)   # also context manager
 ```
+
+## `hearth.server`
+
+```python
+def serve(model_path, *, host='127.0.0.1', port=8080, model_name=None, api_key=None, max_queue=8,
+          speculative='none', draft_len=4, ngram_n=3, cors=None, verbose=False, engine_kwargs=None,
+          tokenizer_path=None, timeout=60.0) -> None
+```
+Clients stalling a read/write for `timeout` s are dropped; non-boolean `stream`/`echo` give 400;
+without a tokenizer `/v1/completions` accepts token-id prompts and returns a non-standard
+`token_ids` list; chat needs `max_tokens >= 1`. `hearth.chat.Tokenizer.from_container(model_path,
+meta=None, path=None)`; `Conversation.say` rolls a turn back when generation raises.

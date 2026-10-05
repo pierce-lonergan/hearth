@@ -19,7 +19,7 @@ feature attacks one term:
 
 | lever | term it shrinks | mechanism |
 |-------|-----------------|-----------|
-| expert slabs + direct I/O | storage latency/overhead | one aligned read per expert, no page-cache copies or thrash |
+| expert slabs + direct I/O | storage latency/overhead | one aligned read per expert, no page-cache copies or thrash; on Windows, overlapped handles so concurrent reads reach queue depth > 1 |
 | LFU heat cache, pinning | `1 − hit_rate` | activation frequencies are power-law; global LRU degenerates under cyclic layer access |
 | next-layer prediction | exposed storage latency | reads for layer L+1 start while layer L computes |
 | rank-order accumulation + completion-order compute | exposed latency | experts are computed as they arrive, summed in canonical order (bit-identical) |

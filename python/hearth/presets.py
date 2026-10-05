@@ -68,7 +68,8 @@ class Shape:
         router = self.n_experts * D
         shared = 3 * D * self.shared_ffn
         dense_ffn = 3 * D * self.dense_ffn
-        return (emb + self.n_layers * per_layer_attn + self.n_moe_layers * (router + shared)
+        latent = 2 * D * self.expert_d if self.expert_d else 0   # projections around latent experts
+        return (emb + self.n_layers * per_layer_attn + self.n_moe_layers * (router + shared + latent)
                 + self.n_dense_layers * dense_ffn)
 
     def params_total(self) -> int:
