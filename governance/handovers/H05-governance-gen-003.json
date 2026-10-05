@@ -1,0 +1,222 @@
+{
+  "generation_id": "gen-003-governance",
+  "parent_generation": "gen-002-governance",
+  "timestamp": "2026-10-05T09:35:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H05-governance",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "Nothing committed (git HEAD is 10f6542 from other tasks). This generation, on top of gen-001/002's uncommitted work: new governance/tools/path_aliases.py and governance/handovers/H05-governance-gen-003.json; modified governance/tools/{check_golden,adr,merge_ref,validate_handover}.py, .github/workflows/{golden,decisions,ci}.yml (ci.yml: comment only), .github/CODEOWNERS, governance/README.md, CONTRIBUTING.md, governance/decisions/ADR-0009-golden-gate-against-base-revision.md (still Proposed), tests/py/test_governance.py. mutate.py, friction.py and waves.py unchanged. Nothing outside H05 ownership touched."
+  },
+  "constraints_touched": [
+    "INV-VERIFY",
+    "INV-HONEST"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier MAJOR (round 3): case-twin paths passed both pull_request_target gates with no label while Windows and macOS checkouts hold the twin's text. Real, also for NTFS 8.3 short names, and fixed",
+        "evidence": "Reproduced with temporary repos built by plumbing (scratch alias_repro.py: temporary index, core.ignorecase=false, depth-1 fetch of the PR commit into an empty repo, tools run with python -I -S as the gates do). Before the fix, all 6 cases gave rc 0 for adr.py breaker --rev HEAD --base-root, adr.py lint --rev HEAD and check_golden.py --rev HEAD --base-manifest. The cases were governance/invariants.md, decisions/adr-0004-lfu-default-eviction.md (LFU->LRU), tests/Golden/conftest.py, docs/format.md, governance/INVARI~1.MD and governance/decisi~1/ADR-0004-.... git clone on this Windows 11 machine (git 2.45.1.windows.1): the lowercase twin wins; a committed g/INVARI~1.MD overwrote g/INVARIANTS.md; governance/decisi~1/ADR-0004-lfu.md overwrote governance/decisions/ADR-0004-lfu.md ('dir /x' shows DECISI~1 as the short name of decisions). A trailing-dot name is refused by git for Windows (loud failure, not an alias). Fix: new governance/tools/path_aliases.py. It lists every tree entry (ls-tree -r -t -z, git objects only) and reports twins and NTFS 8.3 short-name shapes. Twins are paths equal under one key per component: drop the 16 code points HFS+ ignores, rstrip trailing dots and spaces, then NFD, upper, NFD, casefold, NFD. Short names: up to 6 chars, '~', digits, prefix+digits < 8, optional extension of at most 3, any case. check_golden.py --rev and adr.py --rev (lint, index, breaker, and the --base-rev side) load it from their own directory by path and refuse such a commit anywhere in its tree, with or without --acknowledged: check_golden prints ALIAS lines with exit 1, adr raises AliasError with exit 1. Without the sibling file they exit 2, never pass. Reports are ASCII with backslash escapes. After the fix the same script gives rc 1 for every case and command. Tests: test_gates_refuse_paths_that_alias_on_windows_or_macos runs 9 alias cases through both workflows' own steps (base clone; merge_ref.py --fetch of refs/pull/N/merge from a local origin; judging step with and without the label), plus a clean control (both gates rc 0) and a case-only rename of INVARIANTS.md (no twin; the breaker trips on 'deleted'). Also test_golden_rev_refuses_paths_that_alias, test_adr_rev_refuses_paths_that_alias, test_path_aliases_fold_and_short_names and test_path_aliases_cli_reads_a_commit. Also changed: adr._is_adr_name now accepts ADR- and .md in any case, so lint reports a misspelt adr-0002-d2.md instead of skipping it.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The alias key is at least as coarse as macOS's comparison (NFD + case folding) and as upper-casing (NTFS proxy) for every code point",
+        "evidence": "Checked over all 1,112,064 non-surrogate code points: whenever NFD(casefold(NFD(c))) or c.upper() is equal for two code points, fold() is equal too. This is asserted in test_path_aliases_fold_and_short_names (about 1.6 s). Named cases: dotless i vs I, sharp s vs SS, long s, Kelvin sign, NFC vs NFD e-acute, U+200C, U+FEFF, trailing dot or space. Exactly the 16 HFS+-ignorable code points in U+2000..U+20FF and U+FEFF vanish; their neighbours (U+200B, U+2010, U+2029, U+202F, U+2069, U+2070, U+FEFE, U+FF00) do not.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier MAJOR: actions/checkout refuses refs/pull/N/merge of fork pull requests under pull_request_target. Real per GitHub's changelog; fixed by not checking the pull request out at all",
+        "evidence": "github.blog changelog 2026-06-18 (fetched 2026-10-05): checkout refuses fork PR code under pull_request_target when ref matches refs/pull/<n>/merge, and this was backported to all supported major versions on 2026-07-20. The opt-out is allow-unsafe-pr-checkout. Fix: both gates keep a single actions/checkout (the base, ref github.sha). The PR step is now 'python -I -S base/governance/tools/merge_ref.py --fetch \"$REPO_URL\" --pr \"$PR_NUMBER\" --merge pr --head \"$HEAD_SHA\" --base base'. merge_ref.fetch runs git init on a new directory (refuses an existing one). It fetches '+refs/pull/<N>/merge' with --depth=1 --no-tags --no-recurse-submodules and -c transfer.fsckObjects=true. Then update-ref --no-deref HEAD; no working tree is ever written. GITHUB_TOKEN, if set, is sent only as http.<url>.extraheader through GIT_CONFIG_COUNT/KEY_0/VALUE_0, never on a command line, with GIT_TERMINAL_PROMPT=0. URL must be https:// or file://; --pr must be 1-10 digits without a leading 0. Verified against real GitHub, anonymously: actions/setup-python PR 909 fetched (fsck on), merge ref OK ('an ancestor of base'), path_aliases OK on it, 1.8 s, 1.1 MB of objects. Tests: test_merge_ref_fetches_the_merge_commit_as_objects_only covers objects only, shallow, detached HEAD, argv and env per git call, token absent from argv, and git reading the header for the URL and not for another host. It also covers main passing GITHUB_TOKEN, an fsck-failing commit refused (rc 2), and 10 bad-input cases. test_merge_ref_must_be... runs the workflows' own step with fetch (OK, re-run refuses an existing pr/, stale head rc 1). test_golden_and_decision_gates_never_execute_the_pull_request asserts: one checkout; the only ref is github.sha; no refs/pull and no allow-unsafe-pr-checkout in code; exact merge step and env; github.token exactly once.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: pull_request_target runs on the default branch and github.sha is its head, so comments were wrong and PRs into other branches could never pass. Real; gates limited to main",
+        "evidence": "github.blog changelog 2025-11-07 (fetched): workflow file and checkout commit are always taken from the default branch, GITHUB_SHA is the latest commit on it, effective 2025-12-08. Both workflows now have 'branches: [main]'. The base-checkout comment reads 'the head of main, the default branch'. README CI section, residual 8 and new residual 9 ('main is the default branch and the only protected one'), merge_ref docstring and ADR-0009 are updated. The structure test pins the on: block and the comment and rejects 'base branch head'.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: governance/decisions/ had no code owner, so the decision breaker was gated by a label only. Real; fixed",
+        "evidence": "CODEOWNERS adds /governance/decisions/. README residual 5 now says why the code-owner review covers every breaker trip: all touch governance/decisions/ or governance/INVARIANTS.md. test_codeowners_cover_the_verification_paths requires the line (hand-made variant removing it: killed).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: the golden suite's oracle (hearth.reference, quant, synth) was unowned and unnamed in the residuals. Real; code-owned, residual added",
+        "evidence": "CODEOWNERS adds python/hearth/{__init__,reference,quant,synth,format,presets}.py. That set is the closure of what tests/golden imports from hearth (minus engine and _native, the code under test) over the package's own imports. test_codeowners_... computes the closure with ast from the files and requires each module (variant removing presets.py: killed). README: the verification-authority paragraph names the oracle, residual 2 lists it, and new residual 11 covers what stays unowned. hearth.quant calls the engine's own quantiser for Q4/Q8, so a quantiser change moves weights and expectations together, and the transformers cross-check runs only manually.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: validate_handover's 'a schema either engine cannot use exits 2 under both' was false for keywords jsonschema evaluates. Real; both engines now accept the same schemas, and two further disagreements were found and fixed",
+        "evidence": "Reproduced (real schema + keyword, H05-governance-gen-002.json): multipleOf gave builtin rc 2 vs jsonschema 'valid'; allOf and minProperties gave builtin rc 2 vs jsonschema rc 1. Fix: precheck_schema, which runs for every engine, ends with MiniValidator(schema). The keyword whitelist, value kinds and subschema shapes therefore bind jsonschema too. After: all three are refused by both engines with the same message. Found while fixing: a 2019-09 tuple 'items' array was evaluated by jsonschema and refused by builtin (now refused by both). A $id with a fragment was rejected only by jsonschema's metaschema pattern ^[^#]*#?$ (builtin rc 0 vs jsonschema rc 2); the same rule is now in the built-in value checks. Docstring corrected. Tests: test_handover_engines_refuse_the_same_keywords (7 cases x builtin/auto/jsonschema, plus precheck in-process); UNUSABLE_SCHEMAS gains '$id fragment'; test_handover_annotations_stay_usable_under_every_engine (control); test_handover_metaschema_check_runs_for_jsonschema_only (wiring, so CI's builtin verdict never depends on an optional package; an empty trailing fragment is still accepted, '#a' is not); test_builtin_engine_accepts_well_formed_keyword_values now expects anyOf refused under auto/jsonschema/builtin. Against the gen-002 tools all 7 keyword cases fail.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Found by the new end-to-end test: printing a non-ASCII alias path crashed check_golden on Windows (cp1252 pipe), so the gate failed by traceback, not by verdict. Fixed for alias reports",
+        "evidence": "First run of test_gates_refuse_paths_that_alias_on_windows_or_macos, 'NFC and NFD' case: check_golden rc 1 with empty stdout and UnicodeEncodeError on U+0301. path_aliases.describe now renders paths in ASCII with backslash escapes, which also shows invisible code points (U+200C) to a reviewer. Asserted in test_path_aliases_fold_and_short_names; variant returning the raw path is killed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The new and changed tests fail against the gen-002 tools and workflows",
+        "evidence": "Scratch tree with the session-start (gen-002) governance/tools, the new path_aliases.py added so the module imports, gen-002 golden.yml/decisions.yml/CODEOWNERS restored verbatim, and the current tests. 16 of the 20 selected tests fail. The 4 that pass: the two path_aliases unit/CLI tests (module present in both trees), the annotations control, and an unrelated keyword test. Scratch tree deleted.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "All handover manifests in governance/handovers/ are valid",
+        "evidence": "python governance/tools/validate_handover.py governance/handovers --strict: 24/24 valid under the default engine (jsonschema 4.26) and --engine builtin before this manifest was written, and 25/25 with it (see measurements). No invalid manifest to report.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The governance tools and tests still parse as Python 3.9",
+        "evidence": "ast.parse(feature_version=(3, 9)) on governance/tools/*.py and tests/py/test_governance.py plus a scan of f-string replacement fields for PEP 701 forms: 9 files, 0 problems. No 3.9 interpreter here.",
+        "verdict": "INCONCLUSIVE"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "git for Windows protects checkouts against NTFS 8.3 short-name aliases (core.protectNTFS), so only case twins matter",
+        "evidence": "git 2.45.1.windows.1 checked out g/INVARI~1.MD over g/INVARIANTS.md and governance/decisi~1/ADR-0004-lfu.md over governance/decisions/ADR-0004-lfu.md, with only the generic 'paths have collided' warning. protectNTFS refused only the trailing-dot name.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Covering both macOS (NFD + casefold) and NTFS (upper-casing) needs two keys and a union-find of collisions",
+        "evidence": "The single key NFD(casefold(NFD(upper(NFD(c))))) is coarser than both for every code point (exhaustive check, asserted in the tests), so one dict grouping suffices.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Upper-casing commutes with canonical decomposition, so the NFD before upper() is redundant",
+        "evidence": "Hand-made variant dropping it survived the first test set. U+03B1 U+0345 U+0301 and U+03B1 U+0301 U+0345 are canonically equal (one file on macOS), but U+0345 upper-cases to the letter U+0399, which blocks canonical reordering afterwards. Without the inner NFD their folds differ. The pair was added to the twin cases; the variant is now killed.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Once the built-in keyword and value checks bind both engines, jsonschema's metaschema check can no longer reject a schema the built-in engine accepts",
+        "evidence": "A root $id with a fragment ('...#frag') gave builtin rc 0 and jsonschema rc 2 (metaschema pattern ^[^#]*#?$). Mutation of the metaschema wiring survived until this case and the wiring test were added. No further case known: the other metaschema patterns sit on keywords outside the built-in set.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The gates need a working tree of the pull request (actions/checkout of the merge ref, with allow-unsafe-pr-checkout)",
+        "evidence": "Every gate tool reads only git objects (--rev HEAD, merge_ref parents). The fetch-only layout (git init + depth-1 fetch + update-ref, no checkout) passes the full workflow tests, both gates, and a fetch of a real GitHub merge ref. Not checking out removes the opt-in and keeps links and twins off the runner's disk.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "None of the workflows has run on GitHub. Unverified there: pull_request_target checks as required status checks; the GITHUB_TOKEN header path of merge_ref --fetch (only an anonymous https fetch of a public repo's merge ref was run, and the header mechanism was checked with 'git config --get-urlmatch'); fetch-depth: 0 with sparse-checkout for the base; 'python -I -S' on setup-python 3.13. The PR that introduces path_aliases.py and merge_ref --fetch is judged by main's older workflows and tools (README residual 8).",
+      "The alias check is a deliberate over-approximation (README residual 10). Any 8.3-shaped component (e.g. notes~1.md) and any pair like sharp-s/ss is refused anywhere in the repository. File systems with other rules (custom upcase tables, case-insensitive ext4/ZFS with other normalisation) are not modelled.",
+      "Pre-existing, not fixed: check_golden prints other paths (UNLISTED, MODIFIED, ...) unescaped. With a legacy Windows code page a non-ASCII golden path raises UnicodeEncodeError (traceback, exit 1: fails closed). Only alias lines are escaped.",
+      "A non-UTF-8 path anywhere in a commit now fails adr.py --rev (exit 1, RecordError) and check_golden.py/path_aliases.py --rev (exit 2): the exit codes differ, but all fail closed. Building such a path on Windows works through update-index --index-info, as the CLI test does.",
+      "jsonschema_check_schema remains as defence in depth for the jsonschema/auto engines; no known schema reaches it alone any more (the wiring is tested by monkeypatching).",
+      "Python 3.9 is checked syntactically only; no 3.9 interpreter here.",
+      "33 hearth-mutate-* directories dated 2026-10-04 remain in %TEMP% (already reported by T05 and gen-002); none were left by this generation's 8 mutation runs."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_governance.py -q -p no:cacheprovider",
+    "python governance/tools/validate_handover.py governance/handovers --strict",
+    "python governance/tools/validate_handover.py governance/handovers --strict --engine builtin",
+    "python governance/tools/path_aliases.py",
+    "python governance/tools/check_golden.py --rev HEAD --base-rev HEAD",
+    "python governance/tools/adr.py lint --rev HEAD",
+    "python governance/tools/adr.py breaker --rev HEAD --base-rev HEAD",
+    "HEARTH_LIB=<built hearth.dll> python -E governance/tools/check_golden.py --run",
+    "python governance/tools/mutate.py --file governance/tools/path_aliases.py --lines 50-153 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"path_aliases_fold or path_aliases_cli\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/merge_ref.py --lines 46-96,150-170 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"merge_ref\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/check_golden.py --lines 111-123,189,273,282,286-287,302,340,342,374,602-603,609 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"golden_rev_refuses or golden_rev_reads or golden_lock_rejects_links or relocks_itself\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/adr.py --lines 94-95,198-199,240-251,276-287,434-435 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"adr_rev_refuses or adr_read_rev or records_behind or adr_reads_git or decisions_gate\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/validate_handover.py --lines 393,469-470,504-505,848-849 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"keywords or unusable or malformed_schemas or well_formed or precheck or annotations or metaschema_check\\\"\"",
+    "WSL (POSIX): tar the files from 'git ls-files -co --exclude-standard', extract under $HOME, run $HOME/agenv/bin/python -m pytest tests/py/test_governance.py -q, delete the copy"
+  ],
+  "measurements": [
+    {
+      "metric": "tests/py/test_governance.py, Windows",
+      "value": 265,
+      "unit": "passed",
+      "conditions": "Windows 11, Python 3.13, jsonschema 4.26, git 2.45.1: 265 passed, 1 skipped (t-strings need 3.14) in 343.7 s, with a WSL test run and the golden suite running at the same time (noisy); gen-002 ended at 249 passed",
+      "kind": "measured"
+    },
+    {
+      "metric": "tests/py/test_governance.py, WSL2 Ubuntu 24.04",
+      "value": 264,
+      "unit": "passed",
+      "conditions": "Python 3.12.3 venv with pytest 9.1.1 and jsonschema 4.26, git 2.43, tree copied without .git: 264 passed, 2 skipped (t-strings; needs a git checkout) in 93.7 s",
+      "kind": "measured"
+    },
+    {
+      "metric": "golden suite through check_golden.py --run",
+      "value": 21,
+      "unit": "passed",
+      "conditions": "python -E governance/tools/check_golden.py --run with HEARTH_LIB=python/hearth/lib/hearth.dll (existing build, read only): 21 passed, 0 skipped, 1.6 s",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, path_aliases.py lines 50-153 (74 of 74, seed 1)",
+      "value": 0.932,
+      "unit": "fraction",
+      "conditions": "69 killed. Survivors: 2 real (default ROOT parents[2] -> 1/3, never checked because job copies have no .git; return 0 -> None, invisible through the CLI) -> assertions added, follow-up run of lines 50,149: 4/4 killed; 2 equivalent (git timeout 120 -> 119/121). Regex literals and fold steps are not mutated by mutate.py: see hand-made variants. 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, merge_ref.py lines 46-96,150-170 (30 of 30, seed 1)",
+      "value": 0.933,
+      "unit": "fraction",
+      "conditions": "28 killed; 2 equivalent survivors (git timeout 600 -> 599/601). 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, check_golden.py changed lines (7 of 7, seed 1)",
+      "value": 1.0,
+      "unit": "fraction",
+      "conditions": "lines 111-123,189,273,282,286-287,302,340,342,374,602-603,609; the string-key edits (aliases in passed(), in check()'s copy loop, in Revision.scan) are covered by hand-made variants, all killed. 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, adr.py changed lines (22 of 22, seed 1)",
+      "value": 1.0,
+      "unit": "fraction",
+      "conditions": "lines 94-95,198-199,240-251,276-287,434-435; 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, validate_handover.py changed lines (11 of 11, seed 1)",
+      "value": 0.909,
+      "unit": "fraction",
+      "conditions": "lines 393,469-470,504-505,848-849: 10 killed. Survivor: s['$id'][:-1] -> [:-2] (a one-character fragment) -> case added, follow-up run of line 504: 5/5 killed. An earlier run before the $id rule and the wiring test: 1 of 5 (the 4 metaschema-wiring mutants survived; see hypotheses_falsified). 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "hand-made variants killed (regex literals, fold steps, git flags, string keys, workflow and CODEOWNERS lines)",
+      "value": 31,
+      "unit": "of 32",
+      "conditions": "scratch variants.py over a copy of the tree, targeted -k selections. Survivors: short-name prefix {0,6} -> {0,7} (equivalent: prefix + digits < 8 already excludes 7). The dropped inner NFD survived at first; it is now killed by the U+0345 reordering twin",
+      "kind": "measured"
+    },
+    {
+      "metric": "new or changed tests failing against the gen-002 tools and workflows",
+      "value": 16,
+      "unit": "of 20",
+      "conditions": "scratch tree: gen-002 governance/tools plus the new path_aliases.py, gen-002 golden.yml/decisions.yml/CODEOWNERS, current tests; the 4 passing are path_aliases unit/CLI tests, the annotations control and an unrelated keyword test",
+      "kind": "measured"
+    },
+    {
+      "metric": "handover manifests valid (--strict)",
+      "value": 25,
+      "unit": "of 25",
+      "conditions": "governance/handovers/ including this manifest, default engine (jsonschema) and --engine builtin",
+      "kind": "measured"
+    },
+    {
+      "metric": "merge_ref.py --fetch of a real GitHub merge ref",
+      "value": 1.8,
+      "unit": "s",
+      "conditions": "anonymous https fetch of refs/pull/909/merge of actions/setup-python (depth 1, fsck on), then verify against a blob-filtered clone of its main: 'merge ref OK ... (an ancestor of base)'; 1.1 MB of objects; one run, home network",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Maintainer, outside the repository: enable branch protection on main (required checks 'golden lock vs base', 'decision circuit breaker' and the ci.yml jobs; require review from Code Owners; dismiss stale approvals; include administrators), keep main the default branch, create the labels 'golden-reviewed' and 'decisions-reviewed', and confirm the CODEOWNERS handle @pierce-lonergan. Without these the gates are advisory (governance/README.md, CI).",
+    "Maintainer: accept or reject ADR-0009 (amended again in this generation, still Proposed).",
+    "Proposed contract change (not made, INVARIANTS.md is maintainer-owned): INV-VERIFY should name the base comparison and the alias refusal; see the report's contract_issues.",
+    "Run golden.yml and decisions.yml on GitHub once (a same-repository and a fork pull request) and settle the open questions about pull_request_target, the token header and fetch-depth: 0 with sparse-checkout."
+  ]
+}

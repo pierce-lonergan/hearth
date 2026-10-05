@@ -2,7 +2,8 @@
  * platform_common.inc — OS-independent half of the platform layer.
  * Included (not compiled on its own) by platform_win.c and platform_posix.c so
  * both produce bit-identical conversions and identical parsing/logging.
- * The including file must provide hx_env_str() and include hx_platform.h.
+ * The including file must provide hx_env_str() and hx__strtod_c() (strtod in the "C"
+ * locale) and include hx_platform.h.
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +21,8 @@ float hx_f16_to_f32(uint16_t h) {
     uint32_t exp = (uint32_t)(h >> 10) & 0x1fu;
     uint32_t mant = (uint32_t)h & 0x3ffu;
     uint32_t bits;
-    if (exp == 0x1fu) {
-        bits = sign | 0x7f800000u | (mant << 13);           /* inf, or NaN with payload kept */
+    if (exp == 0x1fu) {                           /* inf; NaN quieted, payload kept (as F16C) */
+        bits = sign | 0x7f800000u | (mant ? 0x400000u : 0u) | (mant << 13);
     } else if (exp != 0) {
         bits = sign | ((exp + 112u) << 23) | (mant << 13);
     } else if (mant == 0) {
@@ -102,8 +103,10 @@ static uint64_t hx__xgetbv0(void) { return (uint64_t)_xgetbv(0); }
 
 #define HX__BIT(r, n) (((r) >> (n)) & 1u)
 
-/* ISA bits are reported only if the OS saves the matching register state. */
-static void hx__detect_x86(hx_cpu *c) {
+/* ISA bits are reported only if the OS saves the matching register state. zmm_lazy: the OS
+ * enables AVX-512 state on a thread's first use (Darwin), so XCR0 cannot show it up front and
+ * the caller has confirmed support another way. */
+static void hx__detect_x86(hx_cpu *c, int zmm_lazy) {
     uint32_t r[4];
     hx__cpuid(0, 0, r);
     uint32_t max_leaf = r[0];
@@ -116,7 +119,7 @@ static void hx__detect_x86(hx_cpu *c) {
     if (HX__BIT(ecx1, 27)) {                      /* OSXSAVE */
         uint64_t xcr0 = hx__xgetbv0();
         ymm_ok = (xcr0 & 0x6u) == 0x6u;           /* SSE + AVX state */
-        zmm_ok = ymm_ok && (xcr0 & 0xe0u) == 0xe0u; /* opmask, ZMM_Hi256, Hi16_ZMM */
+        zmm_ok = ymm_ok && ((xcr0 & 0xe0u) == 0xe0u || zmm_lazy);   /* opmask, ZMM_Hi256, Hi16_ZMM */
     }
     c->avx  = ymm_ok && HX__BIT(ecx1, 28);
     c->fma  = ymm_ok && HX__BIT(ecx1, 12);
@@ -183,12 +186,18 @@ int hx_env_int(const char *name, int def) {
     return (int)v;
 }
 
+static double hx__strtod_c(const char *s, char **end);
+
+/* Parsed in the "C" locale: a host process may have set LC_NUMERIC to one with a decimal comma.
+ * A value too small for a normal double is kept as the subnormal or zero it rounds to: glibc
+ * reports ERANGE for those and the MS CRT does not, so ERANGE counts only for overflow. */
 double hx_env_double(const char *name, double def) {
     const char *s = hx_env_str(name);
     char *end;
     if (!s || !*s) return def;
     errno = 0;
-    double v = strtod(s, &end);
+    double v = hx__strtod_c(s, &end);
+    if (errno == ERANGE && v < 1.0 && v > -1.0) errno = 0;
     if (end != s && errno != ERANGE) {
         while (hx__is_space(*end)) end++;
         if (!*end) return v;

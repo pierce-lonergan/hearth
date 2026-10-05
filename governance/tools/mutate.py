@@ -50,7 +50,9 @@ is always inactive. Other conditions are evaluated with three-valued logic
 auto = msvc on Windows unless $CC is set, else gnu; os = OS macros only; none),
 -D/-U overrides, and the #define/#undef lines of the file and of the quoted
 headers it includes. A branch that cannot be decided is mutated, and its
-mutants carry the condition ("cond") in the report.
+mutants carry the condition ("cond") in the report. C files are .c, .h and .inc;
+an .inc fragment is read in the context of the files that #include it (their
+earlier #defines, headers and typedefs; macros they disagree on are unknown).
 
 Sampling is deterministic for a given --seed: candidates are grouped by
 operator, each group is shuffled with the seed, and groups are drawn round-robin
@@ -1067,13 +1069,66 @@ def gen_python(src: str) -> list:
 
 
 # ============================================================= selection
+C_EXTENSIONS = (".c", ".h", ".inc")     # .inc: a C fragment #included by .c files (platform_common.inc)
+
+
 def language_of(path: Path) -> str:
     ext = path.suffix.lower()
-    if ext in (".c", ".h"):
+    if ext in C_EXTENSIONS:
         return "c"
     if ext == ".py":
         return "python"
-    raise MutateError(f"unsupported file type {ext!r} (C: .c/.h, Python: .py)")
+    raise MutateError(f"unsupported file type {ext!r} (C: {'/'.join(C_EXTENSIONS)}, Python: .py)")
+
+
+_QUOTED_INCLUDE = re.compile(r'^[ \t]*#[ \t]*include[ \t]*"([^"]+)"', re.M)
+
+
+def includers(path: Path, root: Path) -> list:
+    """[(file, text before its #include)] for the C files next to path or in engine/src that
+    include path by a quoted name. A fragment such as an .inc is compiled only there, so
+    their earlier #defines, headers and typedefs are its context."""
+    path = Path(path).resolve()
+    out = []
+    for d in dict.fromkeys([path.parent, (root / "engine" / "src").resolve()]):
+        for f in sorted(d.glob("*")) if d.is_dir() else []:
+            if f.suffix.lower() not in C_EXTENSIONS or f.resolve() == path or not f.is_file():
+                continue
+            try:
+                text = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in _QUOTED_INCLUDE.finditer(text):
+                found = header_resolver(root)(m.group(1), f)
+                if found is not None and found[1] == path:
+                    out.append((f, text[:m.start()]))
+                    break
+    return out
+
+
+def fragment_context(path: Path, root: Path, defs: dict) -> tuple:
+    """(macro model, typedef names, includer files) in effect where the includers include
+    path. A macro that the includers leave in different states is unknown."""
+    models, types = [], set()
+    resolve = header_resolver(root)
+    found = includers(path, root)
+    for f, before in found:
+        pp = Preprocessor(defs, resolve)
+        state = pp.regions(before, f)[-1][1]
+        if state == 0:                  # included only in a branch this machine does not compile
+            continue
+        models.append(pp.defs)
+        types |= c_typedef_names(lex_c(before))
+        for h in _local_headers(before, f, root):
+            try:
+                types |= c_typedef_names(lex_c(h.read_text(encoding="utf-8", errors="replace")))
+            except OSError:
+                pass
+    files = [f for f, _ in found]
+    if not models:
+        return defs, types, files
+    merged = {k: v for k, v in models[0].items() if all(k in m and m[k] == v for m in models[1:])}
+    return merged, types, files
 
 
 def generate(src: str, path: Path, root: Path, defs: dict = None, stats: dict = None) -> tuple:
@@ -1081,6 +1136,11 @@ def generate(src: str, path: Path, root: Path, defs: dict = None, stats: dict = 
     lang = language_of(path)
     if lang == "c":
         types = set()
+        if Path(path).suffix.lower() == ".inc":
+            defs, types, files = fragment_context(path, root, defs or {})
+            if stats is not None:
+                stats["includers"] = [f.relative_to(root).as_posix() if f.is_relative_to(root) else str(f)
+                                      for f in files]
         for h in _local_headers(src, path, root):
             try:
                 types |= c_typedef_names(lex_c(h.read_text(encoding="utf-8", errors="replace")))
@@ -1623,6 +1683,8 @@ def main(argv=None) -> int:
                       + (f"   [under {m.cond}]" if m.cond else ""))
             print(f"{len(selected)} selected of {len(cands)} in range ({n_cands} candidates, "
                   f"{invalid} invalid discarded, {gen_stats.get('inactive', 0)} in inactive #if branches)")
+            if "includers" in gen_stats:
+                print(f"fragment context: included by {', '.join(gen_stats['includers']) or 'nothing found'}")
         return 0
     if not a.test:
         print("mutate: --test is required (or use --list)", file=sys.stderr)
@@ -1721,6 +1783,7 @@ def main(argv=None) -> int:
         "timeout_requested_s": a.timeout, "baseline_s": round(base["seconds"], 3), "lines": a.lines,
         "since": a.since,
         "pp_model": resolve_pp_model(a.pp_model), "inactive_skipped": gen_stats.get("inactive", 0),
+        "included_by": gen_stats.get("includers"),
         "candidates": n_cands, "in_range": len(cands), "invalid_discarded": invalid, "selected": len(selected),
         "timeouts_retried": retried,
         "timeouts_cleared": sum(1 for r in results if r.get("first_status") and r["status"] != "timeout"),

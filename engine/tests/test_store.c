@@ -21,17 +21,22 @@
  * layer access, cache smaller than one token's working set, Zipf-skewed routing:
  * LRU vs LFU hit rate).
  * Scheduling-order properties (prefetch promotion, protection expiry, the
- * prefetch queue bound, the prefetch hot rule, starvation wakeups and holds,
- * wait_any's wakeups) run with readers whose reads are gated through store.c's
- * read hook, which makes them deterministic.
+ * prefetch queue bound, overlapping prefetch reads from one batch of hints, the
+ * prefetch hot rule, starvation wakeups and holds, wait_any's wakeups, every
+ * mirror tried before a read fails) run with readers whose reads are gated
+ * through store.c's read hook, which makes them deterministic. Also: read_errors,
+ * hx_store_count_uses, misses and hits of abandoned demands, and usage_out
+ * replaced by a rename. The containers carry the canonical tensors of their
+ * config (FORMAT.md §4.1), which modelfile.c requires.
  *
  * --bench writes a ~N GiB (default 6) synthetic container into the data dir
  * ($HEARTH_DATA, else %LOCALAPPDATA%/hearth or ~/.cache/hearth; never the
  * current directory) with unbuffered writes, measures cold demand-read
  * throughput for 1/2/4/8/16 readers with
  * Qwen3-30B-A3B-sized (2.39 MiB) and DeepSeek-V3-sized (22.3 MiB) Q4 slabs, direct
- * and buffered, prints a table and deletes the file. Synthetic weights; the
- * numbers depend on whatever else the machine is doing.
+ * and buffered demands and direct next-batch prefetch, prints a table and deletes
+ * the file. Synthetic weights; the numbers depend on whatever else the machine is
+ * doing.
  */
 #include "hx_store.h"
 #include "hx_modelfile.h"
@@ -137,6 +142,44 @@ static size_t meta_u32(uint8_t *m, const char *k, uint32_t v) {
     return 7 + n;
 }
 
+typedef struct { char name[32]; int dtype, ndim; uint32_t d0, d1; uint64_t off, nbytes; } wtensor;
+
+static void add_t(wtensor *t, int *n, int layer, const char *suffix, int dtype, int ndim, uint32_t d0, uint32_t d1) {
+    wtensor *w = &t[(*n)++];
+    if (layer < 0) snprintf(w->name, sizeof w->name, "%s", suffix);
+    else snprintf(w->name, sizeof w->name, "blk.%d.%s", layer, suffix);
+    w->dtype = dtype;
+    w->ndim = ndim;
+    w->d0 = d0;
+    w->d1 = ndim == 2 ? d1 : 1;
+    w->nbytes = (uint64_t)(ndim == 2 ? d0 : 1) * hx_row_bytes(dtype, ndim == 2 ? d1 : d0);
+}
+
+/* The canonical tensors (FORMAT.md §4.1) of the writer's config: one head of 64 dims,
+ * tied embeddings, dense FFN width 64; zero weights (the store reads only slabs). */
+static int canonical_tensors(const spec *s, wtensor *t) {
+    int n = 0, mdt = s->D % 64 ? HEARTH_F16 : HEARTH_Q4;
+    add_t(t, &n, -1, "tok_embd", mdt, 2, 64, (uint32_t)s->D);
+    add_t(t, &n, -1, "out_norm", HEARTH_F32, 1, (uint32_t)s->D, 0);
+    add_t(t, &n, -1, "rope_inv_freq", HEARTH_F32, 1, 32, 0);
+    for (int l = 0; l < s->L; l++) {
+        add_t(t, &n, l, "attn_norm", HEARTH_F32, 1, (uint32_t)s->D, 0);
+        add_t(t, &n, l, "ffn_norm", HEARTH_F32, 1, (uint32_t)s->D, 0);
+        add_t(t, &n, l, "attn_q", mdt, 2, 64, (uint32_t)s->D);
+        add_t(t, &n, l, "attn_k", mdt, 2, 64, (uint32_t)s->D);
+        add_t(t, &n, l, "attn_v", mdt, 2, 64, (uint32_t)s->D);
+        add_t(t, &n, l, "attn_o", HEARTH_Q4, 2, (uint32_t)s->D, 64);
+        if (s->lk[l]) {
+            add_t(t, &n, l, "moe_router", HEARTH_F32, 2, (uint32_t)s->E, (uint32_t)s->D);
+        } else {
+            add_t(t, &n, l, "ffn_gate", mdt, 2, 64, (uint32_t)s->D);
+            add_t(t, &n, l, "ffn_up", mdt, 2, 64, (uint32_t)s->D);
+            add_t(t, &n, l, "ffn_down", HEARTH_Q4, 2, (uint32_t)s->D, 64);
+        }
+    }
+    return n;
+}
+
 /* Lays out a container with an optional dense layer mask, per-entry dtype and aliases,
  * computes every slab's expected hash and writes the file (unbuffered if direct). */
 static int write_container(spec *s, int direct) {
@@ -155,6 +198,8 @@ static int write_container(spec *s, int direct) {
     mn += meta_u32(meta + mn, "d_model", (uint32_t)s->D);
     mn += meta_u32(meta + mn, "vocab_size", 64);
     mn += meta_u32(meta + mn, "n_heads", 1);
+    mn += meta_u32(meta + mn, "head_dim", 64);
+    mn += meta_u32(meta + mn, "tie_embeddings", 1);
     mn += meta_u32(meta + mn, "n_experts", (uint32_t)s->E);
     mn += meta_u32(meta + mn, "top_k", (uint32_t)s->K);
     mn += meta_u32(meta + mn, "expert_ffn_dim", (uint32_t)s->F);
@@ -163,9 +208,16 @@ static int write_container(spec *s, int direct) {
     memcpy(meta + mn + 17, s->lk, (size_t)s->L);
     mn += 17 + (size_t)s->L;
 
-    uint64_t meta_off = 64, tdir_off = meta_off + mn, edir_off = tdir_off + 128;
-    uint64_t rope_off = (edir_off + 32 * (uint64_t)ne_dir + 63) / 64 * 64, rope_n = (uint64_t)s->D / 2 * 4;
-    uint64_t hdr = (rope_off + rope_n + 4095) / 4096 * 4096, pos = hdr;
+    wtensor *ts = (wtensor *)calloc(3 + 9 * (size_t)s->L, sizeof *ts);
+    if (!ts) return 0;
+    int nt = canonical_tensors(s, ts);
+    uint64_t meta_off = 64, tdir_off = meta_off + mn, edir_off = tdir_off + 128 * (uint64_t)nt;
+    uint64_t tpos = (edir_off + 32 * (uint64_t)ne_dir + 63) / 64 * 64;
+    for (int i = 0; i < nt; i++) {
+        ts[i].off = tpos;
+        tpos = (tpos + ts[i].nbytes + 63) / 64 * 64;
+    }
+    uint64_t hdr = (tpos + 4095) / 4096 * 4096, pos = hdr;
     s->slab_max = 0;
     for (int i = 0; i < ne; i++) {
         if (!s->lk[i / s->E]) continue;
@@ -185,24 +237,29 @@ static int write_container(spec *s, int direct) {
     s->size = pos;
 
     uint8_t *h = (uint8_t *)hx_aligned_alloc(4096, (size_t)hdr);
-    if (!h) return 0;
+    if (!h) { free(ts); return 0; }
     memset(h, 0, (size_t)hdr);
     put32(h, HX_MAGIC); put32(h + 4, 1); put64(h + 8, meta_off); put64(h + 16, mn); put64(h + 24, tdir_off);
-    put64(h + 32, 1); put64(h + 40, edir_off); put64(h + 48, (uint64_t)ne_dir); put32(h + 56, 4096);
+    put64(h + 32, (uint64_t)nt); put64(h + 40, edir_off); put64(h + 48, (uint64_t)ne_dir); put32(h + 56, 4096);
     memcpy(h + meta_off, meta, mn);
-    memcpy(h + tdir_off, "rope_inv_freq", 13);
-    put32(h + tdir_off + 84, 1); put32(h + tdir_off + 88, (uint32_t)s->D / 2);
-    for (int k = 1; k < 4; k++) put32(h + tdir_off + 88 + 4 * k, 1);
-    put64(h + tdir_off + 104, rope_off); put64(h + tdir_off + 112, rope_n);
+    for (int i = 0; i < nt; i++) {
+        uint8_t *d = h + tdir_off + 128 * (uint64_t)i;
+        memcpy(d, ts[i].name, strlen(ts[i].name));
+        put32(d + 80, (uint32_t)ts[i].dtype); put32(d + 84, (uint32_t)ts[i].ndim);
+        put32(d + 88, ts[i].d0); put32(d + 92, ts[i].d1); put32(d + 96, 1); put32(d + 100, 1);
+        put64(d + 104, ts[i].off); put64(d + 112, ts[i].nbytes);
+        if (!strcmp(ts[i].name, "rope_inv_freq"))
+            for (uint32_t j = 0; j < ts[i].d0; j++) {
+                float f = 1.0f / (float)(j + 1);
+                memcpy(h + ts[i].off + 4 * j, &f, 4);
+            }
+    }
+    free(ts);
     for (int i = 0; i < ne_dir; i++) {
         uint8_t *e = h + edir_off + 32 * (uint64_t)i;
         put64(e, s->off[i]); put64(e + 8, s->nbytes[i]);
         put32(e + 16, (uint32_t)(s->nbytes[i] ? s->dtype[i] : 0));
         put32(e + 20, (s->alias && s->alias[i] >= 0) ? 1u : 0u);
-    }
-    for (uint64_t i = 0; i < rope_n / 4; i++) {
-        float f = 1.0f / (float)(i + 1);
-        memcpy(h + rope_off + 4 * i, &f, 4);
     }
 
     char err[300];
@@ -345,7 +402,8 @@ typedef struct {
     int closed;                          /* readers block in the hook while set */
     int n, key[GATE_LOG], file[GATE_LOG];/* read attempts in order */
     int direct[2];                       /* attempts on buffered / direct handles */
-    int fail_key, fail_file, fail_left;  /* fail attempts on fail_key (file fail_file, or any if -1), fail_left more times (-1: always) */
+    int fail_key, fail_left;             /* fail attempts on fail_key, fail_left more times (-1: always) */
+    unsigned fail_files;                 /* ... on the files whose bits are set */
 } gate;
 
 static void gate_init(gate *g, int E) {
@@ -353,7 +411,7 @@ static void gate_init(gate *g, int E) {
     hx_mutex_init(&g->mu);
     hx_cond_init(&g->cv);
     g->E = E;
-    g->fail_key = g->fail_file = -1;
+    g->fail_key = -1;
 }
 
 static void gate_destroy(gate *g) {
@@ -370,7 +428,7 @@ static int gate_hook(void *ctx, int layer, int expert, int file, int direct) {
     g->direct[direct != 0]++;
     hx_cond_broadcast(&g->cv);
     while (g->closed) hx_cond_wait(&g->cv, &g->mu);
-    if (key == g->fail_key && (g->fail_file < 0 || file == g->fail_file) && g->fail_left) {
+    if (key == g->fail_key && file < 32 && (g->fail_files >> file & 1u) && g->fail_left) {
         fail = 1;
         if (g->fail_left > 0) g->fail_left--;
     }
@@ -385,13 +443,16 @@ static void gate_set(gate *g, int closed) {
     hx_mutex_unlock(&g->mu);
 }
 
-static void gate_fail(gate *g, int key, int file, int times) {
+static void gate_fail_files(gate *g, int key, unsigned files, int times) {
     hx_mutex_lock(&g->mu);
     g->fail_key = key;
-    g->fail_file = file;
+    g->fail_files = files;
     g->fail_left = times;
     hx_mutex_unlock(&g->mu);
 }
+
+/* file -1: every file */
+static void gate_fail(gate *g, int key, int file, int times) { gate_fail_files(g, key, file < 0 ? ~0u : 1u << file, times); }
 
 static int gate_count(gate *g) {
     hx_mutex_lock(&g->mu);
@@ -718,15 +779,19 @@ static void overcommit(const spec *sp, hx_modelfile *mf) {
             st = open_store(mf, 0, ios[ii], 0, pol, NULL, NULL, 0, 0, NULL, 0, err, sizeof err);
             if (!st) continue;
             for (int i = 0; i < n; i++) CHECK(!hx_store_try_acquire(st, keys[i] / sp->E, keys[i] % sp->E), "cold hit");
-            int head = -1;
-            for (int settled = 0, last = -1; settled < 20; hx_sleep_us(2000)) {   /* until the readers are starved */
-                int r = 0;
-                while (r < n && hx_store_is_resident(st, keys[r] / sp->E, keys[r] % sp->E)) r++;
-                settled = r == last ? settled + 1 : 0;
-                last = r;
-                head = r;
-            }
-            CHECK(head > 0 && head < n, "overcommit: %d of %d served before starving", head, n);
+            /* the first n_slots demands are read into the free slots and held; then nothing is
+             * evictable and the readers starve. Wait for those reads however long the machine
+             * takes (polling is_resident, which leaves the holds alone), then check that no
+             * further read happened. */
+            hx_store_stats s0;
+            hx_store_get_stats(st, &s0);
+            int ns = s0.n_slots, served = wait_resident(st, sp, keys, ns, 30000), head = 0;
+            hx_sleep_us(20000);
+            hx_store_get_stats(st, &s0);
+            while (head < n && hx_store_is_resident(st, keys[head] / sp->E, keys[head] % sp->E)) head++;
+            CHECK(served && head == ns && ns < n && s0.reads == (uint64_t)ns,
+                  "overcommit: %d of %d served before starving, want the %d slots (%llu reads)", head, n, ns,
+                  (unsigned long long)s0.reads);
             hx_store_tick(st);
             if (head > 0 && head < n) {
                 const void *p;
@@ -1417,6 +1482,10 @@ static void unreadable(const spec *sp) {
         CHECK(hx_store_try_acquire(st, last / sp->E, last % sp->E) == NULL, "unreadable slab try_acquire");
         hx_store_tick(st);   /* retried after a tick, and still unreadable */
         CHECK(hx_store_acquire(st, last / sp->E, last % sp->E) == NULL, "unreadable slab returned after a tick");
+        hx_store_stats s;
+        hx_store_get_stats(st, &s);
+        CHECK(s.read_errors == 2, "a slab past the end of the file, read twice: read_errors %llu, want 2",
+              (unsigned long long)s.read_errors);
         for (int k = 0; k < ne; k++) {
             if (!sp->nbytes[k] || sp->off[k] == sp->off[last]) continue;
             const void *p = hx_store_acquire(st, k / sp->E, k % sp->E);
@@ -1770,6 +1839,260 @@ static void pf_queue_limit(const spec *sp, hx_modelfile *mf) {
     printf("  prefetch queue bound: hints beyond in-flight + queue bound are dropped (1 and 5 readers) and can be re-hinted\n");
 }
 
+/* One hx_store_prefetch call with n_io + 1 hints (the next layer's top-k, ARCHITECTURE
+ * step 3) starts n_io - 1 reads at once, the prefetch in-flight limit, on readers that
+ * were idle. The readers are held in the read hook, so the number that entered it is
+ * the number of reads in flight. Three rounds on fresh layers per reader count. */
+static void prefetch_overlap(const spec *sp, hx_modelfile *mf) {
+    static const int ios[] = {3, 5, 8};
+    char err[400];
+    g_phase = "prefetch overlap";
+    for (size_t ii = 0; ii < sizeof ios / sizeof ios[0]; ii++) {
+        int n_io = ios[ii], k = n_io + 1, want = n_io - 1, layer = -1, worst = 1 << 30;
+        gate g;
+        gate_init(&g, sp->E);
+        hx_store *st = open_store(mf, 40 * mf->slab_bytes_max, n_io, 0, HEARTH_POLICY_LFU, NULL, NULL, 0, 0, NULL, 0, err,
+                                  sizeof err);
+        CHECK(st != NULL, "open: %s", err);
+        if (!st) { gate_destroy(&g); continue; }
+        hx_store_set_read_hook(st, gate_hook, &g);
+        for (int round = 0; round < 3; round++) {
+            do layer++; while (layer < sp->L && !sp->lk[layer]);
+            if (layer >= sp->L) break;
+            int ids[16], keys[16];
+            for (int i = 0; i < k; i++) { ids[i] = i; keys[i] = layer * sp->E + i; }
+            hx_sleep_us(20000);   /* the readers wait for work */
+            int n0 = gate_count(&g);
+            gate_set(&g, 1);
+            hx_store_prefetch(st, layer, ids, k);
+            int ok = gate_wait(&g, n0 + want, 10000);
+            hx_sleep_us(20000);
+            int inflight = gate_count(&g) - n0;
+            gate_set(&g, 0);
+            if (inflight < worst) worst = inflight;
+            CHECK(ok && inflight == want, "%d readers, one prefetch call with %d hints: %d reads in flight, want %d", n_io, k,
+                  inflight, want);
+            CHECK(wait_resident(st, sp, keys, k, 10000), "%d readers: prefetched slabs not resident", n_io);
+            tickle();
+            if (!ok) break;   /* each failed round costs the 10 s timeout */
+        }
+        hx_store_stats s;
+        hx_store_get_stats(st, &s);
+        CHECK(s.prefetch_issued == (uint64_t)(3 * k), "%d readers: %llu prefetches issued, want %d", n_io,
+              (unsigned long long)s.prefetch_issued, 3 * k);
+        hx_store_close(st);
+        gate_destroy(&g);
+        printf("  prefetch overlap, %d readers: one call with %d hints -> %d reads in flight (limit %d)\n", n_io, k, worst,
+               want);
+    }
+}
+
+/* hx_store_count_uses: n more uses of a held expert are hits and heat (hx_store_heat, the
+ * usage file, LFU eviction); on an expert the caller does not hold, or with n = 0, nothing. */
+static void count_uses(const spec *sp, hx_modelfile *mf) {
+    char up[800], err[400];
+    int ne = sp->L * sp->E, *keys = (int *)malloc(sizeof(int) * (size_t)ne), nk = list_keys(sp, keys);
+    int X = keys[0], Y = keys[1];
+    float *heat = (float *)calloc((size_t)ne, sizeof(float));
+    snprintf(up, sizeof up, "%s.uses.usage", sp->path);
+    remove(up);
+    g_phase = "count uses";
+    hx_store *st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LFU, NULL, up, 0, 0, NULL, 0, err, sizeof err);
+    CHECK(st != NULL, "open: %s", err);
+    if (st) {
+        hx_store_stats s;
+        acq_rel(st, sp, keys[2], "count uses");   /* takes the first slot: X lands in another */
+        hx_store_reset_stats(st);
+        const void *p = hx_store_acquire(st, X / sp->E, X % sp->E);
+        verify_slab(sp, X, p, "count uses");
+        hx_store_count_uses(st, X / sp->E, X % sp->E, 2);
+        hx_store_count_uses(st, X / sp->E, X % sp->E, 1);
+        hx_store_count_uses(st, X / sp->E, X % sp->E, 0);
+        hx_store_get_stats(st, &s);
+        CHECK(s.misses == 1 && s.hits == 3 && hx_store_heat(st)[X] == 4.0f, "count_uses(2), (1), (0) on a held expert: "
+              "misses %llu hits %llu heat %g, want 1, 3, 4", (unsigned long long)s.misses, (unsigned long long)s.hits,
+              (double)hx_store_heat(st)[X]);
+        if (p) hx_store_release(st, X / sp->E, X % sp->E);
+        hx_store_count_uses(st, X / sp->E, X % sp->E, 5);   /* released: not held */
+        hx_store_count_uses(st, Y / sp->E, Y % sp->E, 2);   /* never acquired */
+        hx_store_count_uses(st, -1, 0, 2);
+        hx_store_count_uses(st, 0, sp->E, 2);
+        hx_store_count_uses(NULL, 0, 0, 2);
+        hx_store_get_stats(st, &s);
+        CHECK(s.hits == 3 && hx_store_heat(st)[X] == 4.0f && hx_store_heat(st)[Y] == 0.0f,
+              "count_uses on experts not held changed hits (%llu) or heat (%g, %g)", (unsigned long long)s.hits,
+              (double)hx_store_heat(st)[X], (double)hx_store_heat(st)[Y]);
+        hx_store_close(st);
+        uint64_t tok = 1;
+        int ok = read_usage(up, sp->L, sp->E, &tok, heat);
+        CHECK(ok && tok == 0 && heat[X] == 4.0f && heat[Y] == 0.0f, "usage file after count_uses: X %g Y %g",
+              (double)heat[X], (double)heat[Y]);
+    }
+    /* LFU: churn through experts used 3 times each evicts X used once, or once plus 1
+     * counted use; X with 50 counted uses outlives it */
+    static const uint32_t extra[3] = {0, 1, 50};
+    for (int v = 0; v < 3; v++) {
+        st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LFU, NULL, NULL, 0, 0, NULL, 0, err, sizeof err);
+        CHECK(st != NULL, "open: %s", err);
+        if (!st) continue;
+        const void *p = hx_store_acquire(st, X / sp->E, X % sp->E);
+        if (p) hx_store_count_uses(st, X / sp->E, X % sp->E, extra[v]);
+        if (p) hx_store_release(st, X / sp->E, X % sp->E);
+        for (int i = 1; i <= 40 && i < nk; i++)
+            for (int u = 0; u < 3; u++) acq_rel(st, sp, keys[i], "count uses churn");
+        int res = hx_store_is_resident(st, X / sp->E, X % sp->E);
+        CHECK(res == (v == 2), "LFU with %u counted uses on top of one acquire: X %s, want %s", extra[v],
+              res ? "kept" : "evicted", v == 2 ? "kept (heat 51 > 3)" : "evicted (heat < 3)");
+        hx_store_close(st);
+    }
+    remove(up);
+    free(heat);
+    free(keys);
+    printf("  count_uses: extra uses of a held expert are hits and heat (profile, LFU); ignored when not held\n");
+}
+
+/* A demanded slab the caller never collects ends its pending miss when it is evicted (a
+ * later request is a new miss) and at the next tick (a later use is a hit). */
+static void abandoned_demands(const spec *sp, hx_modelfile *mf) {
+    char err[400];
+    int *keys = (int *)malloc(sizeof(int) * (size_t)(sp->L * sp->E));
+    list_keys(sp, keys);
+    g_phase = "abandoned demands";
+    hx_store *st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LRU, NULL, NULL, 0, 0, NULL, 0, err, sizeof err);
+    CHECK(st != NULL, "open: %s", err);
+    if (st) {
+        hx_store_stats s;
+        hx_store_get_stats(st, &s);
+        int ns = s.n_slots, A = keys[0], Z = keys[ns];
+        for (int i = 0; i <= ns; i++) CHECK(!hx_store_try_acquire(st, keys[i] / sp->E, keys[i] % sp->E), "cold hit");
+        CHECK(wait_resident(st, sp, keys, ns, 30000), "demands not completed");
+        /* the last demand starves behind the holds until wait_any drops them; it then evicts A */
+        uint64_t end = hx_now_ns() + 30000000000ull;
+        while (!hx_store_is_resident(st, Z / sp->E, Z % sp->E) && hx_now_ns() < end) hx_store_wait_any(st, 10000);
+        CHECK(hx_store_is_resident(st, Z / sp->E, Z % sp->E) && !hx_store_is_resident(st, A / sp->E, A % sp->E),
+              "the starved demand did not evict the oldest uncollected slab");
+        hx_store_reset_stats(st);
+        const void *p = hx_store_acquire(st, A / sp->E, A % sp->E);
+        verify_slab(sp, A, p, "abandoned and evicted");
+        if (p) hx_store_release(st, A / sp->E, A % sp->E);
+        hx_store_get_stats(st, &s);
+        CHECK(s.misses == 1 && s.hits == 0 && s.reads == 1,
+              "an evicted, never collected demand: its re-read counted misses %llu hits %llu (reads %llu), want 1, 0, 1",
+              (unsigned long long)s.misses, (unsigned long long)s.hits, (unsigned long long)s.reads);
+        hx_store_close(st);
+    }
+    st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LRU, NULL, NULL, 0, 0, NULL, 0, err, sizeof err);
+    CHECK(st != NULL, "open: %s", err);
+    if (st) {
+        int X = keys[3];
+        CHECK(!hx_store_try_acquire(st, X / sp->E, X % sp->E), "cold hit");
+        CHECK(wait_resident(st, sp, &X, 1, 30000), "demand not completed");
+        hx_store_tick(st);
+        hx_store_tick(st);
+        hx_store_reset_stats(st);
+        acq_rel(st, sp, X, "abandoned, still resident");
+        acq_rel(st, sp, X, "abandoned, still resident");
+        hx_store_stats s;
+        hx_store_get_stats(st, &s);
+        CHECK(s.hits == 2 && s.misses == 0 && s.reads == 0,
+              "two uses of a resident slab demanded and abandoned two tokens earlier: hits %llu misses %llu, want 2, 0",
+              (unsigned long long)s.hits, (unsigned long long)s.misses);
+        hx_store_close(st);
+    }
+    free(keys);
+    printf("  abandoned demands: eviction or the token end ends the pending miss (re-read = miss, later use = hit)\n");
+}
+
+/* usage_out is replaced by a rename, not rewritten in place: a handle opened on the old
+ * profile before close still reads the old bytes; a new open reads the new profile. */
+static void usage_replace(const spec *sp, hx_modelfile *mf) {
+    char up[800], bad[900], err[400];
+    int ne = sp->L * sp->E;
+    float *heat = (float *)calloc((size_t)ne, sizeof(float)), *back = (float *)calloc((size_t)ne, sizeof(float));
+    uint8_t *raw = (uint8_t *)malloc(24 + 4 * (size_t)ne);
+    uint64_t r = 9;
+    int X = moe_key(sp, &r);
+    for (int k = 0; k < ne; k++) heat[k] = 7.0f;
+    snprintf(up, sizeof up, "%s.replace.usage", sp->path);
+    g_phase = "usage_out replace";
+    CHECK(write_usage(up, sp->L, sp->E, 5, heat), "write the old profile");
+    hx_file *old = hx_file_open(up, HX_FILE_READ, err, sizeof err);
+    CHECK(old != NULL, "open the old profile: %s", err);
+    hx_store *st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LFU, NULL, up, 0, 0, NULL, 0, err, sizeof err);
+    CHECK(st != NULL, "open: %s", err);
+    if (st) {
+        acq_rel(st, sp, X, "usage replace");
+        hx_store_tick(st);
+        hx_store_close(st);
+    }
+    uint64_t tok = 0;
+    int ok = read_usage(up, sp->L, sp->E, &tok, back);
+    CHECK(ok && tok == 1 && back[X] == 1.0f, "the new profile was not written (tokens %llu, heat %g)",
+          (unsigned long long)tok, ok ? (double)back[X] : -1.0);
+    if (old) {
+        int same = hx_file_pread(old, raw, 24 + 4 * (size_t)ne, 0) == (int64_t)(24 + 4 * (size_t)ne);
+        uint64_t t0 = 0;
+        float h0 = 0.0f;
+        memcpy(&t0, raw + 16, 8);
+        memcpy(&h0, raw + 24 + 4 * (size_t)X, 4);
+        CHECK(same && t0 == 5 && h0 == 7.0f, "a reader of the old profile saw it rewritten in place (tokens %llu, heat %g)",
+              (unsigned long long)t0, (double)h0);
+        hx_file_close(old);
+    }
+    /* a directory that does not exist: nothing is written, close does not fail */
+    snprintf(bad, sizeof bad, "%s.no_such_dir/x.usage", sp->path);
+    st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LFU, NULL, bad, 0, 0, NULL, 0, err, sizeof err);
+    CHECK(st != NULL, "open: %s", err);
+    hx_store_close(st);
+    CHECK(!hx_path_exists(bad), "a profile appeared in a missing directory");
+    remove(up);
+    free(raw);
+    free(heat);
+    free(back);
+    printf("  usage_out: replaced by a rename (a reader of the old profile keeps the old bytes)\n");
+}
+
+/* Every copy is tried before a read fails: with three mirrors and one slab unreadable on
+ * three of the four files, every acquire of it succeeds, whichever file the read starts
+ * on (the starting file rotates; LRU churn evicts the slab between reads). */
+static void all_copies_tried(const spec *sp, hx_modelfile *mf) {
+    char m[3][800], err[400];
+    int *keys = (int *)malloc(sizeof(int) * (size_t)(sp->L * sp->E));
+    int nk = list_keys(sp, keys), churn = 2 * sp->K + 4, X = keys[9];
+    g_phase = "every mirror tried";
+    const char *ms[3];
+    for (int i = 0; i < 3; i++) {
+        snprintf(m[i], sizeof m[i], "%s.copy%d", sp->path, i);
+        CHECK(copy_file(sp->path, m[i], -1, 0), "copy mirror %d", i);
+        ms[i] = m[i];
+    }
+    for (int good = 0; good < 4 && nk >= 20 + churn; good += 3) {
+        gate g;
+        gate_init(&g, sp->E);
+        hx_store *st = open_store(mf, 0, 1, 0, HEARTH_POLICY_LRU, NULL, NULL, 0, 0, ms, 3, err, sizeof err);
+        CHECK(st != NULL, "open with three mirrors: %s", err);
+        if (st) {
+            int got = 0, reps = 8;
+            hx_store_set_read_hook(st, gate_hook, &g);
+            gate_fail_files(&g, X, 0xFu & ~(1u << good), -1);
+            for (int rep = 0; rep < reps; rep++) {
+                const void *p = hx_store_acquire(st, X / sp->E, X % sp->E);
+                got += verify_slab(sp, X, p, "only one readable copy");
+                if (p) hx_store_release(st, X / sp->E, X % sp->E);
+                for (int i = 0; i < churn; i++) acq_rel(st, sp, keys[20 + i], "copies churn");
+            }
+            hx_store_stats s;
+            hx_store_get_stats(st, &s);
+            CHECK(got == reps && s.read_errors == 0, "file %d the only good copy: %d of %d acquires succeeded, %llu read errors",
+                  good, got, reps, (unsigned long long)s.read_errors);
+            hx_store_close(st);
+        }
+        gate_destroy(&g);
+    }
+    for (int i = 0; i < 3; i++) remove(m[i]);
+    free(keys);
+}
+
 /* pin_fraction 0.9 with a cache just above the minimum: pinning stops where fewer
  * than the minimum slots would stay unpinned, so top-k bursts still complete. */
 static void pin_cap(const spec *sp, hx_modelfile *mf, int quick) {
@@ -1837,6 +2160,25 @@ static void pin_cap(const spec *sp, hx_modelfile *mf, int quick) {
         free(rank);
         hx_store_close(st);
     }
+    /* the cap holds also when every expert has a slot (hx_store.h): 0.9 of 80 slots pins
+     * 80 - min, not int(0.9 * 80) = 72 */
+    int n_ne = 0;
+    for (int k = 0; k < ne; k++) {
+        heat[k] = sp->nbytes[k] ? (float)(1 + k % 7) : 0.0f;
+        n_ne += sp->nbytes[k] != 0;
+    }
+    CHECK(write_usage(up, sp->L, sp->E, 100, heat), "write usage profile");
+    st = open_store(mf, (uint64_t)(n_ne + 50) * mf->slab_bytes_max, n_io, 0, HEARTH_POLICY_LFU, up, NULL, 0.9f, 0, NULL, 0,
+                    err, sizeof err);
+    CHECK(st != NULL, "open: %s", err);
+    if (st) {
+        hx_store_stats s;
+        hx_store_get_stats(st, &s);
+        CHECK(s.n_slots == n_ne && (int)(0.9 * n_ne) > n_ne - min && s.pinned == n_ne - min,
+              "every expert fits (%d slots): %d pinned, want %d (the minimum %d unpinned)", s.n_slots, s.pinned, n_ne - min,
+              min);
+        hx_store_close(st);
+    }
     remove(up);
     free(heat);
     printf("  pin cap: pin_fraction 0.9 near the minimum leaves the minimum unpinned (bursts complete); warm start fills the "
@@ -1865,7 +2207,10 @@ static void read_failures(const spec *sp, hx_modelfile *mf) {
         gate_fail(&g, X, -1, -1);
         CHECK(hx_store_acquire(st, X / sp->E, X % sp->E) == NULL, "acquire of an unreadable expert returned a slab");
         int n1 = gate_count(&g);
-        CHECK(n1 >= 2, "a failed read was not retried (%d attempts)", n1);
+        CHECK(n1 == 3, "a failed read was attempted %d times, want 3 (one file)", n1);
+        hx_store_stats s;
+        hx_store_get_stats(st, &s);
+        CHECK(s.read_errors == 1, "a failed demand read: read_errors %llu, want 1", (unsigned long long)s.read_errors);
         CHECK(!hx_store_try_acquire(st, X / sp->E, X % sp->E), "unreadable expert: try_acquire hit");
         uint64_t t0 = hx_now_ns();
         hx_store_wait_any(st, 30000);
@@ -1879,18 +2224,29 @@ static void read_failures(const spec *sp, hx_modelfile *mf) {
         CHECK(gate_count(&g) == n1 + 1, "a failed expert was re-read within the same token (%d extra attempts)",
               gate_count(&g) - n1 - 1);
         hx_store_tick(st);
-        acq_rel(st, sp, X, "failed expert after a tick");
-        hx_store_stats s;
         hx_store_get_stats(st, &s);
-        CHECK(s.reads == 2, "reads %llu, want 2", (unsigned long long)s.reads);
+        uint64_t m0 = s.misses, h0 = s.hits;
+        acq_rel(st, sp, X, "failed expert after a tick");
+        hx_store_get_stats(st, &s);
+        CHECK(s.reads == 2 && s.read_errors == 1, "reads %llu read_errors %llu, want 2, 1", (unsigned long long)s.reads,
+              (unsigned long long)s.read_errors);
+        CHECK(s.misses == m0 + 1 && s.hits == h0, "the re-read of a failed expert after a tick: %llu new misses, %llu new "
+              "hits, want 1, 0", (unsigned long long)(s.misses - m0), (unsigned long long)(s.hits - h0));
         /* a failed prefetch is dropped without marking the expert: a demand right after reads it */
         int Z = keys[8], ze = Z % sp->E, nz = gate_count(&g);
         gate_fail(&g, Z, -1, -1);
         hx_store_prefetch(st, Z / sp->E, &ze, 1);
-        CHECK(gate_wait(&g, nz + 2, 10000), "failing prefetch not retried");
-        hx_store_wait_any(st, 50000);
+        CHECK(gate_wait(&g, nz + 3, 10000), "failing prefetch not retried");
+        for (uint64_t end = hx_now_ns() + 10000000000ull;; hx_sleep_us(200)) {   /* the third attempt's failure */
+            hx_store_get_stats(st, &s);
+            if (s.read_errors >= 2 || hx_now_ns() > end) break;
+        }
+        CHECK(s.read_errors == 2, "a failed prefetch read: read_errors %llu, want 2", (unsigned long long)s.read_errors);
         gate_fail(&g, -1, -1, 0);
         acq_rel(st, sp, Z, "demand after a failed prefetch");
+        hx_store_reset_stats(st);
+        hx_store_get_stats(st, &s);
+        CHECK(s.read_errors == 0, "reset_stats left read_errors %llu", (unsigned long long)s.read_errors);
         hx_store_close(st);
     }
     gate_destroy(&g);
@@ -2086,6 +2442,13 @@ static void wait_any_wakeups(const spec *sp, hx_modelfile *mf) {
         acq_rel(st, sp, B, "collected");
         ms = timed_wait_any(st, 30000);
         CHECK(ms >= 30.0, "wait_any returned after %.3f ms with nothing pending", ms);
+
+        /* a prefetch the caller did not demand is no news */
+        int P = keys[6], pe = P % sp->E;
+        hx_store_prefetch(st, P / sp->E, &pe, 1);
+        CHECK(wait_resident(st, sp, &P, 1, 10000), "prefetch not completed");
+        ms = timed_wait_any(st, 30000);
+        CHECK(ms >= 30.0, "wait_any returned after %.3f ms for a completed prefetch nobody demanded", ms);
 
         /* a completion the caller has seen, by collecting it with try_acquire or acquire, is no news */
         int D = keys[3], E2 = keys[4], F = keys[5];
@@ -2547,6 +2910,42 @@ static bench_pt bench_once(hx_modelfile *mf, const spec *sp, const int *keys, in
     return res;
 }
 
+/* Next-layer prefetch as in ARCHITECTURE step 3, when the readers are idle at the hint
+ * (compute outlasted the previous reads): one hx_store_prefetch call hints a batch (8
+ * experts of one layer), the caller waits without demanding (an engine computes
+ * meanwhile; demands would wake readers themselves) until it is resident, uses it, and
+ * only then hints the next batch. GB/s = batch bytes / batch latency. No tick: a tick
+ * would end the protection of the hinted batch. */
+static bench_pt bench_prefetch(hx_modelfile *mf, const spec *sp, const int *batches, int nb, int n_io) {
+    bench_pt res = {0, 0, 0};
+    char err[400];
+    uint64_t cache = (uint64_t)(2 * 8 + 2 * sp->K + n_io + 6) * mf->slab_bytes_max;
+    hx_store *st = open_store(mf, cache, n_io, 1, HEARTH_POLICY_LFU, NULL, NULL, 0, 0, NULL, 0, err, sizeof err);
+    if (!st) { printf("  bench open failed: %s\n", err); return res; }
+    uint64_t t0 = hx_now_ns();
+    for (int b = 0; b < nb; b++) {
+        const int *cur = batches + 9 * b;   /* layer, then 8 experts */
+        hx_store_prefetch(st, cur[0], cur + 1, 8);
+        for (int i = 1, waits = 0; i <= 8 && waits < 100000; waits++)   /* wait_any: until the next completion */
+            if (hx_store_is_resident(st, cur[0], cur[i])) i++;
+            else hx_store_wait_any(st, 2000);
+        for (int i = 1; i <= 8; i++) {
+            const void *p = hx_store_acquire(st, cur[0], cur[i]);
+            if (!p) { printf("  bench: read failed\n"); b = nb; break; }
+            hx_store_release(st, cur[0], cur[i]);
+        }
+        tickle();
+    }
+    uint64_t t1 = hx_now_ns();
+    hx_store_stats s;
+    hx_store_get_stats(st, &s);
+    hx_store_close(st);
+    res.bytes = s.bytes_read;
+    res.gbps = (double)s.bytes_read / (double)(t1 - t0);
+    res.lat_ms = s.reads ? (double)s.read_ns / (double)s.reads / 1e6 : 0;
+    return res;
+}
+
 static int bench(double gib, const char *dir_arg) {
     char dir[600];
     if (!data_dir(dir, sizeof dir, dir_arg)) return 1;
@@ -2559,7 +2958,9 @@ static int bench(double gib, const char *dir_arg) {
            hx_cpu_features()->brand, gib, dir);
     printf("  cold reads (direct: the whole file per column, never cached; buffered: each column reads a disjoint,\n"
            "  never-read fifth of the file, which was written unbuffered),\n"
-           "  random expert order, demand window 2 x readers. GB = 1e9 bytes. Measured on a shared machine: noisy.\n");
+           "  random expert order, demand window 2 x readers. prefetch: direct, the whole file, one hx_store_prefetch\n"
+           "  call per batch of 8 experts of a layer to idle readers, used once resident (never demanded), then the next.\n"
+           "  GB = 1e9 bytes. Measured on a shared machine: noisy.\n");
     for (size_t si = 0; si < sizeof shapes / sizeof shapes[0]; si++) {
         uint64_t og, ou, od;
         uint64_t slab = hx_slab_layout(HEARTH_Q4, shapes[si].D, shapes[si].F, &og, &ou, &od);
@@ -2588,18 +2989,31 @@ static int bench(double gib, const char *dir_arg) {
         uint64_t r = 42 + si;
         for (int i = 0; i < ne; i++) keys[i] = i;
         for (int i = ne - 1; i > 0; i--) { int j = (int)rn(&r, (uint32_t)i + 1), t = keys[i]; keys[i] = keys[j]; keys[j] = t; }
+        int nb = ne / 8, *batches = (int *)malloc(sizeof(int) * 9 * (size_t)nb), *lorder = (int *)malloc(sizeof(int) * (size_t)L);
+        for (int l = 0; l < L; l++) lorder[l] = l;
+        for (int l = L - 1; l > 0; l--) { int j = (int)rn(&r, (uint32_t)l + 1), t = lorder[l]; lorder[l] = lorder[j]; lorder[j] = t; }
+        for (int li = 0, b = 0; li < L; li++) {   /* batches of 8 experts of one layer, layers and experts shuffled */
+            int ex[256];
+            for (int e = 0; e < E; e++) ex[e] = e;
+            for (int e = E - 1; e > 0; e--) { int j = (int)rn(&r, (uint32_t)e + 1), t = ex[e]; ex[e] = ex[j]; ex[j] = t; }
+            for (int e = 0; e + 8 <= E; e += 8, b++) {
+                batches[9 * b] = lorder[li];
+                memcpy(batches + 9 * b + 1, ex + e, 8 * sizeof(int));
+            }
+        }
         printf("    %-9s", "readers");
         for (size_t ii = 0; ii < sizeof ios / sizeof ios[0]; ii++) printf("  %8d", ios[ii]);
         printf("\n");
-        for (int direct = 1; direct >= 0; direct--) {
+        for (int row = 0; row < 3; row++) {   /* direct demands, direct prefetch batches, buffered demands */
             bench_pt pt[5];
             g_phase = "bench read";
             for (size_t ii = 0; ii < sizeof ios / sizeof ios[0]; ii++) {
                 int part = ne / 5, start = (int)ii * part;
-                pt[ii] = direct ? bench_once(mf, &sp, keys, ne, ios[ii], 1)
-                                : bench_once(mf, &sp, keys + start, part, ios[ii], 0);
+                pt[ii] = row == 0   ? bench_once(mf, &sp, keys, ne, ios[ii], 1)
+                         : row == 1 ? bench_prefetch(mf, &sp, batches, nb, ios[ii])
+                                    : bench_once(mf, &sp, keys + start, part, ios[ii], 0);
             }
-            printf("    %-9s", direct ? "direct" : "buffered");
+            printf("    %-9s", row == 0 ? "direct" : row == 1 ? "prefetch" : "buffered");
             for (int i = 0; i < 5; i++) printf("  %6.2f  ", pt[i].gbps);
             printf(" GB/s\n    %-9s", "");
             for (int i = 0; i < 5; i++) printf("  %6.1f  ", pt[i].lat_ms);
@@ -2609,6 +3023,8 @@ static int bench(double gib, const char *dir_arg) {
             printf(" GiB read\n");
         }
         free(keys);
+        free(batches);
+        free(lorder);
         hx_modelfile_close(mf);
         CHECK(remove(sp.path) == 0, "delete %s", sp.path);
         spec_free(&sp);
@@ -2664,11 +3080,16 @@ int main(int argc, char **argv) {
             protection(&sp, mf);
             seeded_heat(&sp, mf);
             pf_queue_limit(&sp, mf);
+            prefetch_overlap(&sp, mf);
             read_failures(&sp, mf);
+            all_copies_tried(&sp, mf);
             starvation(&sp, mf);
             wait_any_wakeups(&sp, mf);
             decode_loop(&sp, mf, quick);
             usage_tokens(&sp, mf);
+            usage_replace(&sp, mf);
+            count_uses(&sp, mf);
+            abandoned_demands(&sp, mf);
             min_slots_burst(&sp, mf, quick);
             pin_cap(&sp, mf, quick);
             overcommit(&sp, mf);

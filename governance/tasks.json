@@ -273,7 +273,7 @@
       "accept": [
         "no open critical/major findings"
       ],
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "H02-platform-pool",
@@ -292,7 +292,7 @@
       "accept": [
         "no open critical/major findings"
       ],
-      "status": "todo"
+      "status": "review"
     },
     {
       "id": "H03-forward",
@@ -312,7 +312,7 @@
       "accept": [
         "golden green"
       ],
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "H04-sim",
@@ -328,7 +328,7 @@
       "accept": [
         "mutation score >= 85% on core/feasibility"
       ],
-      "status": "todo"
+      "status": "done"
     },
     {
       "id": "H05-governance",
@@ -347,7 +347,7 @@
       "accept": [
         "a PR cannot weaken its own golden check"
       ],
-      "status": "todo"
+      "status": "done"
     }
   ]
 }

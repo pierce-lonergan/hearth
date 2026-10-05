@@ -9,11 +9,16 @@
  *
  * hearth_open: caller options, then environment overrides (HEARTH_ISA,
  * HEARTH_THREADS, HEARTH_IO_THREADS, HEARTH_CACHE_GB; HEARTH_LOG sets the log
- * level, otherwise verbose 1/2 raises it to info/debug),
+ * level, otherwise verbose 1/2 raises it to info/debug while the engine is open),
  * then validation and resolution of the 0 = default values (n_threads: physical
  * cores, capped at the logical CPUs; n_io_threads 8; max_batch 512, at most 4096).
  * Anything that cannot be honoured, such as an ISA this CPU cannot run, fails
  * with a message.
+ *
+ * The log level is process-wide. Engines opened with verbose > 0 raise it to the
+ * most verbose level any of them asked for; when the last of them closes, the level
+ * the host had before is restored. If the host set a level in between, that level
+ * is left alone.
  */
 #include "hx_model.h"
 #include "hx_quant.h"
@@ -28,7 +33,43 @@
 
 struct hearth_engine {
     hx_model *m;
+    int verbose;                 /* 1/2: counted in g_log_n */
 };
+
+/* Engines may be opened and closed from different threads: a tiny spin lock. */
+static atomic_flag g_log_lock = ATOMIC_FLAG_INIT;
+static int g_log_n[2];           /* open engines that asked for info / debug */
+static int g_log_base;           /* the host's level before they raised it */
+static int g_log_set = -1;       /* the level they set last */
+
+static void log_lock(void) {
+    while (atomic_flag_test_and_set(&g_log_lock)) hx_yield();
+}
+static void log_unlock(void) { atomic_flag_clear(&g_log_lock); }
+
+/* Under the lock. */
+static void log_apply(void) {
+    int lvl = g_log_base;
+    if (g_log_n[1] && lvl < HX_LOG_DEBUG) lvl = HX_LOG_DEBUG;
+    else if (g_log_n[0] && lvl < HX_LOG_INFO) lvl = HX_LOG_INFO;
+    hx_set_log_level(lvl);
+    g_log_set = lvl;
+}
+
+static void log_engine_open(int verbose) {
+    log_lock();
+    if ((g_log_n[0] == 0 && g_log_n[1] == 0) || hx_get_log_level() != g_log_set) g_log_base = hx_get_log_level();
+    g_log_n[verbose - 1]++;
+    log_apply();
+    log_unlock();
+}
+
+static void log_engine_close(int verbose) {
+    log_lock();
+    g_log_n[verbose - 1]--;
+    if (hx_get_log_level() == g_log_set) log_apply();
+    log_unlock();
+}
 
 static int lower_eq(const char *a, const char *b) {
     for (; *a && *b; a++, b++) {
@@ -69,15 +110,15 @@ HEARTH_API hearth_engine *hearth_open(const hearth_options *in, char *err, size_
     const char *s;
     hx_model *m;
     hearth_engine *e;
+    int verbose = 0;
     if (err && errlen) err[0] = 0;
     if (!in) return (hearth_engine *)hx_fail(err, errlen, "hearth_open: options are NULL");
     o = *in;
 
-    /* The log level is process-wide: verbose only raises it, HEARTH_LOG always wins. */
+    /* HEARTH_LOG always wins; otherwise verbose raises the level while the engine is open */
     s = hx_env_str("HEARTH_LOG");
     if (s && *s) hx_set_log_level(hx_env_int("HEARTH_LOG", HX_LOG_WARN));
-    else if (o.verbose > 0 && hx_get_log_level() < (o.verbose == 1 ? HX_LOG_INFO : HX_LOG_DEBUG))
-        hx_set_log_level(o.verbose == 1 ? HX_LOG_INFO : HX_LOG_DEBUG);
+    else if (o.verbose > 0) verbose = o.verbose == 1 ? 1 : 2;
 
     s = hx_env_str("HEARTH_ISA");
     if (s && *s && !hx_parse_isa(s, &o.isa))
@@ -110,6 +151,7 @@ HEARTH_API hearth_engine *hearth_open(const hearth_options *in, char *err, size_
     else if (!hx_kernels_for(o.isa))
         return (hearth_engine *)hx_fail(err, errlen, "hearth_open: ISA %s is not supported by this CPU or build",
                                         isa_name(o.isa));
+    if (verbose) log_engine_open(verbose);   /* undone below if the open fails */
     {
         const int cpus = hx_num_cpus() > 0 ? hx_num_cpus() : 1;
         const int cores = hx_num_physical_cores() > 0 ? hx_num_physical_cores() : cpus;
@@ -139,19 +181,24 @@ HEARTH_API hearth_engine *hearth_open(const hearth_options *in, char *err, size_
     o.warm_start = o.warm_start ? 1 : 0;
 
     m = hx_model_open(&o, err, errlen);
-    if (!m) return NULL;
-    e = (hearth_engine *)calloc(1, sizeof *e);
+    e = m ? (hearth_engine *)calloc(1, sizeof *e) : NULL;
     if (!e) {
-        hx_model_close(m);
-        return (hearth_engine *)hx_fail(err, errlen, "out of memory");
+        if (m) {
+            hx_model_close(m);
+            hx_fail(err, errlen, "out of memory");
+        }
+        if (verbose) log_engine_close(verbose);
+        return NULL;
     }
     e->m = m;
+    e->verbose = verbose;
     return e;
 }
 
 HEARTH_API void hearth_close(hearth_engine *e) {
     if (!e) return;
     hx_model_close(e->m);
+    if (e->verbose) log_engine_close(e->verbose);
     free(e);
 }
 

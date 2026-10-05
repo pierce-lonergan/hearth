@@ -47,22 +47,33 @@ static int bench_argmax(const float *x, int n) {
     return b;
 }
 
+/* Hits per (token, layer, rank) activation, and per unique (call, layer, expert) load:
+ * a batch acquires each expert once and counts at most one miss for it, so for
+ * prefill the second says how often a needed slab was already in DRAM. Percent. */
+static double bench_hit_rate(const hearth_stats *s) {
+    const uint64_t acc = s->cache_hits + s->cache_misses;
+    return acc ? 100.0 * (double)s->cache_hits / (double)acc : 0.0;
+}
+static double bench_unique_hit_rate(const hearth_stats *s) {
+    if (!s->expert_loads_unique || s->cache_misses >= s->expert_loads_unique) return 0.0;
+    return 100.0 * (1.0 - (double)s->cache_misses / (double)s->expert_loads_unique);
+}
+
 static void bench_report(const char *what, int n, double secs, const hearth_stats *s) {
     const double tps = secs > 0 ? n / secs : 0.0;
-    const uint64_t acc = s->cache_hits + s->cache_misses;
     const double gb = (double)s->bytes_read / 1e9;
     const double wall = s->wall_s > 0 ? s->wall_s : secs;
-    printf("%-8s %6d tok %9.3f s %9.2f tok/s | hit %5.1f%% | read %7.3f GB %6.2f GB/s | stall %5.1f%%\n", what, n, secs, tps,
-           acc ? 100.0 * (double)s->cache_hits / (double)acc : 0.0, gb, wall > 0 ? gb / wall : 0.0,
+    printf("%-8s %6d tok %9.3f s %9.2f tok/s | hit %5.1f%% (unique loads %5.1f%%) | read %7.3f GB %6.2f GB/s | stall %5.1f%%\n",
+           what, n, secs, tps, bench_hit_rate(s), bench_unique_hit_rate(s), gb, wall > 0 ? gb / wall : 0.0,
            wall > 0 ? 100.0 * s->stall_s / wall : 0.0);
     printf("         phases: attention %.3f s, moe %.3f s (stall %.3f s), dense+head %.3f s; per token %.2f ms\n",
            s->attn_s, s->moe_s, s->stall_s, s->dense_s, n ? 1e3 * wall / n : 0.0);
     printf("         experts: %llu uses, %llu unique loads, %llu hits, %llu misses, %llu evictions; "
-           "prefetch %llu issued / %llu used / %llu wasted; reader busy %.3f s\n",
+           "prefetch %llu issued / %llu used / %llu wasted; reader busy %.3f s; %llu read errors\n",
            (unsigned long long)s->expert_uses, (unsigned long long)s->expert_loads_unique,
            (unsigned long long)s->cache_hits, (unsigned long long)s->cache_misses, (unsigned long long)s->evictions,
            (unsigned long long)s->prefetch_issued, (unsigned long long)s->prefetch_used,
-           (unsigned long long)s->prefetch_wasted, s->read_s);
+           (unsigned long long)s->prefetch_wasted, s->read_s, (unsigned long long)s->read_errors);
 }
 
 static int bench_main(int argc, char **argv) {

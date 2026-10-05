@@ -23,9 +23,19 @@
  * n_io_threads LOADING, and n_slots >= 2*top_k + n_io_threads + 2 unpinned,
  * a demand can always find a slot.
  *
- * A demand read that fails on every attempt (each retry moves to the next
- * mirror) makes acquire return NULL for that expert until the next tick, when
- * it becomes readable again; a prefetch that fails is simply dropped.
+ * A slab read gets max(3, number of files) attempts, each on the next file, so
+ * every mirror is tried. A demand read that fails on all of them makes acquire
+ * return NULL for that expert until the next tick, when it becomes readable
+ * again; a prefetch that fails is simply dropped. Both count as read_errors.
+ *
+ * A batch of prefetch hints wakes one idle reader per hint, up to the prefetch
+ * in-flight limit (n_io - 1), so the next layer's reads overlap.
+ *
+ * miss_pending[k]: a miss was counted for k and the caller has not collected
+ * the slab. It ends when the caller takes it, when the read fails, when the
+ * uncollected slab is evicted, or at the tick after it became resident (the
+ * hold ends there too): a later request is then a new miss, a later use of a
+ * still-resident slab a hit. Its completion stays news for wait_any either way.
  *
  * hx_store_wait_any must not sleep through a completion the caller has not
  * seen. A demand read that finishes (or fails) before the caller looks at that
@@ -38,7 +48,8 @@
  * The heat profile (usage_in/usage_out, FORMAT.md §8) always has
  * n_layers*n_experts entries, even when no layer is MoE and there are no keys.
  * It only steers caching, so a missing, mismatched or corrupt one is ignored
- * with a warning.
+ * with a warning. usage_out is written to a temporary file next to it and then
+ * renamed over it (hx_file_replace), so readers never see a partial profile.
  *
  * One mutex guards all metadata; reads (hx_file_pread) run outside it.
  *
@@ -94,6 +105,7 @@ struct hx_store {
     slot *slots;
     int *slot_of;           /* [nkeys], -1 = no slot */
     uint8_t *kq, *miss_pending, *failed;
+    int n_pending;          /* keys with miss_pending set */
     int n_failed_now;       /* keys with FAIL_NOW set */
     double *heat;           /* [nkeys] decayed activation count (LFU), lazily decayed */
     uint64_t *heat_tick;    /* [nkeys] */
@@ -110,7 +122,7 @@ struct hx_store {
     int loading, pf_inflight, pf_inflight_max, starved, stop, n_ready;
     uint64_t now, seq, rng, completions, ticks, pf_dropped, io_errors, hold_breaks;
     double decay, hot_heat, decay_tab[DECAY_TAB];
-    int n_files, rr;
+    int n_files, rr, attempts;
     hx_file **files;
     int *outstanding;
     hx_thread **readers;
@@ -201,9 +213,33 @@ static int slot_for_prefetch(hx_store *s) {
     return v;
 }
 
+/* The caller asked for key and has not collected it: its completion is news. */
+static void mark_fresh(hx_store *s, int key) {
+    if (s->miss_pending[key] && s->fresh[key] != s->wgen + 1) {
+        s->fresh[key] = s->wgen + 1;
+        s->n_fresh++;
+    }
+}
+
+/* The caller is looking at key now. */
+static void unfresh(hx_store *s, int key) {
+    if (s->fresh[key] == s->wgen + 1) {
+        s->fresh[key] = 0;
+        s->n_fresh--;
+    }
+}
+
+static void clear_miss(hx_store *s, int key) {
+    if (s->miss_pending[key]) {
+        s->miss_pending[key] = 0;
+        s->n_pending--;
+    }
+}
+
 static void assign(hx_store *s, int si, int key, int demand) {
     slot *sl = &s->slots[si];
     if (sl->state == SLOT_READY) {
+        clear_miss(s, sl->key);   /* evicted before the caller collected it */
         s->slot_of[sl->key] = -1;
         s->n_ready--;
         s->st.evictions++;
@@ -267,22 +303,6 @@ static int pick_file(hx_store *s) {
     return best;
 }
 
-/* The caller asked for key and has not collected it: its completion is news. */
-static void mark_fresh(hx_store *s, int key) {
-    if (s->miss_pending[key] && s->fresh[key] != s->wgen + 1) {
-        s->fresh[key] = s->wgen + 1;
-        s->n_fresh++;
-    }
-}
-
-/* The caller is looking at key now. */
-static void unfresh(hx_store *s, int key) {
-    if (s->fresh[key] == s->wgen + 1) {
-        s->fresh[key] = 0;
-        s->n_fresh--;
-    }
-}
-
 static void finish(hx_store *s, int si, int key, int kind, int ok, uint64_t busy) {
     slot *sl = &s->slots[si];
     mark_fresh(s, key);
@@ -307,9 +327,10 @@ static void finish(hx_store *s, int si, int key, int kind, int ok, uint64_t busy
         if (kind != JOB_PF) {   /* a failed prefetch is simply dropped */
             if (!(s->failed[key] & FAIL_NOW)) s->n_failed_now++;
             s->failed[key] |= FAIL_NOW | FAIL_EVER;
-            s->miss_pending[key] = 0;   /* a retry after the tick is a new miss */
-            s->io_errors++;
+            clear_miss(s, key);   /* a retry after the tick is a new miss */
         }
+        s->st.read_errors++;
+        s->io_errors++;
     }
     s->completions++;
     hx_cond_broadcast(&s->done_cv);
@@ -330,7 +351,7 @@ static void *reader_main(void *arg) {
         int ok = 0, f = pick_file(s);
         int lvl_warn = (s->failed[key] & FAIL_EVER) ? HX_LOG_DEBUG : HX_LOG_WARN;
         uint64_t busy = 0;
-        for (int attempt = 0; attempt < READ_ATTEMPTS; attempt++) {
+        for (int attempt = 0; attempt < s->attempts; attempt++) {
             hx_store_read_hook_fn hook = s->hook;
             void *hook_ctx = s->hook_ctx;
             s->outstanding[f]++;
@@ -353,7 +374,7 @@ static void *reader_main(void *arg) {
         if (!ok)
             hx_log(lvl_warn == HX_LOG_WARN ? HX_LOG_ERROR : HX_LOG_DEBUG,
                    "expert (%d, %d): giving up after %d read attempts (retried after the next token)", key / s->E,
-                   key % s->E, READ_ATTEMPTS);
+                   key % s->E, s->attempts);
         finish(s, si, key, kind, ok, busy);
     }
     hx_mutex_unlock(&s->mu);
@@ -368,6 +389,13 @@ static int key_of(const hx_store *s, int layer, int expert) {
     return s->mf->experts[k].nbytes ? k : -1;
 }
 
+static void count_use(hx_store *s, int key, double n) {
+    s->heat[key] = eff_heat(s, key) + n;
+    s->heat_tick[key] = s->now;
+    s->count[key] += n;
+    s->count_f[key] = (float)s->count[key];
+}
+
 static const void *take(hx_store *s, int si, int key) {
     slot *sl = &s->slots[si];
     sl->refs++;
@@ -376,12 +404,9 @@ static const void *take(hx_store *s, int si, int key) {
     sl->last_seq = ++s->seq;
     sl->last_tick = s->now;
     if (sl->pf_unused) { sl->pf_unused = 0; s->st.prefetch_used++; }
-    if (s->miss_pending[key]) s->miss_pending[key] = 0;
+    if (s->miss_pending[key]) clear_miss(s, key);
     else s->st.hits++;
-    s->heat[key] = eff_heat(s, key) + 1.0;
-    s->heat_tick[key] = s->now;
-    s->count[key] += 1.0;
-    s->count_f[key] = (float)s->count[key];
+    count_use(s, key, 1.0);
     return s->arena + (size_t)si * s->slot_bytes;
 }
 
@@ -396,7 +421,7 @@ static void pfq_remove(hx_store *s, int key) {
 
 static void request_demand(hx_store *s, int key) {
     if (s->failed[key] & FAIL_NOW) return;
-    if (!s->miss_pending[key]) { s->miss_pending[key] = 1; s->st.misses++; }
+    if (!s->miss_pending[key]) { s->miss_pending[key] = 1; s->n_pending++; s->st.misses++; }
     int si = s->slot_of[key];
     if (si >= 0) { s->slots[si].hold_tick = s->now + 1; return; }   /* in flight: promote */
     if (s->kq[key] == Q_DEM) return;
@@ -476,6 +501,20 @@ void hx_store_release(hx_store *s, int layer, int expert) {
     hx_mutex_unlock(&s->mu);
 }
 
+void hx_store_count_uses(hx_store *s, int layer, int expert, uint32_t n) {
+    int key = key_of(s, layer, expert);
+    if (key < 0 || n == 0) return;
+    hx_mutex_lock(&s->mu);
+    int si = s->slot_of[key];
+    if (si < 0 || s->slots[si].state != SLOT_READY || s->slots[si].refs <= 0) {
+        hx_log(HX_LOG_WARN, "hx_store_count_uses(%d, %d) on an expert the caller does not hold", layer, expert);
+    } else {
+        s->st.hits += n;
+        count_use(s, key, (double)n);
+    }
+    hx_mutex_unlock(&s->mu);
+}
+
 void hx_store_wait_any(hx_store *s, uint32_t timeout_us) {
     if (!s || !s->n_slots || timeout_us == 0) return;
     hx_mutex_lock(&s->mu);
@@ -512,9 +551,12 @@ void hx_store_prefetch(hx_store *s, int layer, const int *experts, int n) {
         if (s->pfq_len >= s->pfq_max) { s->pf_dropped++; continue; }
         s->pfq[s->pfq_len++] = key;
         s->kq[key] = Q_PF;
-        added = 1;
+        added++;
     }
-    if (added) hx_cond_signal(&s->work_cv);
+    /* one idle reader per hint, as many as may read prefetches at once */
+    int wake = s->pf_inflight_max - s->pf_inflight;
+    if (wake > added) wake = added;
+    for (int i = 0; i < wake; i++) hx_cond_signal(&s->work_cv);
     hx_mutex_unlock(&s->mu);
 }
 
@@ -526,6 +568,12 @@ void hx_store_tick(hx_store *s) {
     if (s->n_failed_now) {   /* failed experts become readable again */
         for (int k = 0; k < s->nkeys; k++) s->failed[k] &= (uint8_t)~FAIL_NOW;
         s->n_failed_now = 0;
+    }
+    /* demanded slabs left uncollected at the token end: the demand is over (reads still
+     * in flight or queued keep theirs) */
+    for (int i = 0; s->n_pending && i < s->n_slots; i++) {
+        const slot *sl = &s->slots[i];
+        if (sl->state == SLOT_READY && s->miss_pending[sl->key]) clear_miss(s, sl->key);
     }
     if (s->starved) hx_cond_broadcast(&s->work_cv);   /* expired holds may free a slot */
     hx_mutex_unlock(&s->mu);
@@ -660,12 +708,26 @@ static void save_usage(hx_store *s) {
         memcpy(&u, &s->count_f[k], sizeof u);
         w32le(buf + USAGE_HDR + 4 * (size_t)k, u);
     }
-    hx_file *f = hx_file_open(s->usage_out, HX_FILE_WRITE | HX_FILE_CREATE, err, sizeof err);
-    if (!f) hx_log(HX_LOG_WARN, "usage profile not written: %s", err);
-    else {
-        if (hx_file_pwrite(f, buf, n, 0) != (int64_t)n) hx_log(HX_LOG_WARN, "usage profile %s: write failed", s->usage_out);
+    /* a unique temporary name in the same directory: concurrent writers do not share it */
+    size_t pl = strlen(s->usage_out) + 32;
+    char *tmp = (char *)malloc(pl);
+    uint64_t nonce = (hx_now_ns() ^ (uint64_t)(uintptr_t)s) * 0x9E3779B97F4A7C15ull;
+    if (!tmp) { hx_log(HX_LOG_WARN, "usage profile not written: out of memory"); free(buf); return; }
+    snprintf(tmp, pl, "%s.%016llx.tmp", s->usage_out, (unsigned long long)nonce);
+    hx_file *f = hx_file_open(tmp, HX_FILE_WRITE | HX_FILE_CREATE, err, sizeof err);
+    if (!f) {
+        hx_log(HX_LOG_WARN, "usage profile not written: %s", err);
+    } else {
+        int ok = hx_file_pwrite(f, buf, n, 0) == (int64_t)n;
         hx_file_close(f);
+        if (!ok) hx_log(HX_LOG_WARN, "usage profile %s: write failed", tmp);
+        else if (hx_file_replace(tmp, s->usage_out) != 0) {
+            hx_log(HX_LOG_WARN, "usage profile not written: cannot replace %s", s->usage_out);
+            ok = 0;
+        }
+        if (!ok && remove(tmp) != 0) hx_log(HX_LOG_WARN, "cannot remove the temporary file %s", tmp);
     }
+    free(tmp);
     free(buf);
 }
 
@@ -750,7 +812,7 @@ static int cmp_ranked(const void *a, const void *b) {
 
 /* Pins the hottest experts into slots [0, n_pin), warm-loads the next ones,
  * and waits for those reads. Needs the readers running. */
-static int preload(hx_store *s, float pin_fraction, int warm, int n_nonempty, char *err, size_t errlen) {
+static int preload(hx_store *s, float pin_fraction, int warm, char *err, size_t errlen) {
     ranked *r = (ranked *)malloc(sizeof *r * (size_t)(s->nkeys ? s->nkeys : 1));
     int nr = 0, ok = 1;
     if (!r) { hx_fail(err, errlen, "out of memory"); return 0; }
@@ -762,7 +824,7 @@ static int preload(hx_store *s, float pin_fraction, int warm, int n_nonempty, ch
      * (0.7f * 100 is 69.99999881; 0.7 * 100 is 70). */
     double pf = floor((double)pin_fraction * 1e6 + 0.5) / 1e6;
     int n_pin = (int)(pf * (double)s->n_slots);
-    if (s->n_slots < n_nonempty && n_pin > s->n_slots - s->min_slots) n_pin = s->n_slots - s->min_slots;
+    if (n_pin > s->n_slots - s->min_slots) n_pin = s->n_slots - s->min_slots;   /* also when everything fits */
     if (n_pin > nr) n_pin = nr;
     if (n_pin < 0) n_pin = 0;
     int n_warm = warm ? nr - n_pin : 0;
@@ -889,6 +951,7 @@ hx_store *hx_store_open(const hx_modelfile *mf, const hx_store_opts *o, char *er
                                        (double)s->n_slots * (double)s->slot_bytes / (1u << 30), s->n_slots);
         }
         s->n_files = 1 + o->n_mirrors;
+        s->attempts = s->n_files > READ_ATTEMPTS ? s->n_files : READ_ATTEMPTS;   /* every copy is tried */
         s->files = (hx_file **)calloc((size_t)s->n_files, sizeof *s->files);
         s->outstanding = (int *)calloc((size_t)s->n_files, sizeof *s->outstanding);
         if (!s->files || !s->outstanding) { hx_store_close(s); return (hx_store *)hx_fail(err, errlen, "out of memory"); }
@@ -911,7 +974,7 @@ hx_store *hx_store_open(const hx_modelfile *mf, const hx_store_opts *o, char *er
             }
             s->n_readers++;
         }
-        if ((pin_fraction > 0.0f || o->warm_start) && !preload(s, pin_fraction, o->warm_start, n_nonempty, err, errlen)) {
+        if ((pin_fraction > 0.0f || o->warm_start) && !preload(s, pin_fraction, o->warm_start, err, errlen)) {
             hx_store_close(s);
             return NULL;
         }
@@ -934,7 +997,7 @@ void hx_store_close(hx_store *s) {
     }
     for (int i = 0; i < s->n_readers; i++) hx_thread_join(s->readers[i]);
     if (s->opened)
-        hx_log(HX_LOG_DEBUG, "expert store closed: %llu prefetches dropped, %llu hold breaks, %llu unreadable experts",
+        hx_log(HX_LOG_DEBUG, "expert store closed: %llu prefetches dropped, %llu hold breaks, %llu failed slab reads",
                (unsigned long long)s->pf_dropped, (unsigned long long)s->hold_breaks, (unsigned long long)s->io_errors);
     if (s->opened && s->usage_out) save_usage(s);
     for (int i = 0; s->files && i < s->n_files; i++)

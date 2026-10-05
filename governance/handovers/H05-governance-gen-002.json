@@ -1,0 +1,167 @@
+{
+  "generation_id": "gen-002-governance",
+  "parent_generation": "gen-001-governance",
+  "timestamp": "2026-10-05T08:10:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H05-governance",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "Nothing committed (git HEAD is now 10f6542 from other tasks). This generation, on top of gen-001's uncommitted work: modified .github/workflows/{ci,golden,decisions}.yml, CONTRIBUTING.md, governance/README.md, governance/decisions/ADR-0009-golden-gate-against-base-revision.md (still Proposed), governance/tools/{check_golden,adr,validate_handover,friction}.py, tests/py/test_governance.py; new governance/tools/merge_ref.py and governance/handovers/H05-governance-gen-002.json. mutate.py and .github/CODEOWNERS unchanged since gen-001. Nothing outside H05 ownership touched."
+  },
+  "constraints_touched": [
+    "INV-VERIFY",
+    "INV-HONEST",
+    "INV-DATA"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier MAJOR (round 2): both pull_request_target gates followed links in the pull request, so a PR that turns tests/ (or governance/) into an absolute link to $WS/base/... passed without a label. Real, and fixed",
+        "evidence": "Reproduced first with the verifier's own scripts in WSL (scratchpad h05g2/symlink_attack.sh, symlink_decisions.sh): golden.yml command rc=0 'golden lock matches the base revision', ci.yml lock rc=0 and --run 'golden suite OK: 1 passed' on the stub; decisions.yml command 'decision breaker OK: 0 of 8 ... retired' rc=0 vs 'CIRCUIT BREAKER: 8 of 8' for the same content as plain files. Fixes: (1) check_golden.py --rev REV reads the change only from git objects (ls-tree -r -t -z of the commit, cat-file blob); a 120000/160000 entry at tests, tests/golden or below is a LINK, a file at tests means no golden suite; links fail even with --acknowledged; --rev refuses --run/--update and a --root that is not the top level of a checkout (rev-parse --show-cdup). (2) The working-tree check refuses a link at tests/ or tests/golden/ and never reads the lock through one; --update refuses to lock through links. (3) adr.py read_rev (git objects) and read_checkout (working tree) raise RecordError for a link/submodule/non-file at governance/, governance/decisions/, an ADR-*.md or INVARIANTS.md, and for non-UTF-8 records: exit 1 for lint, index and breaker, also with --acknowledged and on the base side. (4) golden.yml/decisions.yml run 'check_golden.py --root pr --rev HEAD ...' and 'adr.py breaker --root pr --rev HEAD --base-root base'. After the fix the same adapted WSL scripts (PR side as a git checkout, real symlinks): golden.yml gate rc=1 'LINK tests' without and with the label; ci.yml lock and --run rc=1 'LINK tests'; decisions.yml rc=1 'governance is not a directory at HEAD (mode 120000)' without and with the label; working tree rc=1. Tests: test_golden_gate_never_follows_a_linked_tests_directory (both workflows' layouts, workflow commands extracted from the YAML, link made by git on POSIX or as a junction on Windows, the link is shown to resolve before it is refused), test_golden_rev_reads_git_objects_only (links and submodules at tests, tests/golden, below, and the manifest; file at tests; committed unchecked .pyc; working tree ignored), test_golden_lock_rejects_links (tests/ link case, --update refusal), test_decisions_gate_as_the_workflow_runs_it (governance/ link case), test_adr_records_behind_links_or_not_files_are_refused, test_adr_read_rev_takes_only_plain_files.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: ci.yml ran pull request code (python -m pip with the PR on sys.path, CMake, conftest) before the 'base revision' tools, and the README overstated what .trusted guarantees. Real; fixed for the governance job, documented for the build jobs",
+        "evidence": "ci.yml: the governance job now checks out .trusted and runs check_golden, waves validate, validate_handover and adr lint with 'python -I -S' before 'python -I -m pip install pytest' and before anything from the change; every pip call is 'python -I -m pip'; the fallback to the change's own tools (GOV_TOOLS) is gone (fail closed). Build jobs run their golden step with 'python -I -S .trusted/...'; README residual assumption 4 now says the change's own code (CMake, build, tests/py conftest, the hearth package) runs before and inside the golden run, can rewrite .trusted/ or plant a .pth, needs no .github/ edit, and that golden.yml is what decides whether golden files changed. test_ci_runs_governance_tools_from_the_base_revision asserts: every governance/tools/*.py reference is .trusted/, all 7 calls use 'python -I -S', no GOV_TOOLS fallback, every '-m pip' is 'python -I -m pip', the 4 governance steps precede the first pip install in the governance job, rm -rf .trusted < .trusted checkout < pip in all 4 jobs, golden --run after pytest tests/py in the build jobs; it runs the 4 governance step commands against this repository (rc 0). Not run on GitHub.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: the gates checked out the mutable refs/pull/N/merge without checking it belongs to the event's head. Real (design level); fixed with merge_ref.py, run before each gate",
+        "evidence": "New governance/tools/merge_ref.py: the merge commit (HEAD of pr) must have exactly two parents, the second equal to --head (github.event.pull_request.head.sha, passed via env) and the first equal to the base checkout's commit or an ancestor of it (git merge-base --is-ancestor in the base checkout, which golden.yml/decisions.yml now fetch with fetch-depth: 0). Parents are read from the raw commit object (cat-file commit, header only), because in the depth-1 checkout actions/checkout makes 'rev-parse HEAD^2' fails (asserted in the test). Parent ids are validated as object ids before use as git arguments. test_merge_ref_must_be_this_events_head_merged_into_the_base with temporary repos (shallow merge checkout): OK for base b1 and for a newer base b2 ('an ancestor of base'); stale head rc 1; merge into a newer base than the lock's rc 1; shallow base rc 1 'unknown to the base checkout ... fetch-depth: 0'; 1-, 3- and 0-parent commits rc 1; message lines 'parent X' ignored; bad arguments rc 2; and the workflow step command itself in the workflow layout. A race on GitHub itself was not reproduced (no GitHub).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: the ADR breaker let a decided ADR be rewritten via demotion to Proposed, free text on the Status line or text before the first section. Real, and fixed",
+        "evidence": "The verifier's adr_probe.py before: step 1 (Accepted->Proposed) rc 0, step 2 rc 0, preamble note rc 0. After: step 1 rc 1 'moved back', preamble rc 1. adr.parse now keeps a frozen text: the whole file, whitespace-collapsed, with only the status word, a YYYY-MM-DD Date value and well-formed Superseded-by ids masked (free text on those lines stays; field-like lines inside sections are body text). Status changes allowed: unchanged, Accepted->Deprecated, Accepted->Superseded, Deprecated->Superseded (adr.RETIREMENTS); anything else trips. Lint: Status must be exactly one word; Supersedes/Superseded-by entries must be ADR-NNNN or [ADR-NNNN](ADR-NNNN-slug.md) with matching ids. Records read as bytes are CRLF-normalised (as the old text-mode readers did). Tests: test_adr_breaker_freezes_decided_records_except_retirement (10 rewrite forms trip, 5 retirement forms do not, full status-transition table, notes on a base Status line, field-like line in a section), test_adr_lint_takes_exact_status_and_successor_forms.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: unusable schemas crashed or failed per file under jsonschema/auto, and the engines disagreed. Real, and fixed; two further disagreements found and fixed",
+        "evidence": "The verifier's schema_probe2.py before: tracebacks for null and $schema 5, per-file PointerToNowhere/Unresolvable/MemoryError, root true rc 0 vs 2, duplicate required/type, title 5, $id 5 rc 0 vs 2. After: every case exits 2 under both engines with the same verdict (rc 1 cases enum [] and property false stay rc 1 under both). Changes: precheck_schema for both engines (JSON object; $schema absent or draft 2020-12/2019-09; $id only at the root; every $ref a local JSON pointer resolving to a subschema reached structurally, percent-decoding and array indices supported; no $dynamicRef/$recursiveRef; no patternProperties, whose keys jsonschema matches with Python's re; every pattern translatable); jsonschema_check_schema maps any jsonschema exception to SchemaError and no longer asserts formats on the metaschema check; MiniValidator checks unique type/required arrays and the types of $schema, $id, $comment, title, description, deprecated, readOnly, writeOnly, examples; the ECMA translator rejects a repeat count above 65535 and nested minimum counts whose product exceeds 65535 ((?:){2147483648} took 108.7 s then MemoryError when probed). Found while fixing: jsonschema asserted every format it knows while the built-in engine asserted only date-time (old jsonschema checker: 1 error each for email, ipv4, uri, hostname, regex, date on 'T05-governance(', built-in 0); now both assert only date-time. Tests: test_handover_engines_agree_on_unusable_schemas (26 cases x builtin/auto/jsonschema), test_handover_schema_precheck_and_references, test_handover_engines_assert_the_same_formats, test_ecma_repeat_bounds.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor: friction.py did not mask the ==PID== prefix of sanitizer reports. Real, and fixed",
+        "evidence": "Reproduced with the verifier's friction_probe.py ('==12345==ERROR' and '==23456==ERROR' normalised differently). _VOLATILE now masks '==\\d+==' anywhere in the (whitespace-collapsed) signature. test_friction_masks_sanitizer_pid_prefixes: three ASan reports from pids 11111/22222/33333 trip in-process and via the CLI ('EPISTEMIC FRICTION'); 'a == 12 == b' unchanged; --exact unchanged. mutate.py does not mutate regex literals, so 5 hand-made variants (mask dropped, line-start only, one digit, pid kept, spaces allowed) were run against the test: 5/5 fail it.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "All handover manifests in governance/handovers/ are valid",
+        "evidence": "python governance/tools/validate_handover.py governance/handovers --strict: 23/23 valid with the default engine (jsonschema 4.26) and with --engine builtin before this manifest was written (H02-platform-pool-gen-001.json is new since gen-001); rechecked with this manifest included (see measurements). No invalid manifest to report.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The governance tools still parse as Python 3.9",
+        "evidence": "ast.parse(feature_version=(3, 9)) on governance/tools/*.py and tests/py/test_governance.py plus a tokenizer scan for PEP 701 f-string forms (same quote, backslash or comment inside a replacement field) that feature_version does not reject: 8 files, 0 problems; the scan was checked to flag f\"{\"bad\"}\" and a backslash in a field. No 3.9 interpreter here (installing one would mean a download).",
+        "verdict": "INCONCLUSIVE"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "The gate can read the merge commit's parents with 'git rev-parse HEAD^2' in the checkout actions/checkout makes",
+        "evidence": "In a depth-1 clone (as actions/checkout fetches a ref) the shallow commit's parents are grafted away: rev-parse HEAD^2 fails and %P is empty, while 'git cat-file commit HEAD' still shows both parent lines (scratch probe, then asserted in the merge_ref test). merge_ref.py reads the raw commit object.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "jsonschema's metaschema check and instance validation are engine-independent once 'regex' is left out",
+        "evidence": "Format assertions depend on installed optional packages (uri, hostname here) and asserted formats the built-in engine ignores (6 of 6 probed). Format assertion was removed from the metaschema check and limited to date-time for instances.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "A malformed parent line in a merge commit could reach 'git merge-base' as an option",
+        "evidence": "An object written with 'git hash-object -t commit --literally' and 'parent --output=x' is refused by 'git rev-parse --verify <oid>^{commit}' (git 2.4x, Windows), so it never gets that far; merge_ref.parents validates parent ids anyway (tested in-process).",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "None of the workflows has run on GitHub. Unverified there: pull_request_target checks as required status checks; actions/checkout of refs/pull/N/merge under pull_request_target; that fetch-depth: 0 together with sparse-checkout gives the base checkout the commit history merge-base needs; how often merge_ref.py fails on a stale merge ref (fail closed: a new push or label event is needed, a re-run replays the old event); 'python -I -S' with setup-python's interpreters on Windows and macOS runners (checked only with CPython 3.13 on Windows and 3.12 in WSL). The PR that introduces merge_ref.py and the new gate commands is judged by the base branch's older workflows.",
+      "Residual by design (README residual 4): in ci.yml's build jobs the change's own build and tests run before and inside the golden run; only review covers that. merge_ref.py checks which commits GitHub merged, not that the merge tree is right (residual 7).",
+      "Python 3.9 is checked syntactically only; no 3.9 interpreter here.",
+      "Pattern matching cost is bounded only for counted repeats; an unbounded quantifier around a costly body, or (a+)+$-style backtracking, can still be slow on long manifest strings. The schema is code-owned.",
+      "Deliberate engine difference kept: the built-in engine rejects unknown keywords, jsonschema ignores them (as JSON Schema does).",
+      "friction.py (gen-001 design, unchanged): any bare 8- or 16-digit hex run containing a digit is masked as an address, so 8-digit decimal numbers are masked too ('expected 12345678 got 87654321' and 'expected 11111111 got 22222222' normalise alike, verifier's friction_probe output). This can over-trip, never under-trip.",
+      "33 hearth-mutate-* directories from 2026-10-04 (10:xx-11:xx local) remain in %TEMP%, as already reported by T05; none were left by this generation's runs."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_governance.py -q -p no:cacheprovider",
+    "python governance/tools/validate_handover.py governance/handovers --strict",
+    "python governance/tools/validate_handover.py governance/handovers --strict --engine builtin",
+    "python governance/tools/check_golden.py --rev HEAD --base-rev HEAD",
+    "python governance/tools/adr.py lint",
+    "python governance/tools/adr.py breaker --rev HEAD --base-rev HEAD",
+    "python governance/tools/mutate.py --file governance/tools/merge_ref.py --lines 38-123 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"merge_ref\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/adr.py --lines 101-130,146-163,167-170,187-272,352-355,393-403 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"adr or decisions_gate\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/check_golden.py --lines 149-150,164,294-295 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"unchecked_bytecode or rev_reads_git or golden_lock_rejects_links or never_follows\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/validate_handover.py --lines 224-228,250,256-257,271-279,348,365,375-377,590 --max-mutants 0 --jobs 4 --seed 1 --timeout 600 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"ecma_repeat or ecma_pattern or unusable or precheck or formats or malformed\\\"\"",
+    "WSL (POSIX symlinks): copy the tree without .git to $HOME, run $HOME/agenv/bin/python -m pytest tests/py/test_governance.py -q, delete the copy (scratch script wsl_tests.sh in the session scratchpad)"
+  ],
+  "measurements": [
+    {
+      "metric": "tests/py/test_governance.py, Windows",
+      "value": 249,
+      "unit": "passed",
+      "conditions": "Windows 11, Python 3.13.4, jsonschema 4.26: 249 passed, 1 skipped (t-strings need 3.14) in 215.6 s, other engineers' jobs running (noisy); gen-001 ended at 212 passed",
+      "kind": "measured"
+    },
+    {
+      "metric": "tests/py/test_governance.py, WSL2 Ubuntu 24.04",
+      "value": 248,
+      "unit": "passed",
+      "conditions": "Python 3.12.3 venv with pytest and jsonschema, git 2.43, tree copied without .git: 248 passed, 2 skipped (t-strings; needs a git checkout) in 72.1 s",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, merge_ref.py lines 38-123 (final file, 55 of 55, seed 1)",
+      "value": 0.945,
+      "unit": "fraction",
+      "conditions": "52 killed; 3 equivalent survivors: git timeout 120->119/121, split(b'\\n\\n', 1)->2 ([0] is the same). First run on the earlier version: 50/56 (0.893); its real survivor (maxsplit 1->0: a message line 'parent X' read as a parent) got a test, an optimisation guard with equivalent mutants was removed, 'return 0'->None is now killed in-process. 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, adr.py changed lines (136 mutants, seed 1)",
+      "value": 0.941,
+      "unit": "fraction",
+      "conditions": "lines 101-130,146-163,167-170,187-272,352-355,393-403: 128 killed. Survivors: 3 real (Status note compared by its first word only, retiring a note-bearing Status line, field-like line inside a section) -> tests added, follow-up run of lines 121,149: 10/10 killed; 5 equivalent: regex group(2)->group(3) twice (both groups are set together and must be equal), st_reparse_tag default 0->1 (1 & 0x20000000 == 0), git timeout 120->119/121. 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, check_golden.py changed lines (120 mutants, seed 1)",
+      "value": 0.908,
+      "unit": "fraction",
+      "conditions": "lines 149-151,164-176,206-350,362-389,517-519,529-532,560-567,587-588,606-607: 109 killed. Survivors: 2 real (7-byte .pyc head; and->or on the .pyc name test for a committed non-.pyc file) -> tests pinned; 7 equivalent, of which the slice/index/range constructs were simplified away; git timeout 120->119/121 remain. Follow-up run of the changed lines 149-150,164,294-295: 19/19 killed. 4 jobs, concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, validate_handover.py changed lines (109 mutants, seed 1)",
+      "value": 0.899,
+      "unit": "fraction",
+      "conditions": "lines 220-224,246,252-253,267-274,310-380,435,482,487-494,500-502,598-603,831 of the earlier version: 98 killed. Survivors: 3 real (product propagation through an unquantified group, top-level product leaking into a later group) -> patterns added; 8 equivalent, 6 removed by simplifying the code. Follow-up run on the final file, lines 224-228,250,256-257,271-279,348,365,375-377,590: 37/39 killed; 2 equivalent survivors (initial value of forced[0], which is never read). Baseline 73-77 s per test run; 4 jobs; concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "hand-made variants of friction's ==PID== mask killed",
+      "value": 5,
+      "unit": "of 5",
+      "conditions": "mutate.py makes no mutants of regex literals (0 candidates on line 97); in-process variants run against test_friction_masks_sanitizer_pid_prefixes",
+      "kind": "measured"
+    },
+    {
+      "metric": "handover manifests valid (--strict)",
+      "value": 24,
+      "unit": "of 24",
+      "conditions": "governance/handovers/ including this manifest, default engine (jsonschema) and --engine builtin",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Maintainer, outside the repository: enable branch protection on main (required checks 'golden lock vs base', 'decision circuit breaker' and the ci.yml jobs; require review from Code Owners; dismiss stale approvals; include administrators), create the labels 'golden-reviewed' and 'decisions-reviewed', and confirm the CODEOWNERS handle @pierce-lonergan. Without these the gates are advisory (governance/README.md, CI).",
+    "Maintainer: accept or reject ADR-0009 (amended in this generation, still Proposed).",
+    "Proposed contract change (not made, INVARIANTS.md is maintainer-owned): INV-VERIFY should name the base comparison; see the report's contract_issues.",
+    "Run the workflows on GitHub once and settle the open questions about pull_request_target, the merge ref and fetch-depth: 0 with sparse-checkout."
+  ]
+}

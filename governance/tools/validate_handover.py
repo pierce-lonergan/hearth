@@ -21,9 +21,29 @@ Schema engine: `jsonschema` is used when installed (--engine auto), otherwise a
 built-in validator that implements the keywords Hearth's schemas use: type
 (including union types), enum, const, required, properties,
 additionalProperties, items, pattern, minLength/maxLength, minItems/maxItems,
-minimum/maximum, $ref to #/$defs, format date-time (RFC 3339). Any other
-validation keyword is rejected loudly instead of being ignored, so a schema that
-outgrows the built-in engine cannot silently pass bad manifests.
+minimum/maximum, $ref to #/$defs, format. Only the "date-time" format (RFC
+3339) is asserted, by both engines; other formats are annotations, as JSON
+Schema 2020-12 defines them by default (jsonschema would otherwise assert
+whichever formats its installed optional packages support). Any other
+keyword (allOf, multipleOf, minProperties, ...) makes the schema unusable under
+every engine, jsonschema included, instead of being evaluated by one engine and
+refused by the other: both engines accept exactly the same schemas, so a schema
+cannot validate under one engine (auto, locally) and not under the other
+(builtin, in CI).
+
+The schema is checked before any manifest, and a schema either engine cannot
+use exits 2 under both. Both require: a JSON object; "$schema", if given, draft
+2020-12 or 2019-09 (whose semantics the built-in engine implements); "$id" only
+at the root; every "$ref" a local JSON pointer ("#/...") that resolves to a
+subschema ($dynamicRef and $recursiveRef are not supported); every "pattern"
+translatable (below); no "patternProperties" (jsonschema would match its keys
+with Python's re, not as ECMA-262); and what the built-in engine can use: only
+the keywords above and annotations, every subschema an object or boolean ("items"
+is never the 2019-09 array form), keyword values of the right kind (e.g.
+"required" and a "type" list hold unique strings, "title" is a string, "$id"
+has no fragment, as the metaschema's pattern says) and no cycle of $refs alone. With jsonschema, the schema is then also checked against
+its metaschema (formats not asserted, so the result does not depend on optional
+packages).
 
 Both engines evaluate "pattern" as an ECMA-262 regular expression with the "u"
 flag (JSON Schema's dialect), translated to Python's re: "$" matches only at the
@@ -31,8 +51,13 @@ very end (Python's also matches before a final newline), "." excludes \\n \\r
 U+2028 U+2029, \\d \\w \\b are ASCII, \\s is ECMA-262 white space (Python's
 differs), [] never matches and [^] matches anything. Syntax that ECMA-262
 rejects in "u" mode (lone braces, Python-only groups, identity escapes of
-letters) or that has no exact translation (\\p{...}, variable-length
-lookbehind) makes the schema unusable (exit 2) instead of being guessed at.
+letters, a quantifier on a lookaround, \\b, \\B, ^ or $) or that has no exact
+translation (backreferences, \\p{...}, variable-length lookbehind) makes the
+schema unusable (exit 2) instead of being guessed at. So does a repeat count
+above 65535, or nested counts whose minimums multiply to more than that: Python
+performs forced repeats one by one, and (?:){2147483648} takes minutes, then
+fails with MemoryError. Matching cost is not bounded otherwise (a pattern like
+(a+)+$ can still backtrack for long); the schema is maintainer-owned.
 Input must be strict JSON: NaN and Infinity are rejected.
 
 A manifest that makes the validator itself fail is reported as invalid; the
@@ -51,6 +76,7 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_SCHEMA = ROOT / "governance" / "schemas" / "handover.schema.json"
@@ -123,11 +149,11 @@ _CONTROL = {"t": 9, "n": 10, "v": 11, "f": 12, "r": 13}
 _SYNTAX = frozenset("^$\\.*+?()[]{}|/")
 _QUANT = re.compile(r"\{[0-9]+(?:,[0-9]*)?\}")
 _GROUP = re.compile(r"\(\?<([A-Za-z_][A-Za-z0-9_]*)>")
-_BACKREF = re.compile(r"k<([A-Za-z_][A-Za-z0-9_]*)>")
+_LOOKAROUND = ("(?=", "(?!", "(?<=", "(?<!")
 _HEX2 = re.compile(r"[0-9A-Fa-f]{2}")
 _HEX4 = re.compile(r"[0-9A-Fa-f]{4}")
 _HEXN = re.compile(r"\{([0-9A-Fa-f]+)\}")
-_DIGITS = re.compile(r"[0-9]+")
+MAX_REPEAT = 65535      # largest repeat count, and largest product of nested minimum counts
 
 
 def _escape(p: str, i: int, in_class: bool) -> tuple:
@@ -161,12 +187,10 @@ def _escape(p: str, i: int, in_class: bool) -> tuple:
             v, j = 0x10000 + ((v - 0xD800) << 10) + int(p[j + 2:j + 6], 16) - 0xDC00, j + 6
     elif c in _SYNTAX or (c == "-" and in_class):
         v = ord(c)
-    elif c in "123456789" and not in_class:
-        m = _DIGITS.match(p, i)
-        return "\\" + m.group(), m.end(), None
-    elif c == "k" and not in_class and _BACKREF.match(p, i):
-        m = _BACKREF.match(p, i)
-        return f"(?P={m.group(1)})", m.end(), None
+    elif (c in "123456789" or c == "k") and not in_class:
+        # ECMA-262 matches a reference to a group that did not participate (or was reset by a
+        # repeat) as empty, Python never matches it; no schema here needs them
+        raise re.error(f"backreference '\\{c}' at position {i - 1} has no exact translation")
     if v is None:
         raise re.error(f"'\\{c}' at position {i - 1} is not an ECMA-262 escape")
     return _cp(v), j, v
@@ -200,41 +224,71 @@ def ecma_translate(p: str) -> str:
     """Python re syntax for a JSON Schema pattern, i.e. an ECMA-262 regular expression
     with the "u" flag. Raises re.error for syntax ECMA-262 rejects or that has no
     exact Python equivalent here."""
-    out, i, quantified = [], 0, False
+    out, i = [], 0
+    prev = None         # what a quantifier here would repeat: None (nothing), atom, assertion, quantifier, lazy
+    groups = []         # per open group: "atom", or "assertion" for a lookaround
+    forced = [1]        # per open group (and the whole pattern): largest product of nested minimum counts
+    last = None         # that product for what a quantifier here would repeat (None: nothing yet)
     while i < len(p):
-        c, quant = p[i], False
+        c, at, kind = p[i], i, "atom"
+        last = 1 if c not in "{*+?)" else last
         if c == "\\":
+            kind = "assertion" if p[i + 1:i + 2] in ("b", "B") else "atom"
             tok, i, _ = _escape(p, i + 1, False)
         elif c == "[":
             tok, i = _class(p, i + 1)
         elif c == ".":
             tok, i = "[^\\n\\r\\u2028\\u2029]", i + 1
-        elif c == "$":
-            tok, i = "\\Z", i + 1
-        elif c == "(" and p.startswith("(?", i):
-            prefix = next((x for x in ("(?:", "(?=", "(?!", "(?<=", "(?<!") if p.startswith(x, i)), None)
+        elif c in "^$":
+            tok, i, kind = ("\\Z" if c == "$" else "^"), i + 1, "assertion"
+        elif c == "(":
+            prefix = next((x for x in ("(?:",) + _LOOKAROUND if p.startswith(x, i)), None)
             m = None if prefix else _GROUP.match(p, i)
             if prefix:
                 tok, i = prefix, i + len(prefix)
             elif m:
                 tok, i = f"(?P<{m.group(1)}>", m.end()
-            else:
+            elif p.startswith("(?", i):
                 raise re.error(f"unsupported group syntax at position {i}")
-        elif c == "{":
-            m = _QUANT.match(p, i)
-            if not m:
+            else:
+                tok, i = "(", i + 1
+            groups.append("assertion" if prefix in _LOOKAROUND else "atom")
+            forced.append(1)
+            kind = None
+        elif c == ")":
+            if not groups:
+                raise re.error(f"unbalanced ')' at position {i}")
+            tok, i, kind = ")", i + 1, groups.pop()
+            last = forced.pop()
+            forced[-1] = max(forced[-1], last)
+        elif c == "|":
+            tok, i, kind = "|", i + 1, None
+        elif c == "{" or c in "*+?":
+            m = _QUANT.match(p, i) if c == "{" else None
+            if c == "{" and not m:
                 raise re.error(f"'{{' at position {i} is not a quantifier")
-            tok, i, quant = m.group(), m.end(), True
-        elif c in "*+?":
-            if c == "+" and quantified:
-                raise re.error(f"'+' at position {i} repeats a quantifier")
-            tok, i, quant = c, i + 1, True
+            tok, i = (m.group(), m.end()) if m else (c, i + 1)
+            if prev is None or prev == "assertion":    # u flag: lookarounds, \b, ^, $ are not quantifiable
+                raise re.error(f"{tok!r} at position {at} has nothing to repeat")
+            if prev == "lazy" or (prev == "quantifier" and tok != "?"):
+                raise re.error(f"{tok!r} at position {at} repeats a quantifier")
+            kind = "lazy" if prev == "quantifier" else "quantifier"
+            if kind == "quantifier":
+                counts = re.findall(r"[0-9]+", tok)
+                for n in counts:
+                    if len(n.lstrip("0")) > len(str(MAX_REPEAT)) or int(n) > MAX_REPEAT:
+                        raise re.error(f"repeat count {n[:20]} at position {at} is above {MAX_REPEAT}")
+                if counts:              # *, + and ? force at most one repetition
+                    last *= int(counts[0])
+                    if last > MAX_REPEAT:
+                        raise re.error(f"nested repeats at position {at} force {last} repetitions, above {MAX_REPEAT}")
+                    forced[-1] = max(forced[-1], last)
         elif c in "}]":
             raise re.error(f"lone {c!r} at position {i}")
         else:
             tok, i = c, i + 1
         out.append(tok)
-        quantified = quant
+        prev = kind
     return "".join(out)
 
 
@@ -248,21 +302,95 @@ def ecma_regex(pattern: str):
     Raises re.error for a pattern it cannot translate exactly."""
     rx = _PATTERNS.get(pattern)
     if rx is None:
-        rx = _PATTERNS[pattern] = re.compile(ecma_translate(pattern))
+        try:
+            rx = re.compile(ecma_translate(pattern))
+        except (OverflowError, RecursionError) as e:     # e.g. a repeat count above Python's limit
+            raise re.error(f"no exact translation: {e}") from None
+        _PATTERNS[pattern] = rx
     return rx
 
 
+# where JSON Schema (2019-09, 2020-12) applies subschemas: one schema, a map of them, a list of them
+_ONE = ("items", "additionalItems", "additionalProperties", "not", "if", "then", "else", "contains",
+        "propertyNames", "unevaluatedItems", "unevaluatedProperties", "contentSchema")
+_MAP = ("properties", "patternProperties", "$defs", "definitions", "dependentSchemas")
+_LIST = ("allOf", "anyOf", "oneOf", "prefixItems")
+DIALECTS = ("https://json-schema.org/draft/2020-12/schema", "https://json-schema.org/draft/2019-09/schema")
+
+
+def schema_nodes(s):
+    """Every subschema object of s (s included) at a position where JSON Schema applies it;
+    instance data (const, enum, default, examples) and unknown keywords are not schemas."""
+    stack = [s]
+    while stack:
+        n = stack.pop()
+        if not isinstance(n, dict):
+            continue
+        yield n
+        for k in _ONE:
+            v = n.get(k)
+            stack.extend(v if isinstance(v, list) else [v])
+        for k in _MAP:
+            if isinstance(n.get(k), dict):
+                stack.extend(n[k].values())
+        for k in _LIST:
+            if isinstance(n.get(k), list):
+                stack.extend(n[k])
+
+
 def schema_patterns(s):
-    """Every "pattern" string in a schema (instance data under const/enum/default/examples excluded)."""
-    if isinstance(s, dict):
-        for k, v in s.items():
-            if k == "pattern" and isinstance(v, str):
-                yield v
-            elif k not in ("const", "enum", "default", "examples"):
-                yield from schema_patterns(v)
-    elif isinstance(s, list):
-        for v in s:
-            yield from schema_patterns(v)
+    """Every "pattern" string of a schema."""
+    for n in schema_nodes(s):
+        if isinstance(n.get("pattern"), str):
+            yield n["pattern"]
+
+
+def resolve_ref(root: dict, ref):
+    """The subschema a local $ref names: "#" or a JSON pointer in the URI fragment. Raises
+    SchemaError for any other reference, and for one that does not resolve to a schema."""
+    if not isinstance(ref, str) or not ref.startswith("#") or ref[1:2] not in ("", "/"):
+        raise SchemaError(f"only local $ref to a JSON pointer ('#/...') is supported, got {json.dumps(ref)[:80]}")
+    node = root
+    for part in unquote(ref).split("/")[1:]:
+        part = part.replace("~1", "/").replace("~0", "~")
+        if isinstance(node, dict) and part in node:
+            node = node[part]
+        elif isinstance(node, list) and re.fullmatch(r"0|[1-9][0-9]*", part) and int(part) < len(node):
+            node = node[int(part)]
+        else:
+            raise SchemaError(f"unresolvable $ref {ref!r}")
+    if not isinstance(node, (dict, bool)):
+        raise SchemaError(f"$ref {ref!r} does not name a schema")
+    return node
+
+
+def precheck_schema(schema) -> None:
+    """What both engines require before anything else (module docstring); raises SchemaError."""
+    if not isinstance(schema, dict):
+        raise SchemaError("the schema must be a JSON object")
+    if "$schema" in schema and schema["$schema"] not in DIALECTS:     # none given: 2020-12
+        raise SchemaError(f"$schema {json.dumps(schema['$schema'])[:80]} is not one of {', '.join(DIALECTS)}")
+    nodes = list(schema_nodes(schema))
+    applied = {id(n) for n in nodes}
+    for n in nodes:
+        if n is not schema and "$id" in n:
+            raise SchemaError("$id is supported only at the root (it would change what '#' refers to)")
+        for k in ("$dynamicRef", "$recursiveRef"):
+            if k in n:
+                raise SchemaError(f"{k} is not supported; use a local $ref")
+        if "patternProperties" in n:
+            raise SchemaError("patternProperties is not supported: jsonschema would match its keys with Python's re, "
+                              "not as ECMA-262")
+        if "$ref" in n:
+            target = resolve_ref(schema, n["$ref"])
+            if isinstance(target, dict) and id(target) not in applied:
+                raise SchemaError(f"$ref {n['$ref']!r} points into instance data, not at a subschema")
+        if isinstance(n.get("pattern"), str):
+            try:
+                ecma_regex(n["pattern"])
+            except re.error as e:
+                raise SchemaError(f"bad pattern {n['pattern']!r}: {e}") from None
+    MiniValidator(schema)       # the built-in engine's keywords and value kinds bind jsonschema too
 
 
 # ---------------------------------------------------------- built-in engine
@@ -318,15 +446,7 @@ class MiniValidator:
         self._check_schema(schema, "#")
 
     def _resolve(self, ref: str):
-        if not ref.startswith("#"):
-            raise SchemaError(f"only local $ref is supported, got {ref!r}")
-        node = self.root
-        for part in [p for p in ref[1:].split("/") if p]:
-            part = part.replace("~1", "/").replace("~0", "~")
-            if not isinstance(node, dict) or part not in node:
-                raise SchemaError(f"unresolvable $ref {ref!r}")
-            node = node[part]
-        return node
+        return resolve_ref(self.root, ref)
 
     def _check_ref_chain(self, s, where: str):
         """$ref is the only supported keyword that applies a subschema to the same
@@ -346,12 +466,9 @@ class MiniValidator:
             raise SchemaError(f"{where}: subschema must be an object or boolean")
         for k in s:
             if k not in _SUPPORTED and k not in _ANNOTATIONS:
-                raise SchemaError(f"{where}: keyword {k!r} is not supported by the built-in engine "
-                                  "(install jsonschema or extend validate_handover.py)")
-        t = s.get("type")
-        for tt in (t if isinstance(t, list) else [t] if t is not None else []):
-            if tt not in _TYPES:
-                raise SchemaError(f"{where}: unknown type {tt!r}")
+                raise SchemaError(f"{where}: keyword {k!r} is not supported (under any engine; extend "
+                                  "validate_handover.py's built-in engine first)")
+        self._check_values(s, where)
         if "$ref" in s:
             self._check_ref_chain(s, where)
         if "pattern" in s:
@@ -359,14 +476,52 @@ class MiniValidator:
                 ecma_regex(s["pattern"])
             except re.error as e:
                 raise SchemaError(f"{where}: bad pattern: {e}") from None
-        for k, sub in (s.get("properties") or {}).items():
+        for k, sub in s.get("properties", {}).items():
             self._check_schema(sub, f"{where}/properties/{k}")
         for key in ("items", "additionalProperties"):
             if key in s:
                 self._check_schema(s[key], f"{where}/{key}")
         for defs in ("$defs", "definitions"):
-            for k, sub in (s.get(defs) or {}).items():
+            for k, sub in s.get(defs, {}).items():
                 self._check_schema(sub, f"{where}/{defs}/{k}")
+
+    @staticmethod
+    def _check_values(s: dict, where: str):
+        """Keyword values of the wrong kind would otherwise surface as per-manifest failures."""
+        def bad(k, what):
+            raise SchemaError(f"{where}: {k!r} must be {what}, got {json.dumps(s[k])[:60]}")
+
+        t = s.get("type", "string")
+        types = t if isinstance(t, list) else [t]
+        if not types or not all(isinstance(x, str) for x in types) or len(set(types)) != len(types):
+            bad("type", "a type name or a non-empty list of distinct ones")
+        for tt in types:
+            if tt not in _TYPES:
+                raise SchemaError(f"{where}: unknown type {tt!r}")
+        for k in ("pattern", "format", "$ref", "$schema", "$id", "$comment", "title", "description"):
+            if k in s and not isinstance(s[k], str):
+                bad(k, "a string")
+        if isinstance(s.get("$id"), str) and "#" in s["$id"][:-1]:     # the metaschema's ^[^#]*#?$
+            bad("$id", "a URI without a fragment")
+        for k in ("deprecated", "readOnly", "writeOnly"):
+            if k in s and not isinstance(s[k], bool):
+                bad(k, "a boolean")
+        if "examples" in s and not isinstance(s["examples"], list):
+            bad("examples", "an array")
+        for k in ("properties", "$defs", "definitions"):
+            if k in s and not isinstance(s[k], dict):
+                bad(k, "an object")
+        if "enum" in s and not isinstance(s["enum"], list):
+            bad("enum", "an array")
+        req = s.get("required", [])
+        if not (isinstance(req, list) and all(isinstance(x, str) for x in req) and len(set(req)) == len(req)):
+            bad("required", "an array of distinct strings")
+        for k in ("minLength", "maxLength", "minItems", "maxItems"):
+            if k in s and not (_is_type(s[k], "integer") and s[k] >= 0):
+                bad(k, "a non-negative integer")
+        for k in ("minimum", "maximum"):
+            if k in s and not _is_type(s[k], "number"):
+                bad(k, "a number")
 
     def errors(self, instance) -> list:
         out: list = []
@@ -441,11 +596,27 @@ def _jsonschema_errors(schema: dict, instance) -> list:
 
     base = jsonschema.validators.validator_for(schema)
     cls = jsonschema.validators.extend(base, {"pattern": _ecma_pattern_keyword})
-    checker = jsonschema.FormatChecker()
+    checker = jsonschema.FormatChecker(formats=())          # only date-time is asserted, as by MiniValidator
     checker.checks("date-time")(is_date_time)
     v = cls(schema, format_checker=checker)
     errs = sorted(v.iter_errors(instance), key=lambda e: [str(p) for p in e.absolute_path])
     return [(_ptr(tuple(e.absolute_path)), e.message) for e in errs]
+
+
+def jsonschema_check_schema(schema: dict) -> None:
+    """Raises SchemaError if the schema is not valid against its JSON Schema metaschema, or if
+    jsonschema fails on it. Formats are not asserted: "regex" would test patterns with Python's
+    re, which rejects valid ECMA-262 such as (?<name>...) (precheck_schema checks them), and
+    the others ("uri" for $id and $schema) depend on which optional packages are installed."""
+    import jsonschema
+
+    try:
+        cls = jsonschema.validators.validator_for(schema)
+        err = jsonschema.exceptions.best_match(cls(cls.META_SCHEMA).iter_errors(schema))
+    except Exception as e:      # jsonschema failing on the schema makes it as unusable as an invalid one
+        raise SchemaError(f"jsonschema cannot check the schema: {type(e).__name__}: {e}") from None
+    if err is not None:
+        raise SchemaError(f"schema is not valid JSON Schema: {err.message}")
 
 
 def have_jsonschema() -> bool:
@@ -673,13 +844,9 @@ def main(argv=None) -> int:
         tasks = task_ids(a.tasks) if a.tasks else None
         if a.engine == "jsonschema" and not have_jsonschema():
             raise SchemaError("--engine jsonschema requested but jsonschema is not installed")
-        if a.engine == "builtin" or not have_jsonschema():
-            MiniValidator(schema)
-        for pat in schema_patterns(schema):
-            try:
-                ecma_regex(pat)
-            except re.error as e:
-                raise SchemaError(f"bad pattern {pat!r}: {e}") from None
+        precheck_schema(schema)
+        if a.engine != "builtin" and have_jsonschema():
+            jsonschema_check_schema(schema)
     except (OSError, ValueError, SchemaError) as e:
         print(f"validate_handover: {e}", file=sys.stderr)
         return 2

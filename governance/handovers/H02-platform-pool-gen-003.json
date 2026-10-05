@@ -1,0 +1,207 @@
+{
+  "generation_id": "gen-003-h02-platform-pool",
+  "parent_generation": "gen-002-h02-platform-pool",
+  "timestamp": "2026-10-05T15:01:23Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H02-platform-pool",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified (gen-001..003, uncommitted): engine/src/{pool.c, platform_posix.c, platform_common.inc}, engine/tests/{test_pool.c, test_platform.c} changed in gen-003; platform_win.c unchanged since gen-002; new: governance/handovers/H02-platform-pool-gen-003.json. HEAD is e9d1bfd through other engineers' commits, none touching these files or engine/src/hx_*.h. gen-002's timestamp (2026-10-05T06:45:00Z) was local EDT time with a Z suffix (really about 10:45Z); this file is written in UTC."
+  },
+  "constraints_touched": [
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DET-1",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier major #1 reproduced and fixed: a stall in a dispatch of long tasks started a sleep-only back-off because 'slow' was measured at the end of the dispatch. Each laggard now measures its own pickup against slow_at, which only starts once the participants that did start have finished (the pool waits idle with its CPUs freed); finishers decide that with one atomic RMW, so exactly one sees 'only laggards left'.",
+        "evidence": "Deterministic test (test_late_pickup): a worker held off its CPU (SuspendThread / SIGUSR2 handler) 0.15 ms or 1 ms before 2 ms tasks: gen-002 starts a back-off and the next 21 dispatches run sleep-only (p50 = sleeping pool), gen-003 none (p50 0.5 us). Held 3 ms past empty tasks (tid 1 or the last tid), or 2.5 ms past 1 ms tasks: back-off in both. Verifier scenario (16 threads, spin_us=1000, workers-only 2 ms tasks, 4 busy threads, 300 iterations): slow-stall back-offs 0/0/0, short-dispatch mean 0.9 us (verifier on gen-002: 5-8 false back-offs, 13.6-30.8 us). An intermediate version (each finisher stored its finish time, checking pending before its decrement) still counted 7-8 slow stalls at 32 threads: simultaneous finishers all read pending before any decrement.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Caller starvation counts only if the work finished while the caller was off its CPU, measured at the next clock read or when the spin loop sees pending == 0. Before, any gap counted (a caller waiting through long tasks backed off), and a gap that ended inside the poll loop was never measured.",
+        "evidence": "Caller held 0.1-1.5 ms: with 0.3 ms tasks a back-off (gen-002 too), with 3 ms tasks none (gen-002: back-off). Without the exit check the 0.3 ms case was missed in every run (the hold lands in the poll loop).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier major #2 reproduced and fixed: idle spinners' yields handed CPUs to other processes. Workers yield for late threads (a participant has not picked up the newest dispatch, or pending == 0 and the caller has not returned) only in crowded pools (n_threads > 3/4 of hx_num_cpus()); every worker still yields after 50 us without a task; the caller yields only in crowded pools, from its first stall check.",
+        "evidence": "v_engine, spin_us=50, 10 us regions, interleaved, us per region (base / gen-002 / gen-003): 16 threads + 16 busy 11.6-29.5 / 48-88 / 11.5-12.7; with 20 us caller gaps 33.4-39.2 / 77-166 / 32.5-38.9; 24 + 8 busy 14.9-23.5 / 35.6-43.3 / 13.2-16.7; 28 + 4 busy 56.6-118.9 / 32-42.5 / 31.8-48.8; 32 + 4 busy 108-119 / 37-43 / 34.9-44. test_small_pool_load (16 threads + 20 busy): gen-003 11.3-18.8 us vs sleeping 45-53 us; gen-002 65.6 vs 47.6 (fails).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Conditional yields remain necessary in crowded pools: on this (never quiet) machine nearly every 32-thread dispatch has a displaced participant that only a yield brings back.",
+        "evidence": "32 threads, spin_us=1000: without yields for late threads (stall rule only) p50 55-60 us; with them 5-8 us; base 1.0 ms. Delaying the first yield to 5 / 10 us moves p50 to 7.8 / 12.9 us, also at HIGH priority class. test_full_machine (Windows) fails with crowded forced to 0 (p50 54.7 vs sleeping 78.8 us).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor #3 (WSL2 16-thread tail) fixed: in pools that are not crowded the stall threshold is max(20 us, (k-1) x wake cost) (2x and at least 200 us for dispatches that woke workers) and the slow-stall / caller-starved threshold max(0.5 ms, 4x re-wake). The wake cost is the caller's own signalling time per woken worker (EMA, weight 1/4): ~2 us on Windows, ~17 us under WSL2.",
+        "evidence": "WSL2 v_lat interleaved, share of time in > 100 us dispatches (p999): 16 threads base 0.7-1.8% (34-41 us), gen-002 29-32% (280-285 us), gen-003 0-1.6% (27-37 us); 24 threads 16-25% / 44-51% / 5.8-7.0%. test_core_pool_tail fails on gen-002 under WSL2 (16-34%) and passes on gen-003 (0.5-5.4%). test_stall_threshold (seeded wake cost): no stall at 0.4x, stall at 2x, crowded pool at 20 us, slow only after 4x re-wake; it fails with the scaling removed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Back-off doubling keys on spinning dispatches: a new sleep-only period within 16 spinning dispatches of the last one is twice as long, otherwise 10 ms (was: within 4x the last period's length in time).",
+        "evidence": "test_backoff_period: 10, 20, then (after 40 spinning dispatches) 10 ms. With 2 ms worker tasks at 32 threads the old rule plus the old slow measure kept the pool sleep-only most of the time (short dispatches 54-61 us); now 0 slow stalls, 13.7 us.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Platform minors: hx_env_double keeps an underflowing value (subnormal or zero) on both platforms (glibc sets ERANGE for both, the MS CRT only for zero); POSIX hx_file_replace logs the directory fsync at debug level and a child-process test checks it.",
+        "evidence": "test_platform against gen-002's platform_common.inc fails 3 checks on Linux (1e-320, -4.9e-324, 1e-400) and 1 on Windows (1e-400). Deleting the hx__sync_parent call fails test_replace_sync under WSL2 (mutant M0483 killed).",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Yielding only while some pool thread is late (no crowded rule) stops the oversubscription cascade.",
+        "evidence": "16 threads + 16 busy, 10 us regions: 39-51 us per region (base 12); 20-24 threads + 4-8 busy: 31-50 vs 13-17 us. A yield turns a running pool thread into a queued one whenever another thread waits on that CPU, so lateness spreads.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "A per-thread pause after long yields (> 10-50 us) separates harmful from useful yields.",
+        "evidence": "The long-yield fraction is 8-19% in both regimes (32 threads alone 11%, 16 + 16 busy 19%); penalties that fixed 16 + 16 (13-18 us) broke 32 threads (42-62 us), those that kept 32 threads did not fix 16 + 16.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Scaling the thresholds with the wake cost also in crowded pools helps WSL2 at no cost.",
+        "evidence": "WSL2 32 threads: v_lat 340-480 us with it vs 620-770 us without, but test_stranded (32 + 16 busy) spent 23-60% of its time in > 2 ms dispatches with it; without it 14-40% (gen-002 9.5-29.8%), so the host noise dominates. Crowded pools keep 20 us / 0.5 ms (gen-002's Windows-tuned values).",
+        "verdict": "INCONCLUSIVE"
+      },
+      {
+        "claim": "The quiet-machine target (32-thread dispatch within a small multiple of 16-thread) can be shown on this machine.",
+        "evidence": "Never quiet (~8.6 CPUs of normal-priority load). Even with the bench at HIGH priority class nearly every 32-thread dispatch needs a yield (p50 5.2-5.4 us; delaying the first yield shifts p50 by the delay); 16 threads 0.75 us: ~7-9x. Base at HIGH priority: p50 0.9 us but p90 1.0 ms, mean 133 us.",
+        "verdict": "INCONCLUSIVE"
+      }
+    ],
+    "open_questions": [
+      "WSL2 32-thread pools: gen-003 mean 622-768 us vs base 204-240 us and gen-002 771-803 us (interleaved). Every variant tried stays at 0.2-0.9 ms there; native Linux untested. Engine callers should keep n_threads <= physical cores on VMs.",
+      "Linux CFS: after sched_yield the CPU goes to the thread with the least run time (another spinner), so a pool pinned to one CPU with a long spin window leaves the caller about a third of its CPU (2.9-3.0x, gen-002 the same). test_pinned judges that ratio on Windows only; sleeping instead of yielding would be the fix there.",
+      "Surviving pool.c mutants (40 of 168): equivalent (>= vs > on clock values, initial values overwritten by memset, cap comparisons below the cap, starved = 2, idle_yield > vs >=), tuning constants (4x starve, 2x wake-dispatch threshold, (k-1) vs k in the re-wake cost, EMA weight, crowded caller's first-yield time), the crowded caller's yield-gap starvation check (reachable only when the caller is preempted inside SwitchToThread), the caller's `done` store (removing it gives gen-002-like yields in crowded pools) and the spurious-yield guard in hx__late (perf only).",
+      "Test hooks hx__pool_stats / hx__pool_seed_wake are exported from pool.c (not declared in hx_pool.h) and declared by test_pool.c itself; see contract_issues.",
+      "Windows machines with several processor groups and the macOS code paths remain untested (as in gen-001/002)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o h02g3/test_pool.exe engine/src/pool.c engine/tests/test_pool.c            # full ~13 s (runs take turns via %TEMP%/hx_test_pool_timing.lock)",
+    "python scripts/hxcc.py --platform --run -o h02g3/test_pool.exe engine/src/pool.c engine/tests/test_pool.c -- --quick # ~6 s",
+    "python scripts/hxcc.py --platform --run -o h02g3/test_platform.exe engine/tests/test_platform.c -- --expect-cpu sse42,avx,avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512bf16,avxvnni,-neon,-dotprod,cores=16,cpus=32",
+    "MSVC ASan: PATH += VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 ; python scripts/hxcc.py --asan --debug --platform --run -o h02g3/test_pool_asan.exe engine/src/pool.c engine/tests/test_pool.c ; same for engine/tests/test_platform.c",
+    "WSL: cp -r engine ~/x/ ; gcc -std=c11 -ffp-contract=off -Wall -Wextra -pthread -Isrc -Iinclude [-O2 | -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined | -O1 -g -fsanitize=thread] tests/test_pool.c src/pool.c src/platform_posix.c -lm ; TSan binaries under setarch $(uname -m) -R ; test_platform with TMPDIR set and LOCPATH=<localedef -i de_DE -f UTF-8 dir>",
+    "cmake -S . -B %LOCALAPPDATA%/hearth/build/h02g3 -G \"Visual Studio 17 2022\" -A x64 ; cmake --build <dir> --config Release ; ctest --test-dir <dir> -C Release [-j6] --output-on-failure",
+    "python governance/tools/mutate.py --file engine/src/pool.c --lines <lines changed since gen-002> --max-mutants 0 --jobs 3 --seed 1 --timeout 90 --no-timeout-retry --test \"python scripts/hxcc.py --platform --run -o {tmp}/mut_pool.exe engine/src/pool.c engine/tests/test_pool.c -- --quick\"",
+    "python governance/tools/mutate.py --file engine/src/platform_common.inc --lines 200 --max-mutants 0 --jobs 3 --seed 1 --test \"python scripts/hxcc.py --platform --run -o {tmp}/mut_pc.exe engine/tests/test_platform.c\"",
+    "platform_posix.c mutation: --pp-model gnu -U __APPLE__ -U _WIN32 -D __linux__ --lines 392-414,429, with a --test wrapper that wslpath's {root}, builds tests/test_platform.c + src/platform_posix.c with gcc in WSL and runs it",
+    "Scratch benches (not in the repo; the verifier's drivers adapted): v_lat NT SPIN SAMPLES ROUNDS [h], v_engine NT SPIN WORK GAP HOGS MS ROUNDS, v_longtask2 NT SPIN TASK HOGS ITERS w; each built against 4a6cb80's, gen-002's and gen-003's pool.c and run interleaved"
+  ],
+  "measurements": [
+    {
+      "metric": "16-thread pool (spin_us=50) beside 16 busy threads, 10 us regions back to back, per region",
+      "value": 11.94,
+      "unit": "us",
+      "conditions": "gen-003 11.5-12.7 (4 interleaved 300 ms windows); base 4a6cb80 11.6-29.5; gen-002 48.1-88.4. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "same with 20 us of caller-only work between regions",
+      "value": 32.85,
+      "unit": "us",
+      "conditions": "gen-003 32.5-38.9; base 33.4-39.2; gen-002 77.0-165.7. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "24 threads beside 8 busy threads, 10 us regions, per region",
+      "value": 13.92,
+      "unit": "us",
+      "conditions": "gen-003 13.2-16.7; base 14.9-23.5; gen-002 35.6-43.3. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "32 threads beside 4 busy threads, 10 us regions, per region",
+      "value": 34.9,
+      "unit": "us",
+      "conditions": "gen-003 34.9-44.2; base 108-119; gen-002 37.3-42.7. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, 32 threads, spin_us=1000, mean",
+      "value": 7.52,
+      "unit": "us",
+      "conditions": "gen-003 7.5-9.2 (p50 5.5-5.9, p999 75-126, max 189-309); gen-002 6.75-6.8 (p50 5.0); base 921-1033 (p50 1022-1027). 20000 samples, interleaved. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, 16 threads, spin_us=1000, mean",
+      "value": 0.75,
+      "unit": "us",
+      "conditions": "gen-003 0.74-0.76; gen-002 0.67-0.77; base 0.87-0.90. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "32 vs 16 threads, mean dispatch ratio with the bench at HIGH priority class (closest to quiet available)",
+      "value": 8.6,
+      "unit": "x",
+      "conditions": "gen-003 6.46 us (p50 5.3) vs 0.75 us; gen-002 5.95 vs 0.75; base 133 (p50 0.9, p90 1016) vs 0.80. Not a quiet machine; the quiet target is unverified. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "verifier long-task scenario: slow-stall back-offs per 300 iterations (16 threads, spin_us=1000, workers-only 2 ms tasks, 4 busy threads)",
+      "value": 0,
+      "unit": "count",
+      "conditions": "3 runs 0/0/0, short-dispatch mean 0.9 us, 0.2-0.3% > 20 us (verifier on gen-002: 5-8 false back-offs, 13.6-30.8 us); 32 threads without busy threads: 0 slow stalls, 13.7 us. Windows 11, Ryzen 9 9950X (16C/32T), MSVC /O2; machine shared all session (4 CPU-bound python processes, OneDrive ~2 CPUs, javaw, explorer: ~8.6 CPUs busy at normal priority), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "WSL2, 16 threads, spin_us=1000: share of time in dispatches > 100 us",
+      "value": 1.6,
+      "unit": "percent",
+      "conditions": "gen-003 0.0-1.6% (p999 27-37 us); gen-002 29-32% (p999 280-285 us); base 0.7-1.8% (p999 34-41 us); 24 threads 5.8-7.0 / 44-51 / 16-25%. Interleaved v_lat. WSL2 Ubuntu 24.04 VM (32 vCPUs) on the same loaded host, gcc 13.3 -O2; very noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "WSL2, 32 threads, spin_us=1000, mean (regression vs 4a6cb80, not fixed)",
+      "value": 622,
+      "unit": "us",
+      "conditions": "gen-003 622-768; gen-002 771-803; base 204-240. WSL2 Ubuntu 24.04 VM (32 vCPUs) on the same loaded host, gcc 13.3 -O2; very noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "pinned to one CPU, 4 threads, spin_us=200000: p50 dispatch",
+      "value": 33.8,
+      "unit": "us",
+      "conditions": "Windows 33.7-34.2 us; the caller's 40 ms tasks + 40 ms pauses take 0.99-1.00x their time alone (2.21x without idle yields); 81 us without the yield for a caller that has not returned. WSL2: p50 34-93 us, ratio 2.9x (gen-002 2.9-3.0x, CFS)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score pool.c (lines changed since gen-002, all 168 mutants)",
+      "value": 76.2,
+      "unit": "percent",
+      "conditions": "test_pool --quick, MSVC, seed 1, jobs 3, timeout 90 s, no retry: killed 112, timeout 16 (completion-signal hangs), survived 40 (classified in open_questions). A first run (166 mutants, before the tests for the caller-not-returned yield, idle yields, a tid-1 laggard, back-off doubling and the crowded boundary were added) scored 62.0% (63 survived). Machine shared during the runs",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_common.inc line 200 (underflow rule)",
+      "value": 70.0,
+      "unit": "percent",
+      "conditions": "MSVC test_platform: killed 7, survived 3, all equivalent (< vs <= 1.0 and > vs >= -1.0 on values ERANGE never returns; errno = 1 instead of 0 is still != ERANGE)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_posix.c hx__sync_parent and its call (lines 392-414, 429)",
+      "value": 68.2,
+      "unit": "percent",
+      "conditions": "WSL gcc test_platform: killed 15, build error 1, survived 7 (malloc size +1, the root '/' branch, fd > 0 vs >= 0, deleted close/free). In gen-002 none of these was observable; deleting the call (the verifier's point) is now killed",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "'32-thread dispatch within a small multiple of 16-thread dispatch on a quiet machine': no quiet machine; measured ~8-12x under load and ~8.6x with the bench at HIGH priority (see measurements).",
+    "WSL2 32-thread dispatch stays ~3x slower than at 4a6cb80 (gen-002 too); not fixed.",
+    "hx_pool.h's spin/yield wording, hx_platform.h's hx_env_str pointer lifetime and its hx_file_replace comment need director amendments (contract_issues); the headers are read-only and were not edited."
+  ]
+}

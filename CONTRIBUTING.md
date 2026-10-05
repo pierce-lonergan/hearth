@@ -6,7 +6,8 @@ covers picking a task, path ownership, tests, handovers and decisions. The
 non-negotiables:
 
 * `governance/INVARIANTS.md` is binding. Never modify `tests/golden/`
-  (INV-VERIFY).
+  (INV-VERIFY). CI compares it with the base revision's lock, so a change
+  that edits and re-locks golden tests fails until a maintainer reviews it.
 * Edit only the paths your task owns (`governance/tasks.json`). Report
   contract problems; do not patch contracts.
 * New behaviour needs contributor tests that kill mutants
@@ -70,14 +71,29 @@ ctest --test-dir build-asan --output-on-failure
 ## Before you open a pull request
 
 ```sh
-python governance/tools/check_golden.py
+python governance/tools/check_golden.py --rev HEAD --base-rev origin/main
 python governance/tools/waves.py validate
 python governance/tools/validate_handover.py
 python governance/tools/adr.py lint
+python governance/tools/adr.py breaker --rev HEAD --base-rev origin/main
+python governance/tools/path_aliases.py
 python -m pytest tests/py -q
 ```
 
+`--rev HEAD` judges what you committed, as CI's review gates do; without it
+the tools read your working tree. Links (symbolic links, junctions,
+submodules) in or on the way to `tests/golden/` or `governance/decisions/`
+fail every check. So do two paths that are one file on Windows or macOS
+(`docs/FORMAT.md` and `docs/format.md`, or an NTFS short name such as
+`INVARI~1.MD`), anywhere in the commit, whatever label it has.
+
 With a built library, also `python -E governance/tools/check_golden.py --run`.
+Some paths (`tests/golden/`, `governance/INVARIANTS.md`, `governance/decisions/`,
+`governance/tools/`, `governance/schemas/`, `.github/`, the golden suite's
+oracle in `python/hearth/` and the contract headers and docs) need a
+code-owner review (`.github/CODEOWNERS`). Golden-test changes also need the
+`golden-reviewed` label, and decision churn the `decisions-reviewed` label,
+which a maintainer adds after reviewing.
 Then run `mutate.py` on the files you changed, and write your handover
 manifest (`python governance/tools/validate_handover.py --new <TASK_ID> --write`
 creates `governance/handovers/<TASK_ID>-gen-<NNN>.json`). Every performance

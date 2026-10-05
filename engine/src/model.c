@@ -28,7 +28,8 @@
  * the shared expert being computed at this point, overlapping the reads) ->
  * hx_store_prefetch(top_k + prefetch_extra per token, while recent predictions were
  * precise) -> compute resident experts in waves, release, hx_store_wait_any for
- * the rest -> rank-order sum + shared.
+ * the rest -> rank-order sum + shared. An expert used by n (token, rank) pairs of
+ * a batch is acquired once and counted n times (hx_store_count_uses).
  */
 #include "hx_model.h"
 #include "hx_modelfile.h"
@@ -47,25 +48,26 @@
 #define ATT_DC        32                  /* output dims per value work item */
 #define MLA_HC        16                  /* MLA heads per score work item */
 #define ATT_BUDGET    ((size_t)64 << 20)  /* bytes of score / latent scratch: bounds the attention sub-batch */
-/* Pool workers spin this long after a region before sleeping. A region waits for
- * every worker, and a descheduled worker (or caller) costs about one spin period
- * before a spinning thread yields its CPU, so long spins collapse throughput once
- * threads + other load exceed the logical CPUs. Measured with every region on the
- * pool (synthetic Qwen3-30B-A3B-shaped Q4 container, fully cached decode, Ryzen 9
- * 9950X 16C/32T, 16/24/32 threads, shared machine): 1000 us 23.7/22.7/2.1 tok/s,
- * 200 us 22.3/18.4/7.3, 100 us 21.6/19.8/10.4, 50 us 23.4/22.5/14.2, 0 us
- * 16.5/14.7/13.0. With a 4 GiB cache (I/O-bound) 1000 us is ~2% faster than 50. */
+/* Pool workers spin this long after their last task before sleeping. Before the
+ * pool yielded while spinning, 1000 us collapsed decode at 32 threads (2.1 vs 14.2
+ * tok/s with 50 us, every region on the pool). With hx_pool_for_n regions and the
+ * yielding pool, 50 / 300 / 1000 us and one pool vs a per-core + an all-thread pool
+ * measured the same within noise (synthetic Qwen3-30B-A3B Q4, Ryzen 9 9950X, shared
+ * machine; fully cached decode and 512-token prefill at 16 and 32 threads, 4 GiB
+ * direct-I/O decode at 16, a tiny model at 1-32): one pool, 50 us. */
 #define POOL_SPIN_US  50
 /* A batch of fewer tokens runs on at most one thread per physical core: it is
  * memory-bound, so SMT siblings add no bandwidth but every region then waits for
  * oversubscribed threads (same container and machine, prefill tok/s with 16 vs 32
  * threads: T=64 172 vs 157, T=128 241 vs 240, T=256 323 vs 336, T=512 391 vs 437). */
 #define SMT_MIN_T     256
-/* A parallel region costs a barrier over every worker (a few us; far more when a
- * worker is descheduled). Work estimated below this many ns of one thread's time
- * stays on the caller. The per-site estimates are calibrated on a Zen 5 core and
- * only steer scheduling, never a result. */
+/* A parallel region costs a barrier over its threads (a few us; far more when a
+ * thread is descheduled). Work estimated below PAR_MIN_NS of one thread's time
+ * stays on the caller; above it a region gets one thread per PAR_THREAD_NS of work
+ * (hx_pool_for_n), so small regions wake few workers. The per-site estimates are
+ * calibrated on a Zen 5 core and only steer scheduling, never a result. */
 #define PAR_MIN_NS    6000.0
+#define PAR_THREAD_NS 3000.0
 #define WAIT_US       20000u              /* one hx_store_wait_any */
 #define STUCK_NS      1000000000ull       /* nothing arrived this long: blocking acquire (detects unreadable slabs) */
 #define PF_MIN_PREC   0.5                 /* see prefetch_next */
@@ -75,6 +77,9 @@
 #define MAX_ALLOCS    96
 
 enum { EX_PENDING = 0, EX_HELD = 1, EX_DONE = 2 };
+/* Prefetch hints a failed call must wait for (see drain_hints): hinted by the previous
+ * call / by this one and not acquired since, or listed but acquired (resolved). */
+enum { HINT_NONE = 0, HINT_PREV = 1, HINT_NOW = 2, HINT_USED = 3 };
 
 typedef struct mat {
     const uint8_t *w;
@@ -121,10 +126,12 @@ struct hx_model {
     hx_modelfile *mf;
     const hx_config *c;
     hx_store *store;
-    hx_pool *pool;                       /* the pool of the running forward call: core or all */
-    hx_pool *pool_core, *pool_all;       /* one thread per physical core / n_threads (may be the same) */
+    hx_pool *pool;                       /* n_threads threads */
+    int core_threads;                    /* min(n_threads, physical cores): batches under SMT_MIN_T */
+    int fwd_threads;                     /* threads available to the running forward call */
     double par_min_ns;
-    uint64_t regions;                    /* regions run on a pool (test seam) */
+    uint64_t regions, region_threads;    /* regions run on a pool and their summed thread counts (test seams) */
+    int region_max;                      /* most threads of one region since the seam last read it */
     const hx_kernels *k;
     int isa, n_threads, n_io;
 
@@ -178,6 +185,13 @@ struct hx_model {
     int64_t replay_rows;
 
     mstats st;
+    hx_store_stats hid;                  /* store counters of failed calls, left out of hearth_stats */
+    uint64_t seen_errors;                /* store read_errors the MoE wait loop has reacted to */
+    uint8_t *hint;                       /* [L*E] HINT_* of (layer, expert) keys handed to hx_store_prefetch */
+    int *hint_keys, n_hints;             /* the keys whose state is not HINT_NONE */
+    uint64_t hints_drained;              /* test seam: hints failed calls have waited for */
+    int *pred_log;                       /* test seam: [layer, n, ids...] per prediction */
+    int pred_log_cap, pred_log_len;
     void *allocs[MAX_ALLOCS];
     int n_allocs;
 };
@@ -228,16 +242,32 @@ static float *pcache(const hx_model *m, int l, int p) {
 
 /* ------------------------------------------------------------ parallel regions */
 
-/* fn over items [0, n): on the pool when ~ns of one thread's work is worth a
- * region (PAR_MIN_NS), else on the caller as tid 0. */
-static void par_for(hx_model *m, int64_t n, double ns, hx_range_fn fn, void *ctx) {
+/* Threads for a region of n items and ~ns of one thread's work: the caller alone
+ * below par_min_ns, else one per PAR_THREAD_NS of work (at least 2), at most the
+ * forward call's threads. par_min_ns 0 (test seam) gives every region all of them. */
+static int region_k(const hx_model *m, int64_t n, double ns) {
+    int k = m->fwd_threads;
+    if (n <= 1 || k <= 1 || ns < m->par_min_ns) return 1;
+    if (m->par_min_ns > 0.0 && ns < PAR_THREAD_NS * (double)k) k = ns < 2.0 * PAR_THREAD_NS ? 2 : (int)(ns / PAR_THREAD_NS);
+    return n < k ? (int)n : k;
+}
+
+/* fn over items [0, n) on k threads (the caller as tid 0 when k <= 1). */
+static void par_run(hx_model *m, int64_t n, int k, hx_range_fn fn, void *ctx) {
     if (n <= 0) return;
-    if (n == 1 || ns < m->par_min_ns || hx_pool_size(m->pool) <= 1) {
+    if (n < k) k = (int)n;
+    if (k <= 1) {
         fn(ctx, 0, n, 0);
-    } else {
-        m->regions++;
-        hx_pool_for(m->pool, n, 1, fn, ctx);
+        return;
     }
+    m->regions++;
+    m->region_threads += (uint64_t)k;
+    if (k > m->region_max) m->region_max = k;
+    hx_pool_for_n(m->pool, k, n, 1, fn, ctx);
+}
+
+static void par_for(hx_model *m, int64_t n, double ns, hx_range_fn fn, void *ctx) {
+    par_run(m, n, region_k(m, n, ns), fn, ctx);
 }
 
 /* Sum over the tokens of a sub-batch of their causal prefix lengths. */
@@ -275,15 +305,17 @@ static void mm_range(void *ctx, int64_t b, int64_t e, int tid) {
 /* Runs every task's rows in dynamic chunks (multiples of 16 rows, the kernels' tile).
  * Estimate: weights stream at ~30 B/ns, ~100 multiply-adds per ns once T is large. */
 static void mm_run(hx_model *m, const mm_task *t, int n) {
-    int64_t total = 0, chunk, maxr = 1;
-    int nt = hx_pool_size(m->pool);
+    int64_t total = 0, chunk, maxr = 1, tiles = 0;
+    int nt;
     double ns = 0.0;
     if (n <= 0) return;
     for (int i = 0; i < n; i++) {
         total += t[i].rows;
+        tiles += (t[i].rows + 15) / 16;
         if (t[i].rows > maxr) maxr = t[i].rows;
         ns += (double)t[i].rows * ((double)hx_row_bytes(t[i].dtype, t[i].cols) / 30.0 + (double)t[i].T * (double)t[i].cols / 100.0);
     }
+    nt = region_k(m, tiles, ns);
     if (nt <= 1) {
         chunk = maxr;
     } else {
@@ -303,7 +335,7 @@ static void mm_run(hx_model *m, const mm_task *t, int n) {
     j.start = m->task_start;
     j.n = n;
     j.chunk = chunk;
-    par_for(m, m->task_start[n], ns, mm_range, &j);
+    par_run(m, m->task_start[n], nt, mm_range, &j);
 }
 
 static void mm_set(mm_task *t, const hx_model *m, const mat *w, const void *act, int T, float *Y, int64_t ldy) {
@@ -512,6 +544,36 @@ static void gqa_softmax(void *ctx, int64_t b, int64_t e, int tid) {
     }
 }
 
+/* o_h[d] = sum_r p_h[r] * v_r[d] for r in [0, n), sequentially from 0.0f (NUMERICS
+ * §5.1/§5.2), for nh heads (o_h = o + h*ldo, p_h = p + h*ldp) and dn <= ATT_DC
+ * dims of the rows v_r = v + r*ldv; each row is read once for all nh heads. The
+ * full-width case has a constant trip count and restrict pointers, so compilers
+ * vectorise it across d (MSVC/SSE2: ~15% faster); every element keeps its order. */
+static void value_sum(float *HX_RESTRICT o, size_t ldo, const float *HX_RESTRICT p, size_t ldp, int nh,
+                      const float *HX_RESTRICT v, size_t ldv, int n, int dn) {
+    for (int h = 0; h < nh; h++)
+        for (int d = 0; d < dn; d++) o[(size_t)h * ldo + d] = 0.0f;
+    if (dn == ATT_DC) {
+        for (int r = 0; r < n; r++) {
+            const float *HX_RESTRICT vr = v + (size_t)r * ldv;
+            for (int h = 0; h < nh; h++) {
+                const float ph = p[(size_t)h * ldp + (size_t)r];
+                float *HX_RESTRICT oh = o + (size_t)h * ldo;
+                for (int d = 0; d < ATT_DC; d++) oh[d] = oh[d] + ph * vr[d];
+            }
+        }
+    } else {
+        for (int r = 0; r < n; r++) {
+            const float *HX_RESTRICT vr = v + (size_t)r * ldv;
+            for (int h = 0; h < nh; h++) {
+                const float ph = p[(size_t)h * ldp + (size_t)r];
+                float *HX_RESTRICT oh = o + (size_t)h * ldo;
+                for (int d = 0; d < dn; d++) oh[d] = oh[d] + ph * vr[d];
+            }
+        }
+    }
+}
+
 static void gqa_values(void *ctx, int64_t b, int64_t e, int tid) {
     const core_job *j = (const core_job *)ctx;
     hx_model *m = j->m;
@@ -519,20 +581,10 @@ static void gqa_values(void *ctx, int64_t b, int64_t e, int tid) {
     (void)tid;
     for (int64_t it = b; it < e; it++) {
         const int dc = (int)(it % j->ndc), g = (int)(it / j->ndc) % Hkv, i = (int)(it / j->ndc) / Hkv;
-        const int pos = j->pos0 + j->t0 + i, d0 = dc * ATT_DC, dn = imin(ATT_DC, hd - d0);
-        const float *p0 = m->S + ((size_t)i * m->H + (size_t)g * grp) * m->ldS;
-        const float *v0 = vcache(m, j->l, g) + d0;
-        float *o0 = m->att + (size_t)(j->t0 + i) * (size_t)m->o_in + (size_t)g * grp * hd + d0;
-        for (int hh = 0; hh < grp; hh++)
-            for (int d = 0; d < dn; d++) o0[(size_t)hh * hd + d] = 0.0f;
-        for (int r = 0; r <= pos; r++) {
-            const float *v = v0 + (size_t)r * hd;
-            for (int hh = 0; hh < grp; hh++) {
-                const float p = p0[(size_t)hh * m->ldS + r];
-                float *o = o0 + (size_t)hh * hd;
-                for (int d = 0; d < dn; d++) o[d] = o[d] + p * v[d];
-            }
-        }
+        const int pos = j->pos0 + j->t0 + i, d0 = dc * ATT_DC;
+        value_sum(m->att + (size_t)(j->t0 + i) * (size_t)m->o_in + (size_t)g * grp * hd + d0, (size_t)hd,
+                  m->S + ((size_t)i * m->H + (size_t)g * grp) * m->ldS, m->ldS, grp, vcache(m, j->l, g) + d0, (size_t)hd,
+                  pos + 1, imin(ATT_DC, hd - d0));
     }
 }
 
@@ -657,19 +709,9 @@ static void mla_values(void *ctx, int64_t b, int64_t e, int tid) {
     (void)tid;
     for (int64_t it = b; it < e; it++) {
         const int dc = (int)(it % j->ndc), i = (int)(it / j->ndc);
-        const int pos = j->pos0 + j->t0 + i, c0 = dc * ATT_DC, cn = imin(ATT_DC, C - c0);
-        const float *p0 = m->S + (size_t)i * H * m->ldS;
-        const float *cc = ccache(m, j->l, 0) + c0;
-        for (int h = 0; h < H; h++)
-            for (int c = 0; c < cn; c++) m->OL[((size_t)h * m->att_tb + i) * C + c0 + c] = 0.0f;
-        for (int r = 0; r <= pos; r++) {
-            const float *cr = cc + (size_t)r * C;
-            for (int h = 0; h < H; h++) {
-                const float p = p0[(size_t)h * m->ldS + r];
-                float *ol = m->OL + ((size_t)h * m->att_tb + i) * C + c0;
-                for (int c = 0; c < cn; c++) ol[c] = ol[c] + p * cr[c];
-            }
-        }
+        const int pos = j->pos0 + j->t0 + i, c0 = dc * ATT_DC;
+        value_sum(m->OL + (size_t)i * C + c0, (size_t)m->att_tb * C, m->S + (size_t)i * H * m->ldS, m->ldS, H,
+                  ccache(m, j->l, 0) + c0, (size_t)C, pos + 1, imin(ATT_DC, C - c0));
     }
 }
 
@@ -913,7 +955,21 @@ static void prefetch_next(hx_model *m, int nl, int T) {
     }
     m->pred_layer = nl;
     m->pred_n = n;
-    if (m->pf_prec >= PF_MIN_PREC * (double)m->K / (double)kk) hx_store_prefetch(m->store, nl, m->pf_list, n);
+    if (m->pred_log && m->pred_log_len + 2 + n <= m->pred_log_cap) {
+        int *d = m->pred_log + m->pred_log_len;
+        d[0] = nl;
+        d[1] = n;
+        memcpy(d + 2, m->pf_list, sizeof(int) * (size_t)n);
+        m->pred_log_len += 2 + n;
+    }
+    if (m->pf_prec >= PF_MIN_PREC * (double)m->K / (double)kk) {
+        hx_store_prefetch(m->store, nl, m->pf_list, n);
+        for (int i = 0; i < n; i++) {
+            const int key = nl * m->E + m->pf_list[i];
+            if (m->hint[key] == HINT_NONE) m->hint_keys[m->n_hints++] = key;
+            m->hint[key] = HINT_NOW;
+        }
+    }
 }
 
 /* Scores the prediction made for layer l against its actual experts (ulist). */
@@ -982,6 +1038,9 @@ static int moe_layer(hx_model *m, const layer_w *w, int l, int T, int pos0) {
     m->st.expert_uses += (uint64_t)T * (uint64_t)K;
     m->st.expert_loads_unique += (uint64_t)nu;
     score_prediction(m, l, nu);
+    /* acquiring these settles their prefetches (also on failure: the drain below) */
+    for (int u = 0; u < nu; u++)
+        if (m->hint[l * E + m->ulist[u]]) m->hint[l * E + m->ulist[u]] = HINT_USED;
 
     for (int u = 0; u < nu; u++) {
         m->uslab[u] = hx_store_try_acquire(m->store, l, m->ulist[u]);
@@ -1005,6 +1064,7 @@ static int moe_layer(hx_model *m, const layer_w *w, int l, int T, int pos0) {
 
     remaining = nu;
     uint64_t idle_ns = 0;
+    int blocking = 0;
     for (;;) {
         int nw = 0, got = 0;
         for (int u = 0; u < nu; u++)
@@ -1013,11 +1073,8 @@ static int moe_layer(hx_model *m, const layer_w *w, int l, int T, int pos0) {
             compute_wave(m, l, nw, T);
             for (int i = 0; i < nw; i++) {
                 const int u = m->wave[i];
-                /* the store counts one use per acquire (LFU heat, usage_out, hits): one per
-                 * (token, rank) routed here, as sequential evaluation would; the slab is
-                 * held, so these are hits */
-                for (int r = 1; r < m->u_n[u]; r++)
-                    if (hx_store_try_acquire(m->store, l, m->ulist[u])) hx_store_release(m->store, l, m->ulist[u]);
+                /* one use per (token, rank) routed here, as sequential evaluation counts */
+                if (m->u_n[u] > 1) hx_store_count_uses(m->store, l, m->ulist[u], (uint32_t)(m->u_n[u] - 1));
                 hx_store_release(m->store, l, m->ulist[u]);
                 m->ustate[u] = EX_DONE;
                 m->uslab[u] = NULL;
@@ -1033,10 +1090,16 @@ static int moe_layer(hx_model *m, const layer_w *w, int l, int T, int pos0) {
             }
         if (got) continue;
         uint64_t t0 = hx_now_ns();
-        if (idle_ns < STUCK_NS) {
+        if (!blocking) {   /* a failed read, or nothing for a long time: wait on the experts one by one */
+            hx_store_stats ss;
+            hx_store_get_stats(m->store, &ss);
+            blocking = ss.read_errors != m->seen_errors || idle_ns >= STUCK_NS;
+            m->seen_errors = ss.read_errors;
+        }
+        if (!blocking) {
             hx_store_wait_any(m->store, WAIT_US);
         } else {
-            /* nothing has arrived for a long time: block on one expert; NULL = unreadable */
+            /* the blocking acquire returns NULL at once for an expert that could not be read */
             for (int u = 0; u < nu; u++)
                 if (m->ustate[u] == EX_PENDING) {
                     m->uslab[u] = hx_store_acquire(m->store, l, m->ulist[u]);
@@ -1052,7 +1115,13 @@ static int moe_layer(hx_model *m, const layer_w *w, int l, int T, int pos0) {
         uint64_t dt = hx_now_ns() - t0;
         idle_ns += dt;
         m->st.stall_ns += dt;
-        if (rc) return rc;
+        if (rc) {
+            /* let this layer's other demand reads finish, so none completes after the call */
+            for (int u = 0; u < nu; u++)
+                if (m->ustate[u] == EX_PENDING && hx_store_acquire(m->store, l, m->ulist[u]))
+                    hx_store_release(m->store, l, m->ulist[u]);
+            return rc;
+        }
     }
 
     sum_job sj;
@@ -1105,7 +1174,7 @@ static int forward(hx_model *m, const int32_t *tok, int T, int pos0, float *logi
     uint64_t t0 = hx_now_ns(), t1;
     int rc = HX_OK;
 
-    m->pool = T >= SMT_MIN_T ? m->pool_all : m->pool_core;
+    m->fwd_threads = T >= SMT_MIN_T ? m->n_threads : m->core_threads;
     for (int t = 0; t < T; t++) {
         float *h = m->h + (size_t)t * D;
         hx_dequantize_row(m->tok_embd.dtype, m->tok_embd.w + (size_t)tok[t] * m->tok_embd.rb, h, D);
@@ -1164,11 +1233,57 @@ static int forward(hx_model *m, const int32_t *tok, int T, int pos0, float *logi
     return HX_OK;
 }
 
+/* At the start of a call: this call's hints become the previous call's; older and
+ * resolved ones are forgotten. */
+static void age_hints(hx_model *m) {
+    int n = 0;
+    for (int i = 0; i < m->n_hints; i++) {
+        const int key = m->hint_keys[i];
+        if (m->hint[key] == HINT_NOW) {
+            m->hint[key] = HINT_PREV;
+            m->hint_keys[n++] = key;
+        } else {
+            m->hint[key] = HINT_NONE;
+        }
+    }
+    m->n_hints = n;
+}
+
+/* A failed call waits for every prefetch that it or the previous call asked for and
+ * did not acquire: a blocking acquire turns a queued prefetch into a demand read and
+ * waits for one in flight (an unreadable expert fails at once). So no read it caused
+ * lands after it returns, and what those reads count falls inside the hidden delta.
+ * Costs at most one read per such hint (also for hints the store dropped). */
+static void drain_hints(hx_model *m) {
+    for (int i = 0; i < m->n_hints; i++) {
+        const int key = m->hint_keys[i], l = key / m->E, e = key % m->E;
+        if (m->hint[key] == HINT_USED) continue;
+        if (hx_store_acquire(m->store, l, e)) hx_store_release(m->store, l, e);
+        m->hint[key] = HINT_USED;
+        m->hints_drained++;
+    }
+}
+
+/* Store counters a failed call added (from s0 to s1) join the hidden ones; read_errors stays visible. */
+static void hide_store_delta(hx_model *m, const hx_store_stats *s0, const hx_store_stats *s1) {
+    hx_store_stats *h = &m->hid;
+    h->hits += s1->hits - s0->hits;
+    h->misses += s1->misses - s0->misses;
+    h->evictions += s1->evictions - s0->evictions;
+    h->prefetch_issued += s1->prefetch_issued - s0->prefetch_issued;
+    h->prefetch_used += s1->prefetch_used - s0->prefetch_used;
+    h->prefetch_wasted += s1->prefetch_wasted - s0->prefetch_wasted;
+    h->bytes_read += s1->bytes_read - s0->bytes_read;
+    h->read_ns += s1->read_ns - s0->read_ns;
+}
+
 int hx_model_eval(hx_model *m, const int32_t *tokens, int n, float *logits, int all_logits) {
     const uint64_t t0 = hx_now_ns();
     const int start = m->pos;
     const mstats before = m->st;
+    hx_store_stats s0;
     int rc = HX_OK;
+    hx_store_get_stats(m->store, &s0);
     m->tpend_len = 0;
     if (m->trace) {   /* the call's rows are written only if every chunk succeeds */
         const size_t need = (size_t)n * (size_t)m->n_moe * (size_t)m->K * 2;
@@ -1182,6 +1297,7 @@ int hx_model_eval(hx_model *m, const int32_t *tokens, int n, float *logits, int 
             m->tpend_cap = need;
         }
     }
+    age_hints(m);
     for (int off = 0; off < n && rc == HX_OK; off += m->max_batch) {
         const int T = imin(m->max_batch, n - off);
         float *lg = NULL;
@@ -1197,18 +1313,19 @@ int hx_model_eval(hx_model *m, const int32_t *tokens, int n, float *logits, int 
         if (rc == HX_OK) m->pos += T;
     }
     if (rc != HX_OK) {
-        /* the failed call leaves no trace: position, routing rows and the token / call /
-         * expert counters are as before (time counters and store statistics keep it) */
+        /* the failed call leaves no trace: position, routing rows and every counter
+         * but read_errors are as before */
+        hx_store_stats s1;
         m->pos = start;
         m->tpend_len = 0;
-        m->st.tokens = before.tokens;
-        m->st.forward_calls = before.forward_calls;
-        m->st.expert_uses = before.expert_uses;
-        m->st.expert_loads_unique = before.expert_loads_unique;
+        m->st = before;
+        drain_hints(m);            /* before s1: what the reads it waits for count is hidden too */
         hx_store_tick(m->store);   /* ends this attempt: unreadable experts may be retried, holds expire */
-    } else {
-        trace_flush(m);
+        hx_store_get_stats(m->store, &s1);
+        hide_store_delta(m, &s0, &s1);
+        return rc;
     }
+    trace_flush(m);
     m->st.wall_ns += hx_now_ns() - t0;
     return rc;
 }
@@ -1485,6 +1602,8 @@ static int alloc_scratch(hx_model *m, char *msg, size_t ml) {
         A(m->U, szmul(P * F, 4));
         A(m->Y, szmul(P * D, 4));
         A(m->routes, szmul(B, (size_t)m->n_moe * K * 2));
+        A(m->hint, szmul((size_t)m->L, E));
+        A(m->hint_keys, szmul(szmul((size_t)m->L, E), sizeof(int)));
     }
     {   /* attention sub-batch: score (and MLA latent) scratch within ATT_BUDGET */
         const size_t per = szmul(szmul((size_t)m->H, (size_t)m->cap), 4) +
@@ -1520,8 +1639,7 @@ void hx_model_close(hx_model *m) {
     if (!m) return;
     if (m->trace) hx_file_close(m->trace);
     if (m->store) hx_store_close(m->store);
-    if (m->pool_all && m->pool_all != m->pool_core) hx_pool_destroy(m->pool_all);
-    if (m->pool_core) hx_pool_destroy(m->pool_core);
+    if (m->pool) hx_pool_destroy(m->pool);
     if (m->kv) hx_free_large(m->kv, m->kv_bytes ? m->kv_bytes : 64);
     for (int i = 0; i < m->n_allocs; i++) hx_aligned_free(m->allocs[i]);
     free(m->replay);
@@ -1547,7 +1665,6 @@ hx_model *hx_model_open(const hearth_options *o, char *err, size_t errlen) {
     m->n_io = o->n_io_threads < 1 ? 1 : o->n_io_threads;
     m->max_batch = o->max_batch < 1 ? 1 : o->max_batch;
     m->prefetch = o->prefetch;
-    m->prefetch_extra = o->prefetch_extra < 0 ? 0 : o->prefetch_extra;
     m->pred_layer = -1;
     m->pf_prec = 1.0;
     m->par_min_ns = PAR_MIN_NS;
@@ -1556,19 +1673,19 @@ hx_model *hx_model_open(const hearth_options *o, char *err, size_t errlen) {
     if (!m->mf) { free(m); return NULL; }
     m->c = &m->mf->cfg;
     if (!setup_dims(m, msg, sizeof msg) || !bind_all(m, msg, sizeof msg)) goto fail;
+    /* capped at n_experts (<= 65536), so top_k + extra cannot overflow in prefetch_next */
+    m->prefetch_extra = o->prefetch_extra < 0 ? 0 : imin(o->prefetch_extra, m->E);
     m->cap = o->max_seq > 0 ? imin(o->max_seq, m->model_max_seq) : imin(m->model_max_seq, 4096);
     if (m->cap < 1) m->cap = 1;
     if (!alloc_scratch(m, msg, sizeof msg)) goto fail;
 
-    {   /* threads beyond the physical cores only for large batches (SMT_MIN_T) */
-        const int cores = imax(1, imin(m->n_threads, hx_num_physical_cores()));
-        m->pool_core = hx_pool_create(cores, POOL_SPIN_US);
-        m->pool_all = !m->pool_core || cores == m->n_threads ? m->pool_core : hx_pool_create(m->n_threads, POOL_SPIN_US);
-        m->pool = m->pool_core;
-        if (!m->pool_core || !m->pool_all) {
-            snprintf(msg, sizeof msg, "cannot start %d compute threads", m->n_threads);
-            goto fail;
-        }
+    /* threads beyond the physical cores only for large batches (SMT_MIN_T) */
+    m->core_threads = imax(1, imin(m->n_threads, hx_num_physical_cores()));
+    m->fwd_threads = m->core_threads;
+    m->pool = hx_pool_create(m->n_threads, POOL_SPIN_US);
+    if (!m->pool) {
+        snprintf(msg, sizeof msg, "cannot start %d compute threads", m->n_threads);
+        goto fail;
     }
 
     {
@@ -1592,7 +1709,7 @@ hx_model *hx_model_open(const hearth_options *o, char *err, size_t errlen) {
     }
     hx_log(HX_LOG_INFO, "%s: %s, %d layers (%d MoE), d_model %d, vocab %d, KV %d positions (%.1f MiB), isa %d, "
            "%d threads (%d for batches under %d tokens)", o->model_path, m->c->arch, m->L, m->n_moe, m->D, m->V, m->cap,
-           (double)m->kv_bytes / (1 << 20), m->isa, m->n_threads, hx_pool_size(m->pool_core), SMT_MIN_T);
+           (double)m->kv_bytes / (1 << 20), m->isa, m->n_threads, m->core_threads, SMT_MIN_T);
     return m;
 fail:
     hx_fail(err, errlen, "%s: %s", o->model_path, msg[0] ? msg : "cannot open");
@@ -1648,12 +1765,36 @@ void hx_model_set_parallel_min(hx_model *m, double ns) {
 }
 int hx_model_max_batch(const hx_model *m) { return m ? m->max_batch : 0; }
 uint64_t hx_model_regions(const hx_model *m) { return m ? m->regions : 0; }
-int hx_model_core_threads(const hx_model *m) { return m ? hx_pool_size(m->pool_core) : 0; }
+uint64_t hx_model_region_threads(const hx_model *m) { return m ? m->region_threads : 0; }
+int hx_model_region_max(hx_model *m) {
+    int k = m ? m->region_max : 0;
+    if (m) m->region_max = 0;
+    return k;
+}
+int hx_model_core_threads(const hx_model *m) { return m ? m->core_threads : 0; }
+void hx_model_set_prediction_log(hx_model *m, int *buf, int cap) {
+    if (!m) return;
+    m->pred_log = cap > 0 ? buf : NULL;
+    m->pred_log_cap = cap > 0 ? cap : 0;
+    m->pred_log_len = 0;
+}
+int hx_model_prediction_log_len(const hx_model *m) { return m ? m->pred_log_len : 0; }
+uint64_t hx_model_hints_drained(const hx_model *m) { return m ? m->hints_drained : 0; }
+
+static uint64_t minus(uint64_t a, uint64_t b) { return a > b ? a - b : 0; }
 
 void hx_model_get_stats(hx_model *m, hearth_stats *out) {
     hx_store_stats ss;
     memset(out, 0, sizeof *out);
     hx_store_get_stats(m->store, &ss);
+    ss.hits = minus(ss.hits, m->hid.hits);
+    ss.misses = minus(ss.misses, m->hid.misses);
+    ss.evictions = minus(ss.evictions, m->hid.evictions);
+    ss.prefetch_issued = minus(ss.prefetch_issued, m->hid.prefetch_issued);
+    ss.prefetch_used = minus(ss.prefetch_used, m->hid.prefetch_used);
+    ss.prefetch_wasted = minus(ss.prefetch_wasted, m->hid.prefetch_wasted);
+    ss.bytes_read = minus(ss.bytes_read, m->hid.bytes_read);
+    ss.read_ns = minus(ss.read_ns, m->hid.read_ns);
     out->tokens = m->st.tokens;
     out->forward_calls = m->st.forward_calls;
     out->wall_s = (double)m->st.wall_ns * 1e-9;
@@ -1674,10 +1815,13 @@ void hx_model_get_stats(hx_model *m, hearth_stats *out) {
     out->cache_slots = ss.n_slots;
     out->cache_resident = ss.resident;
     out->cache_pinned = ss.pinned;
+    out->read_errors = ss.read_errors;
 }
 
 void hx_model_reset_stats(hx_model *m) {
     memset(&m->st, 0, sizeof m->st);
+    memset(&m->hid, 0, sizeof m->hid);
+    m->seen_errors = 0;
     hx_store_reset_stats(m->store);
 }
 
@@ -1689,11 +1833,28 @@ static uint32_t get32(const uint8_t *p) {
 }
 
 /* The new file is opened (and its header written) before an active trace is
- * closed, so a path that cannot be written leaves the current trace running. */
+ * closed, so a path that cannot be written leaves the current trace running.
+ * An existing non-empty file is overwritten only if it is a routing trace: a slip
+ * must not truncate the model, a mirror or a heat profile. One that exists but
+ * cannot be read (write-only permissions, a handle denying read sharing) cannot be
+ * checked, so it is refused too. */
 int hx_model_trace_start(hx_model *m, const char *path) {
     char err[512];
     uint8_t hdr[TRACE_HDR];
-    hx_file *f;
+    hx_file *f = hx_file_open(path, HX_FILE_READ, err, sizeof err);
+    if (f) {
+        const int64_t size = hx_file_size(f);
+        const int trace = size == 0 || (size >= 4 && hx_file_pread(f, hdr, 4, 0) == 4 && get32(hdr) == TRACE_MAGIC);
+        hx_file_close(f);
+        if (!trace) {
+            hx_log(HX_LOG_ERROR, "routing trace: %s exists and is not a routing trace; not overwritten", path);
+            return HX_E_ARG;
+        }
+    } else if (hx_path_exists(path)) {
+        hx_log(HX_LOG_ERROR, "routing trace: %s exists but cannot be read to check it is a routing trace (%s); "
+               "not overwritten", path, err);
+        return HX_E_ARG;
+    }
     f = hx_file_open(path, HX_FILE_WRITE | HX_FILE_CREATE, err, sizeof err);
     if (!f) { hx_log(HX_LOG_ERROR, "routing trace: %s", err); return HX_E_IO; }
     put32(hdr, TRACE_MAGIC);

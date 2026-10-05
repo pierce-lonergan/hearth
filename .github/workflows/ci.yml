@@ -22,10 +22,22 @@ concurrency:
 # __init__.py files, pytest.ini/pyproject.toml/setup.cfg/tox.ini, PYTEST_ADDOPTS, planted .pyc
 # files or a sitecustomize on PYTHONPATH could skip or neutralise them, and pytest reports skips
 # as success. `check_golden.py --run` verifies the hash lock and runs a temporary copy of only
-# the locked files, failing on any skip. It is started with `python -E` and without PYTHONPATH so
-# nothing from the repository runs before it, and it is taken from the base revision
-# ($GOV_TOOLS) so that a change cannot weaken the check it is judged by.
-# The decision circuit breaker lives in decisions.yml, which also re-runs when PR labels change.
+# the locked files, failing on any skip.
+#
+# The governance tools run as checked out at the base revision (.trusted/, removed first in case the
+# change brings one), with `python -I -S`: no PYTHON* variables, no current directory or script
+# directory on sys.path, no site-packages and no .pth files. In the governance job they run before
+# anything from the change is installed or executed (`python -I -m pip` keeps pip from importing a
+# pip/ package of the change). The build jobs run the change's own build and tests before their
+# golden run, and that code could tamper with .trusted/ or site-packages, so the golden run there is
+# only as trustworthy as review of that code (governance/README.md, "CI").
+#
+# This workflow runs on `pull_request`, i.e. as the pull request has edited it; only CODEOWNERS on
+# .github/ with required code-owner review stops a change from editing these steps. Whether the
+# golden files may differ from the base's lock is decided by golden.yml, and the decision circuit
+# breaker by decisions.yml. Those run on `pull_request_target` for pull requests into main (the
+# default branch's copy of the workflow), fetch the change only as git objects, refuse paths that
+# are one file on Windows or macOS, and re-run when labels change.
 
 jobs:
   governance:
@@ -40,7 +52,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - run: python -m pip install pytest
+      - name: Discard any .trusted directory the change brings
+        shell: bash
+        run: rm -rf .trusted
       - name: Verification tools from the base revision
         uses: actions/checkout@v4
         with:
@@ -48,21 +62,19 @@ jobs:
           path: .trusted
           sparse-checkout: governance/tools
           persist-credentials: false
-      - name: Select verification tools
-        shell: bash
-        run: |
-          t=.trusted/governance/tools
-          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
-          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
       - name: Golden-test lock (INV-VERIFY)
-        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root .
+        run: python -I -S .trusted/governance/tools/check_golden.py --root .
       - name: Task DAG
-        run: python governance/tools/waves.py validate
+        run: python -I -S .trusted/governance/tools/waves.py validate --tasks governance/tasks.json
       - name: Handover manifests
-        run: python governance/tools/validate_handover.py --engine builtin
+        run: >
+          python -I -S .trusted/governance/tools/validate_handover.py --engine builtin
+          --schema governance/schemas/handover.schema.json --invariants governance/INVARIANTS.md
+          --tasks governance/tasks.json governance/handovers
       - name: Decision records
-        run: python governance/tools/adr.py lint
-      - name: Governance tool tests
+        run: python -I -S .trusted/governance/tools/adr.py lint --root .
+      - run: python -I -m pip install pytest
+      - name: Governance tool tests (the change's own tools)
         run: python -m pytest tests/py/test_governance.py -q
 
   linux:
@@ -77,7 +89,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install numpy pytest
+      - name: Discard any .trusted directory the change brings
+        shell: bash
+        run: rm -rf .trusted
       - name: Verification tools from the base revision
         uses: actions/checkout@v4
         with:
@@ -85,12 +99,7 @@ jobs:
           path: .trusted
           sparse-checkout: governance/tools
           persist-credentials: false
-      - name: Select verification tools
-        shell: bash
-        run: |
-          t=.trusted/governance/tools
-          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
-          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - run: python -I -m pip install numpy pytest
       - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
       - name: Configure
         run: >
@@ -108,7 +117,7 @@ jobs:
       - name: Golden tests, isolated (INV-VERIFY)
         env:
           HEARTH_LIB: ${{ github.workspace }}/build/libhearth.so
-        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root . --run
+        run: python -I -S .trusted/governance/tools/check_golden.py --root . --run
 
   linux-asan:
     name: linux asan+ubsan
@@ -134,7 +143,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install numpy pytest
+      - name: Discard any .trusted directory the change brings
+        shell: bash
+        run: rm -rf .trusted
       - name: Verification tools from the base revision
         uses: actions/checkout@v4
         with:
@@ -142,12 +153,7 @@ jobs:
           path: .trusted
           sparse-checkout: governance/tools
           persist-credentials: false
-      - name: Select verification tools
-        shell: bash
-        run: |
-          t=.trusted/governance/tools
-          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
-          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - run: python -I -m pip install numpy pytest
       - shell: bash
         run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
       - name: Configure (Visual Studio generator, x64)
@@ -166,7 +172,7 @@ jobs:
       - name: Golden tests, isolated (INV-VERIFY)
         env:
           HEARTH_LIB: ${{ github.workspace }}\build\Release\hearth.dll
-        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root . --run
+        run: python -I -S .trusted/governance/tools/check_golden.py --root . --run
 
   macos:
     name: macos arm64
@@ -176,7 +182,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: python -m pip install numpy pytest
+      - name: Discard any .trusted directory the change brings
+        shell: bash
+        run: rm -rf .trusted
       - name: Verification tools from the base revision
         uses: actions/checkout@v4
         with:
@@ -184,12 +192,7 @@ jobs:
           path: .trusted
           sparse-checkout: governance/tools
           persist-credentials: false
-      - name: Select verification tools
-        shell: bash
-        run: |
-          t=.trusted/governance/tools
-          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
-          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - run: python -I -m pip install numpy pytest
       - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
       - name: Configure
         run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
@@ -205,7 +208,7 @@ jobs:
       - name: Golden tests, isolated (INV-VERIFY)
         env:
           HEARTH_LIB: ${{ github.workspace }}/build/libhearth.dylib
-        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root . --run
+        run: python -I -S .trusted/governance/tools/check_golden.py --root . --run
 
   transformers-crosscheck:
     name: transformers cross-check (manual)
@@ -218,8 +221,8 @@ jobs:
           python-version: "3.12"
       - name: Install numpy, pytest, CPU torch, transformers
         run: |
-          python -m pip install numpy pytest safetensors tokenizers transformers
-          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          python -I -m pip install numpy pytest safetensors tokenizers transformers
+          python -I -m pip install torch --index-url https://download.pytorch.org/whl/cpu
       - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
       - name: Build
         run: |

@@ -1,0 +1,588 @@
+{
+ "review": "Verification council round 2 — hardening (workflow wf_e0cf3c38-537)",
+ "date": "2026-10-05",
+ "tasks": {
+  "H01-store": {
+   "final_verifier": "verify:H01-store",
+   "verdict": "pass",
+   "findings": [
+    {
+     "severity": "minor",
+     "title": "Leftover of the T06 stale-miss_pending finding: a prefetch that was promoted to a demand and then fails on every attempt keeps miss_pending",
+     "file": "engine/src/store.c",
+     "line": 327,
+     "evidence": "request_demand (line 424/426) sets miss_pending[key] when it promotes an in-flight prefetch. If that read then fails, finish() handles it as JOB_PF: lines 327-331 skip both FAIL_NOW and clear_miss. The slot is freed (slot_of = -1). The tick clear at lines 574-577 only reaches READY slots, and the eviction clear in assign() only reaches READY slots. If the caller then abandons the expert, the flag stays set indefinitely and n_pending stays > 0, so every tick scans all slots.\n\nVerifier harness adv_store.c (outside the repo), t_promoted_fail on make_tiny qwen3_moe (L4 E32 K2), 2 readers, LRU:\n1. Read hook delays expert (0,5) by 40 ms and fails it on every attempt.\n2. hx_store_prefetch(0,{5}), wait until the hook is entered, then try_acquire(0,5) (promotes it).\n3. Wait for read_errors == 1, then tick x3, make the expert readable, reset_stats, acquire(0,5).\nResult: 'later cold read of the abandoned expert: reads 1 misses 0 hits 0' (want 1,1,0). Reproduced on MSVC /O2, MSVC ASan, gcc 13.3 ASan+UBSan and gcc TSan (no sanitizer report).\n\nThe engineer's abandoned_demands test covers only the eviction and tick paths. Effect: a genuine cold read is counted as neither a miss nor a hit (hit-rate statistics, simulator calibration), and a later prefetch completion of that key is wrongly reported as fresh to wait_any. Not a deadlock: hx_store_acquire over a failing promoted prefetch still re-reads it as a demand and returns the slab (verified by t_promoted_fail_acquire).",
+     "fix_hint": "In finish(), when ok == 0, kind == JOB_PF and miss_pending[key] is set, the read was demanded. Either re-queue it as a demand (kq = Q_DEM, push it on dq, signal work_cv), or treat it like a failed demand (FAIL_NOW + clear_miss). Alternatively, have hx_store_tick also clear miss_pending for keys with slot_of < 0 and kq == Q_NONE. Add the sequence above to abandoned_demands."
+    },
+    {
+     "severity": "minor",
+     "title": "save_usage's replace-failure cleanup is untested although a portable trigger exists; the mutant that skips temp removal survives",
+     "file": "engine/tests/test_store.c",
+     "line": 441,
+     "evidence": "The engineer's open issue says there is no portable way to make the replace fail, which is why store.c lines 724-728 are untested (9 mutate survivors). A portable trigger exists: point usage_out at an existing directory. platform_win.c hx_file_replace refuses a directory dst up front (ERROR_DIRECTORY_NOT_SUPPORTED), and POSIX rename(file, dir) fails. hx_file_open still creates '<dir>.<hex>.tmp' next to it.\n\nMy harness (t_replace_fail) does exactly this. It logs '[hearth] warning: usage profile not written: cannot replace ...\\advdir_usage' and leaves 0 temp files, on both MSVC and gcc.\n\nTargeted mutant M11 (store.c:728 'if (!ok && remove(tmp) != 0)' -> 'if (0 && ...)', which never removes the temp) SURVIVES test_store --quick --seed 3. mutate.py --root <snapshot> on store.c's changed lines (seed 5, 60 mutants) also shows M0816 and M0817 at line 728 surviving.",
+     "fix_hint": "In usage_replace(), add a case with usage_out = an existing directory: check that the directory is unchanged and that no '<name>.*.tmp' file remains afterwards (list the parent directory)."
+    },
+    {
+     "severity": "minor",
+     "title": "Confirmed (already raised as a contract issue): a non-ASCII usage_out leaks its temp file when the replace fails, because remove() takes an ANSI path on Windows",
+     "file": "engine/src/store.c",
+     "line": 728,
+     "evidence": "uni.c harness: usage_out = UTF-8 '<scratch>\\профиль_dir', which names an existing directory, so the replace fails. Output: '[hearth] warning: cannot remove the temporary file ...\\профиль_dir.1d41098fb3c757e4.tmp', and the directory listing afterwards contains 'профиль_dir.1d41098fb3c757e4.tmp'. The same non-ASCII path as a normal file is written correctly with no leftover. Every close in that state leaks one file.",
+     "fix_hint": "As the engineer proposed: add hx_file_remove(const char *utf8) to hx_platform.h (DeleteFileW / unlink) and use it in save_usage."
+    }
+   ],
+   "engineer_open_issues": [
+    "save_usage's replace-failure branch (temp written, hx_file_replace fails, temp removed) is implemented but not tested: no portable way to force the replace to fail inside the scratch dir and observe the temp name. 9 mutate.py survivors are there.",
+    "C/Python reader disagreement on rope_inv_freq with rope_dim 0 (see contract_issues); FORMAT owner to decide.",
+    "Forward-pass integration (not my files): model.c should call hx_store_count_uses where one acquire serves n activations, copy hx_store_stats.read_errors into hearth_stats.read_errors, and treat a NULL from hx_store_acquire as an I/O error for the token.",
+    "On filesystems without POSIX renames (FAT, SMB/9P), hx_file_replace fails while another process holds the profile open. A usage_out in a directory without create permission can no longer be written. Both cases log a warning and keep the old profile.",
+    "hearth.sim caps pins at slots - max(engine_min_slots, max_union + top_k), which is stricter than hx_store.h's minimum-slot rule when a batch union exceeds the minimum (python/hearth/sim/cache.py, H04's file).",
+    "With several caller threads, one thread's wait_any can report another thread's completion (carried over; the header says a single compute thread drives the store).",
+    "Benchmark measured on a shared machine with other engineers' builds running: run-to-run noise is about 10%. POSIX was verified only on WSL2 gcc 13.3."
+   ],
+   "engineer_contract_issues": [
+    "hx_platform.h: add `int hx_file_remove(const char *path);` (UTF-8 path, DeleteFileW / unlink, 0 on success). store.c's save_usage removes its temp file `<usage_out>.<16 hex>.tmp` with ISO C remove() when the write or replace fails. On Windows remove() takes an ANSI path, so a non-ASCII usage_out path leaves the temp file behind.",
+    "hx_platform.h (optional): add `int hx_file_sync(hx_file *f);` (FlushFileBuffers / fsync) so the atomically replaced profile is durable across a power loss. Today a crash right after close may leave an empty or partial profile on some filesystems. That is harmless: the reader ignores an invalid profile with a warning.",
+    "FORMAT.md §4.1 table, 'when' column: write `layer_kind = 1 and score_bias` for moe_router_bias, `layer_kind = 1 and shared_ffn_dim > 0` for shexp_gate/shexp_up/shexp_down, and `layer_kind = 1, shared_ffn_dim > 0 and shared_gate` for shexp_gate_inp. hearth.format.canonical_tensors and model.c treat these as MoE-layer tensors, which is what modelfile.c now enforces; the table reads as if dense layers needed them too.",
+    "shexp_gate_inp dtype: FORMAT.md lists it among 'other matrices' (F32/F16/BF16/Q8/Q4) and hearth.format.canonical_tensors marks it not F32-only. model.c, however, binds it with bind_vec, which requires F32, and all writers produce F32. Proposal: add shexp_gate_inp to FORMAT's always-F32 list (modelfile.c MAT -> F32MAT, one line; canonical_tensors True), or let model.c accept matrix dtypes. Until then the C reader accepts a non-F32 shexp_gate_inp that hx_model_open rejects.",
+    "rope_inv_freq 'present iff rope_dim > 0' (FORMAT.md §4.1, amended in 8ea46c0) is now enforced by modelfile.c, but hearth.format.ContainerReader and hearth.reference accept rope_inv_freq with rope_dim 0. Two tests assert that: tests/py/test_format.py::test_rope_inv_freq_shape_checked_when_present and tests/py/test_reference.py::test_rope_dim_zero_means_no_rotation. Either the Python reader also rejects it (and those tests change), or FORMAT relaxes to 'required when rope_dim > 0, ignored otherwise' (one line in modelfile.c).",
+    "FORMAT.md §4.1 says lm_head is 'absent when tied'. modelfile.c ignores an lm_head in a tied model as an unused extra tensor, as hearth.reference does. If 'absent' is meant as a requirement, that is one more check.",
+    "hx_store.h hx_store_stats.read_errors 'failed slab reads (after retries / mirrors)' and hearth.h hearth_stats.read_errors 'failed expert reads': store.c counts demand, prefetch and open-time slab reads. Propose saying so explicitly in hx_store.h."
+   ],
+   "engineer_measurements": [
+    {
+     "metric": "prefetch reads in flight after one prefetch call with n_io+1 hints to idle readers (8 readers)",
+     "value": 7,
+     "unit": "reads (2 and 4 for 3 and 5 readers; gen-003: 1)",
+     "conditions": "test_store prefetch_overlap, readers held in the read hook"
+    },
+    {
+     "metric": "prefetch batch throughput from idle readers, direct, 2.39 MiB slabs, peak (readers 1/2/4/8/16: 5.02/4.96/6.62/6.57/6.56 and 4.89/4.88/6.72/6.67/6.66; gen-003 wake-up 4.24/4.27/4.26/4.27/4.20)",
+     "value": 6.72,
+     "unit": "GB/s",
+     "conditions": "test_store --bench 'prefetch' row, 990 PRO, 6.0 GiB synthetic container, shared machine (noisy)"
+    },
+    {
+     "metric": "prefetch batch throughput from idle readers, direct, 22.3 MiB slabs, peak (5.64/5.59/6.20/6.54/6.14 and 5.47/5.51/6.21/6.30/6.12; gen-003 wake-up 5.68/5.78/5.74/5.80/5.73)",
+     "value": 6.54,
+     "unit": "GB/s",
+     "conditions": "same runs, 5.59 GiB container, noisy"
+    },
+    {
+     "metric": "cold demand reads, direct I/O, 2.39 MiB slabs, peak (readers 1/2/4/8/16: 4.90/7.16/5.93/5.88/5.95 and 4.80/6.99/5.99/5.91/6.15)",
+     "value": 7.16,
+     "unit": "GB/s",
+     "conditions": "test_store --bench 'direct' row, demand window 2 x readers, shared machine (noisy)"
+    },
+    {
+     "metric": "cold demand reads, direct I/O, 22.3 MiB slabs, peak (5.71/5.83/6.77/5.91/6.53 and 5.60/5.78/5.91/6.50/6.39)",
+     "value": 6.77,
+     "unit": "GB/s",
+     "conditions": "same runs"
+    },
+    {
+     "metric": "cold demand reads, buffered I/O, peak (2.39 MiB: 2.59/4.88/6.07/5.87/6.60; 22.3 MiB: 2.90/5.29/5.67/6.45/4.87)",
+     "value": 6.6,
+     "unit": "GB/s",
+     "conditions": "disjoint never-read fifths, first bench run, noisy"
+    },
+    {
+     "metric": "overcommit failures under 32 busy loops + parallel --quick runs",
+     "value": 0,
+     "unit": "failed runs of 60 (gen-003: 3/6 and 2/6)",
+     "conditions": "Windows MSVC /O2, seeds 61-122"
+    },
+    {
+     "metric": "mutation score store.c (all changed lines, seed 1)",
+     "value": 70.9,
+     "unit": "percent",
+     "conditions": "78 killed / 110; survivors: 12 equivalent, 4 log-only, 3 memory-only, 4 temp-name/nonce, 9 untested replace-failure branch"
+    },
+    {
+     "metric": "mutation score modelfile.c (all changed lines, seed 1)",
+     "value": 92.9,
+     "unit": "percent",
+     "conditions": "131 killed / 141; 10 equivalent survivors"
+    },
+    {
+     "metric": "C reader vs hearth.format.canonical_tensors parity cases",
+     "value": 728,
+     "unit": "agree (0 disagree)",
+     "conditions": "make_tiny 5 archs x F32/Q4, each canonical tensor dropped / one row added, rope_dim 0"
+    }
+   ]
+  },
+  "H02-platform-pool": {
+   "final_verifier": "verify:H02-platform-pool#3",
+   "verdict": "fail",
+   "findings": [
+    {
+     "severity": "major",
+     "title": "test_pool is flaky under ctest -j6: 7 of 12 runs failed, which contradicts the report's '6/6 serial and -j6'",
+     "file": "engine/tests/test_pool.c",
+     "line": 548,
+     "evidence": "I did a CMake VS2022 x64 Release build of the current sources (file hashes unchanged throughout) and ran `ctest --test-dir <dir> -C Release -j6 --output-on-failure` 12 times: 7 runs failed, every time in test_pool. In 5 runs the failure was test_pool.c:548 'workers stopped spinning after slow tasks', with values (-0.144 vs 2.344 CPU s), (0.184 vs 2.078), (0.731 vs 2.328), (0.778 vs 1.875) and (0.169 vs 2.109). In 2 runs it was test_pool.c:1036 'stall threshold: held 120 us: no stall' (stalls 1), failing all 3 attempts. Serial ctest passed 4 of 4, and standalone full runs pass. I also re-ran test_slow_tasks on its own (driver outside the repo that #includes test_pool.c) while a separate process ran 24 busy threads: it failed 3 of 5 runs, with values such as -0.300 vs 0.000 and -0.066 vs 0.000 CPU s. Causes: (1) test_slow_tasks (lines 534-548) is single-shot. Every other timing section gets 3 attempts and/or gates on hx__pool_stats; this one does neither. It also subtracts a nominal 15 x 100 x 200 us of task CPU, but busy_us() is wall-clock based, so under contention the tasks use less CPU than that, and the result is compared against tick-granular GetProcessTimes. Stalls and caller-starved back-offs during the slow phase (more likely with a 200 us caller wait) also send the workers to sleep. (2) test_stall_threshold's 'held 120 us: no stall' case assumes the held worker is the only source of delay. Under load the pickup exceeds the seeded ~300 us re-wake threshold.",
+     "fix_hint": "Give test_slow_tasks the same treatment as the other sections. Give it up to 3 attempts. Read hx__pool_stats before and after each phase and count an attempt with back-offs (or with stalls in only one phase) as inconclusive. Run the worker tasks on a fixed count of CPU work, like cpu_work(), or measure per-thread CPU time instead of subtracting a nominal wall-clock figure. In test_stall_threshold, count the 'no stall' case as inconclusive when the run was overloaded, for example when a sleeping-pool control shows slow wake-ups, rather than failing after 3 attempts."
+    },
+    {
+     "severity": "major",
+     "title": "test_platform asserts a getenv pointer lifetime POSIX does not promise; this already fails the macOS CI job and is still unconditional",
+     "file": "engine/tests/test_platform.c",
+     "line": 1506,
+     "evidence": "governance/reviews/2026-10-05-ci-first-runs.md, open item 2 (CI run 37308785094, macos arm64): test_platform.c:858 'earlier returned pointer still valid' fails because Darwin getenv storage is not stable across setenv. The same assertion is in gen-003 unchanged and unguarded: `CHECK(keep && strcmp(keep, \"42\") == 0, \"earlier returned pointer still valid\")` at line 1506, after set_env(\"HX_TEST_V\", \"  -7 \"). Only the 'same pointer' check just above it is guarded with #if HX_OS_WINDOWS. platform_posix.c:480-483 returns getenv() directly. The engineer's own contract_issues proposal for hx_env_str says that on POSIX the pointer is valid only 'until the variable is next set or unset', so the test contradicts the contract the engineer is proposing. On Darwin the check reads storage that may have been freed. I could not run this myself (no macOS): the evidence is the CI record plus code reading. It passes on glibc only because glibc setenv never frees old strings.",
+     "fix_hint": "Put the check under #if defined(HX_OS_WINDOWS), where the 8-change ring in platform_win.c guarantees it. Alternatively, give platform_posix.c the same bounded per-name cache of copies as Windows and document that lifetime in hx_platform.h, as the CI review suggests."
+    },
+    {
+     "severity": "major",
+     "title": "Crowded pools (28-32 threads) are 2.2-3x slower than at the 4a6cb80 baseline under WSL2/Linux; disclosed, unresolved, and no non-Windows test guards it",
+     "file": "engine/src/pool.c",
+     "line": 274,
+     "evidence": "WSL2 gcc -O2, verifier bench v_lat (empty task, spin_us=1000), interleaved runs against 4a6cb80's pool.c. 32 threads: current mean 655.7/564.8/369.2/507.1/485.1 us (p50 805/693/559/654/614) vs base 216.2/251.4/153.3/187.8/194.3 us (p50 192/196/104/169/177). 28 threads: current 399/294 us vs base 163/137 us (p50 499/472 vs 101/99). 16 threads: parity (0.85-0.87 vs 0.83-0.92 us). The p50 of 470-800 us matches one stall, then sleep, then a re-wake of 27-31 workers at about 17 us each: crowded pools use rewake = 0 (line 274), so they stall after a fixed 20 us. test_full_machine (lines 1145-1169) judges only on Windows, and in the full WSL test_pool run it printed 'p50 718.66 us spinning, 533.08 us sleeping', so the spinning pool loses to a sleeping one. Caveats: VM-only (native Linux not measured); the engine's default n_threads = physical cores never builds a crowded pool; the engineer disclosed this as an unfulfilled mandate.",
+     "fix_hint": "For crowded pools where the measured wake cost is high, avoid the stall, sleep, re-wake cycle: for example, do not declare stalls when (k-1)*wake_ns is far above the spin cost, or fall back to the 4a6cb80 behaviour. Add a non-Windows guard that compares against the baseline behaviour or a sleeping pool, so the regression cannot grow unnoticed. Validate on native Linux before accepting."
+    },
+    {
+     "severity": "minor",
+     "title": "The 32-vs-16-thread target is unverified, no test asserts it, and the claimed baseline number at HIGH priority did not reproduce",
+     "file": "engine/tests/test_pool.c",
+     "line": 1165,
+     "evidence": "Windows, interleaved v_lat runs, about 30% ambient load. 32 threads: mean 6.30-7.29 us, p50 5.4-5.5 us. 16 threads: 0.68-0.79 us. Ratio 8-10x. At HIGH priority class (verified as applied): 32 threads 6.52-7.07 us (p50 5.4) vs 16 threads 0.74-0.80 us. That is the same ratio, because SwitchToThread also yields to lower-priority threads. The only Windows test, test_full_machine, requires spinning p50 below one third of a sleeping pool's (about 77 us), which allows a 32-thread p50 of about 25 us, roughly 40x the 16-thread p50. The engineer's claim '4a6cb80 at HIGH priority: p50 0.9 us' did not reproduce: I measured 4a6cb80 at HIGH 6 times and got p50 1023.8-1025.8 us, mean 1029.7-1033.2 us.",
+     "fix_hint": "Either get a director decision on what 'small multiple on a quiet machine' means given this machine can never be made quiet, or add a check of the 32-vs-16 latency ratio that self-skips when a control shows load. Correct the baseline-at-HIGH number in the handover."
+    },
+    {
+     "severity": "minor",
+     "title": "Windows hx_file_replace main path drops the write-through durability the task asked for; POSIX fsyncs the directory",
+     "file": "engine/src/platform_win.c",
+     "line": 524,
+     "evidence": "Code reading. The task text requires MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH). The main path hx__rename_posix opens tmp with FILE_ATTRIBUTE_NORMAL|FILE_FLAG_OPEN_REPARSE_POINT only: no FILE_FLAG_WRITE_THROUGH and no flush. Only the MoveFileExW fallback passes WRITE_THROUGH. test_platform says so itself ('hx_file_replace directory sync: not applicable on Windows (the rename is the only step)'). The engineer's proposed hx_platform.h wording does not mention that durability is lost on the main path. Functional behaviour is correct, verified by running on both OSes: replace(x, x) gives rc 0, >MAX_PATH paths work, replace with tmp and dst both open through hx_file works, and readers holding dst keep the old data.",
+     "fix_hint": "Open the rename handle with FILE_FLAG_WRITE_THROUGH, which as I understand it (not verified) is how MoveFileEx implements WRITE_THROUGH, or call FlushFileBuffers on the renamed handle before closing. Otherwise state in the proposed contract text that Windows gives no crash-durability guarantee."
+    },
+    {
+     "severity": "minor",
+     "title": "Smoothed wake-up cost (wake_ns) has no outlier clamp: under overload it jumps 100-170x and temporarily disables the stall and back-off thresholds",
+     "file": "engine/src/pool.c",
+     "line": 355,
+     "evidence": "Verifier bench v_wake2 (16 threads, spin_us=5000, 32 busy threads, 3 s back to back), 3 runs: wake_ns max 353631 / 229285 / 280857 ns, against about 2.1-2.3 us normally (final value 1.4-1.7 us; it recovers). During such a spike a 16-thread pool's stall threshold is (k-1)*wake_ns, about 3.4-5.3 ms (doubled after a wake), and the slow/starve threshold is about 21 ms. Stall and back-off detection are effectively off during exactly the overload they exist for. I did not show an effect on dispatch latency: in v_ovl, 16 threads plus 32 busy threads, the spinning pool was still 10-25x faster on mean than a sleeping pool.",
+     "fix_hint": "Clamp each per-wake sample, for example to a few times the current estimate or a fixed ceiling such as 50 us, or use a short min or median window, so that one preempted signalling loop cannot rescale every threshold."
+    }
+   ],
+   "engineer_open_issues": [
+    "Quiet-machine target unverified. The machine was never quiet: about 8.6 CPUs of normal-priority load from 4 CPU-bound python processes, OneDrive, javaw and explorer. Even with the bench at HIGH priority class, almost every 32-thread dispatch needs a yield: p50 5.2-5.4 us, mean 6.46 us vs 0.75 us at 16 threads, about 8.6x. 4a6cb80 at HIGH priority: p50 0.9 us but p90 1.0 ms.",
+    "WSL2 32-thread pools are still about 3x slower than at 4a6cb80: mean 622-768 us vs 204-240 us (gen-002 771-803 us). Every variant tried stays at 0.2-0.9 ms in that VM. Native Linux is untested.",
+    "Linux CFS: sched_yield gives the CPU to another spinner, so a pool pinned to one CPU with a long spin window leaves the caller about a third of its CPU (2.9x; gen-002 the same). test_pinned judges this ratio only on Windows.",
+    "test_stranded under WSL2 is noisy: time in >2 ms dispatches was 14-40% for gen-003 and 9.5-29.8% for gen-002. The non-Windows margin was widened to 35% with the reason documented in the test. The Windows check is unchanged at 20%.",
+    "40 surviving pool.c mutants, classified in the handover: equivalents, tuning constants, the crowded caller's yield-gap starvation check, the caller's done store, the spurious-yield guard.",
+    "Machines with several Windows processor groups and the macOS code paths remain untested.",
+    "All performance numbers were taken on a shared, loaded machine, partly while mutation runs were going. They are interleaved comparisons, not absolute figures."
+   ],
+   "engineer_contract_issues": [
+    "engine/src/hx_pool.h, hx_pool_create comment. Current: 'Workers spin for ~spin_us microseconds after finishing a task before sleeping; while spinning they yield the CPU every few microseconds so descheduled siblings and the caller can run.' Proposed: 'Workers spin for up to ~spin_us microseconds after finishing a task before sleeping. They stop early when the dispatch they wait on is declared stalled, and do not spin during a sleep-only back-off after the pool found no idle CPU. While spinning they yield the CPU every few microseconds once they have spun ~50 us without a task. In a pool with more threads than 3/4 of the CPUs available to the process they also yield every ~2 us whenever a sibling has not picked up the newest dispatch or the caller has not returned from it. Smaller pools do not yield for late threads, because there a yield hands the CPU to other processes (16 threads beside 16 busy threads, spin_us=50, 10 us regions: 48-88 us per region with yields every 2 us vs 11.5-12.7 us without).' The verifier's fix hint asked for this wording.",
+    "engine/src/hx_platform.h, hx_env_str. Current: '/* NULL if unset */'. Proposed: '/* NULL if unset. The string belongs to the platform layer: on Windows it stays valid until the variable has changed 8 more times (an unchanged value returns the same pointer); on POSIX getenv rules apply (valid until the variable is next set or unset). Copy it to keep it longer. */'. This is the verifier minor finding: HX__ENV_KEEP in platform_win.c is undocumented in the contract.",
+    "engine/src/hx_platform.h, hx_file_replace comment (carried over from gen-001/002, still not amended). Current: 'Atomically replace dst with tmp (MoveFileExW REPLACE_EXISTING / rename). 0 on success.' Proposed: 'Atomically replace dst with tmp (files only). Windows: POSIX-semantics rename (SetFileInformationByHandle FileRenameInfoEx, REPLACE_IF_EXISTS|POSIX_SEMANTICS), so readers holding dst open keep the old data; falls back to MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH) on volumes without it, where an open dst makes the replace fail. POSIX: rename(2), then fsync of dst's directory. 0 on success.' Director sign-off on the MoveFileExW-first task text is still open.",
+    "Test hooks hx__pool_stats(const hx_pool*, long long out[6]) and hx__pool_seed_wake(hx_pool*, long long) are exported from pool.c. They are not in hx_pool.h; test_pool.c declares them itself. No contract change is needed. If the director prefers them declared somewhere, the proposal is an internal engine/src/hx_pool_test.h owned by H02, or a '/* test hooks */' section in hx_pool.h."
+   ],
+   "engineer_measurements": [
+    {
+     "metric": "16 threads (spin_us=50) beside 16 busy threads, 10 us regions, per region (gen-003; base 11.6-29.5, gen-002 48.1-88.4)",
+     "value": 11.94,
+     "unit": "us",
+     "conditions": "Windows 11, Ryzen 9 9950X, MSVC /O2, 4 interleaved 300 ms windows, gen-003 range 11.5-12.7; shared loaded machine, noisy"
+    },
+    {
+     "metric": "same with 20 us caller-only gaps (gen-003; base 33.4-39.2, gen-002 77-166)",
+     "value": 32.85,
+     "unit": "us",
+     "conditions": "gen-003 range 32.5-38.9; Windows, shared machine"
+    },
+    {
+     "metric": "32 threads beside 4 busy threads, 10 us regions (gen-003; base 108-119, gen-002 37-43)",
+     "value": 34.9,
+     "unit": "us",
+     "conditions": "gen-003 range 34.9-44.2; Windows, shared machine"
+    },
+    {
+     "metric": "hx_pool_run 32 threads spin_us=1000 mean (gen-003; gen-002 6.75-6.8, base 921-1033)",
+     "value": 7.52,
+     "unit": "us",
+     "conditions": "gen-003 7.5-9.2, p50 5.5-5.9, p999 75-126 us; 20000 samples interleaved; Windows, shared machine"
+    },
+    {
+     "metric": "hx_pool_run 16 threads spin_us=1000 mean (gen-003; gen-002 0.67-0.77, base 0.87-0.90)",
+     "value": 0.75,
+     "unit": "us",
+     "conditions": "Windows, shared machine"
+    },
+    {
+     "metric": "32 vs 16 thread mean dispatch at HIGH priority class",
+     "value": 8.6,
+     "unit": "x",
+     "conditions": "6.46 vs 0.75 us; not a quiet machine"
+    },
+    {
+     "metric": "false slow-stall back-offs, verifier long-task scenario (16 threads, 2 ms worker tasks, 4 busy, 300 iterations)",
+     "value": 0,
+     "unit": "count",
+     "conditions": "3 runs 0/0/0, short-dispatch mean 0.9 us; verifier on gen-002: 5-8, 13.6-30.8 us"
+    },
+    {
+     "metric": "WSL2 16 threads: share of time in >100 us dispatches (gen-003; gen-002 29-32%, base 0.7-1.8%)",
+     "value": 1.6,
+     "unit": "percent",
+     "conditions": "gen-003 0-1.6%, p999 27-37 us; interleaved; VM on loaded host, noisy"
+    },
+    {
+     "metric": "WSL2 32 threads mean dispatch (gen-003; gen-002 771-803, base 204-240)",
+     "value": 622,
+     "unit": "us",
+     "conditions": "gen-003 622-768; not fixed"
+    },
+    {
+     "metric": "pinned 1 CPU, 4 threads: p50 dispatch (Windows)",
+     "value": 33.8,
+     "unit": "us",
+     "conditions": "33.7-34.2; caller work ratio 0.99-1.00x (2.21x without idle yields; p50 81 us without the caller-not-returned yield)"
+    },
+    {
+     "metric": "mutation score pool.c changed lines (168 mutants)",
+     "value": 76.2,
+     "unit": "percent",
+     "conditions": "killed 112, timeout 16, survived 40; first run before the added tests 62.0%"
+    },
+    {
+     "metric": "mutation score platform_common.inc line 200",
+     "value": 70,
+     "unit": "percent",
+     "conditions": "3 survivors, all equivalent"
+    },
+    {
+     "metric": "mutation score platform_posix.c lines 392-414,429 (WSL)",
+     "value": 68.2,
+     "unit": "percent",
+     "conditions": "the deleted hx__sync_parent call is killed"
+    }
+   ]
+  },
+  "H03-forward": {
+   "final_verifier": "verify:H03-forward#2",
+   "verdict": "pass",
+   "findings": [
+    {
+     "severity": "minor",
+     "title": "Round-1 T08 finding 5 (slow attention value pass) is still open; 2048-token prefill is still dominated by attention",
+     "file": "engine/src/model.c",
+     "line": 552,
+     "evidence": "value_sum (model.c:552) is a portable-C loop. The GQA value pass is parallel over (token x kv group x 32-dim chunk), so task item 4's 'parallelise' part is met. The AVX-512 kernel is blocked on an hx_kernels contract change (value_acc), which the engineer correctly raised under contract_issues. Measured with hearth-bench, 16 threads, fully cached, prompt 2048, synthetic Qwen3-30B-A3B Q4, load 26-66%, interleaved: current code prefill 226.6 / 227.9 tok/s with attention 5.80 / 5.84 s of the run; HEAD (T08) 214.9 / 215.7 tok/s with attention 6.30 / 6.33 s. That is +5.6%, but attention is still about 64% of prefill time.",
+     "fix_hint": "Kernels owner: add the proposed hx_kernels value_acc entry (mul then add, sequential in r, identical results on every ISA); then value_sum calls it for GQA and MLA."
+    },
+    {
+     "severity": "minor",
+     "title": "Some hint state-machine transitions in the failure drain are not covered by any test: four hand mutants pass the full test_model",
+     "file": "engine/src/model.c",
+     "line": 970,
+     "evidence": "Each mutant was built with hxcc from a scratch copy and run with test_model --seed 1. All four report 2195-2197 checks, 0 failed:\n(a) model.c:970 'm->hint[key] = HINT_NOW;' changed to 'if (m->hint[key] == HINT_NONE) m->hint[key] = HINT_NOW;'. A key already marked PREV or USED that is hinted again no longer becomes NOW. Effect 1: a prefetch that call N re-queues is not waited for if call N+1 fails. Effect 2: a chunk-2 re-hint of a key used in chunk 1 is not waited for.\n(b) model.c:965-971: hints recorded even while the precision gate is closed. The drain then reads slabs that were never prefetched.\n(c) model.c:1262: drain_hints no longer marks drained keys USED.\nEach of these only changes the failure path's cost, or opens a narrow window for a late read. I could not make (a) visible: my randomized failure stress harness ran 4 configurations x 300 calls with the mutant and showed 0 late counter changes. So this is a test gap, not a demonstrated bug. For comparison, 27 other hand mutants on the same code were all killed, including the 5 round-1 mutants M1/M2/M3/M4/M7, drain skipped, drain only NOW, USED marking removed or made unconditional, the release removed from either drain, and hide-delta lines.",
+     "fix_hint": "Extend test_drain_scope with two cases. (1) Four calls: A1, A2 hints k, B hints k again and succeeds, C fails. Expect k among the hints drained. (2) A replay that keeps the precision gate closed, then a failing call. Expect hx_model_hints_drained to stay at 0."
+    },
+    {
+     "severity": "minor",
+     "title": "Runs of test_model that abort leave their scratch containers in %TEMP%; mutation runs have left about 2.4 GiB",
+     "file": "engine/tests/test_model.c",
+     "line": 2299,
+     "evidence": "A normal run removes its files (main, test_model.c:3158-3161). Two cases skip cleanup: the watchdog's _Exit(1) at test_model.c:2299, and runs killed by mutate.py on timeout or crash. The documented mutate command ('--test \"... --run -o {tmp}/h03m.exe <sources>\"') does not pass '--dir {tmp}', so these files land in %TEMP%, not in the job directory that mutate.py deletes. I found 2,258 hxtm_* files (2.5 GiB) in %TEMP%. Of these, 2,190 files (2.41 GiB) are dated 2026-10-04 17:00 to 2026-10-05 17:59. The 10-05 14:00-17:59 group, about 424 sets of gqa/gqa_fullnorm/mla/mla_noqlora containers, falls in the H03 gen-001/gen-002 mutation window. I deleted only the 68 files (83 MiB) my own mutation run created. Rule 4 asks that scratch files be deleted when done.",
+     "fix_hint": "Pass '--dir {tmp}' in the mutate.py test command in the handover procedure. Have the watchdog remove the g_tag scratch files before _Exit. Delete the existing %TEMP%\\hxtm_* leftovers once no test_model process is running."
+    }
+   ],
+   "engineer_open_issues": [
+    "The attention value pass is still at portable-C speed (verifier minor 4). It needs the hx_kernels value_acc contract change and the kernels owner.",
+    "A failed call waits only for prefetch hints from itself and the previous call. Hints from two or more calls back that are still queued are not waited for. This needs prefetch reads starved by demand reads for a whole call; the store's prefetch queue holds at most max(2*top_k, 2*n_io) keys.",
+    "Each expert a failed call waits for counts one use in LFU heat and usage_out, because hx_store_acquire always counts a use. A hint the store had dropped is read once on the failure path. This affects caching only, not output.",
+    "The failure-path cost is measured only on the Qwen3-30B-shaped container (+2.4 to +14 ms, +14 to +25 MiB). On DeepSeek or Kimi-sized slabs (44 MB) with a small cache it is estimated at about 0.5-1 s per failed call, not measured. If it matters, the drain could request all reads first and then wait for each, so they overlap.",
+    "Still open from gen-001: a failed call ticks the store once (usage tokens_observed counts it); the macOS arm64 sincos hypothesis is untested; there is no Python test for engine.py's HearthError text (tests/py/test_runtime.py is T07's).",
+    "All performance numbers are on synthetic weights on a shared machine at 16-47% CPU load; differences under about 3% are within noise."
+   ],
+   "engineer_contract_issues": [
+    "engine/include/hearth.h, hearth_eval comment: change 'a failed call leaves pos, the routing trace and all counters unchanged' to '... and every hearth_stats counter except read_errors unchanged (read_errors counts the failed reads)'. read_errors is deliberately left visible (gen-001), and hx_model.h already says so.",
+    "engine/src/hx_quant.h (kernels owner), for verifier minor 4. Add to hx_kernels: void (*value_acc)(float *o, size_t ldo, const float *p, size_t ldp, int nh, const float *v, size_t ldv, int n, int dn), computing o[h*ldo+d] = sum over r = 0..n-1 of p[h*ldp+r] * v[r*ldv+d] for h < nh, 0 < d <= dn <= 32. Start from 0.0f, accumulate sequentially in r, round each product before the add (no FMA), and give bit-identical results across scalar, AVX2 and AVX-512 (INV-DET-3). model.c's value_sum (GQA and MLA) then calls it. Gen-001's AVX-512 prototype measured 94-136 GMAC/s vs 15-18 for the portable loop, and was bit-identical.",
+    "engine/src/hx_store.h (store owner H01). Add void hx_store_quiesce(hx_store *s): drop queued prefetch hints and return once no read is in flight, without counting uses. With it, a failed hearth_eval would no longer have to acquire every unresolved hint: no extra reads of hints the store had dropped, no LFU heat or usage_out uses for drained experts, and coverage of queued hints from any earlier call, not only the previous one."
+   ],
+   "engineer_measurements": [
+    {
+     "metric": "decode, fully cached, 16 threads (gen-002; gen-001 21.87)",
+     "value": 21.88,
+     "unit": "tok/s",
+     "conditions": "synthetic Qwen3-30B-A3B Q4 container (17 GB), 9950X, MSVC /O2, shared machine at 16-33% load, median of 4 interleaved runs"
+    },
+    {
+     "metric": "prefill 512 tokens, fully cached, 16 threads (gen-002; gen-001 386.6)",
+     "value": 383.7,
+     "unit": "tok/s",
+     "conditions": "same setup; ranges 377-385 vs 381-390 overlap, within noise"
+    },
+    {
+     "metric": "decode, 4 GiB cache, direct I/O, 16 threads (gen-002; gen-001 9.64)",
+     "value": 9.64,
+     "unit": "tok/s",
+     "conditions": "same container, load 18-47%, median of 3"
+    },
+    {
+     "metric": "failed hearth_eval latency, failure at layer 47, 4 GiB direct I/O (gen-001 106.6)",
+     "value": 120.1,
+     "unit": "ms",
+     "conditions": "scratch harness, medians of 8 reps in 2 sessions; 622-629 vs 590-605 MiB read during the failed call"
+    },
+    {
+     "metric": "failed hearth_eval latency, failure at layer 1 (gen-001 3.4)",
+     "value": 5.8,
+     "unit": "ms",
+     "conditions": "same harness; 26.3 vs 12.0 MiB read during the failed call"
+    },
+    {
+     "metric": "mutation score model.c (changed lines and verifier ranges)",
+     "value": 86.8,
+     "unit": "percent",
+     "conditions": "mutate.py seed 3: 157 killed + 27 timeouts of 212; first pass with the earlier tests 77.9%"
+    },
+    {
+     "metric": "test_model checks",
+     "value": 2197,
+     "unit": "checks (0 failed)",
+     "conditions": "seed 1; 2189-2197 depending on seed; was 2064 after gen-001"
+    }
+   ]
+  },
+  "H04-sim": {
+   "final_verifier": "verify:H04-sim",
+   "verdict": "pass",
+   "findings": [
+    {
+     "severity": "minor",
+     "title": "feasibility() gives wrong disk-per-format and parameter counts, without any error, for a ModelCosts built without the new fields (the original finding (b) symptom, now reachable through the public API)",
+     "file": "python/hearth/sim/timing.py",
+     "line": 65,
+     "evidence": "The new ModelCosts fields expert_d, expert_ffn, resident_params and total_params default to 0 (timing.py:65-68). check() now sizes the disk table from costs.expert_d and costs.expert_ffn (feasibility.py:75). ModelCosts and feasibility are both in hearth.sim.__all__. My script built ModelCosts(**required_fields_of(model_costs(kimi-k2))) and called feasibility(..., HARDWARE['this-pc']). It printed `file_gb 551.63 disk {'Q3 ...': 12.58, 'Q4 (4.25 bpw)': 12.58, 'Q8 ...': 12.58, 'BF16': 12.58} params 0 0`. That is the 'disk ~13 GB for every format' symptom the council reported. At base this path returned an empty dict (shape=None), not wrong numbers. My mutation run on timing.py lines 65-68 left the four default mutants alive, as the engineer also found; the engineer called them equivalent, but they are not equivalent for callers of the public API. The adversarial test test_feasibility_from_public_modelcosts_without_new_fields_is_not_silently_wrong fails.",
+     "fix_hint": "Make expert_d and expert_ffn (and the param totals) required ModelCosts fields, or have check() raise ValueError when costs.expert_d <= 0 or costs.expert_ffn <= 0."
+    },
+    {
+     "severity": "minor",
+     "title": "feasibility.check() accepts any gpu_mode string, and every value other than exactly 'off' counts as a GPU mode",
+     "file": "python/hearth/sim/feasibility.py",
+     "line": 50,
+     "evidence": "`if gpu_mode != \"off\":` is the only check. feasibility(model_costs(olmoe), HARDWARE['this-pc'], gpu_mode=m) gives fits=True, backbone_location='vram' and vram_expert_slots=0 for m in 'Off', 'dense+expert' (typo) and 'gpu'. simulate() and evaluate() validate against GPU_MODES; the public hearth.sim.feasibility does not. The parametrized adversarial test (3 cases) fails.",
+     "fix_hint": "At the top of check(): `if gpu_mode not in GPU_MODES: raise ValueError(...)` (import GPU_MODES from .timing)."
+    },
+    {
+     "severity": "minor",
+     "title": "A usage profile with NaN or negative heat in a dense-layer row is accepted; store.c ignores the whole profile",
+     "file": "python/hearth/sim/core.py",
+     "line": 202,
+     "evidence": "_resolve_profile drops the dense-layer rows (heat[n_dense_layers:]) and only then checks for finite, non-negative values (core.py:211). store.c load_usage checks all n_layers*n_experts entries and drops the profile on any bad one ('heat entry %d is not a finite non-negative number'). Repro: a kimi-k2 .usage file with h[0,5]=NaN (layer 0 is dense). simulate(policy='lfu-pinned', profile=file) ran with 91 pins and no warning, so the simulated run uses a profile the engine would ignore. docs/SIMULATOR.md sec. 1 says such a profile is one 'which store.c also rejects'.",
+     "fix_hint": "Validate `heat` before slicing off the dense rows (or validate the raw array), so any bad entry anywhere in the file is rejected."
+    },
+    {
+     "severity": "minor",
+     "title": "The new --cpu-cores flag changes no output (Hardware.cpu_cores is not used by the model)",
+     "file": "python/hearth/sim/cli.py",
+     "line": 42,
+     "evidence": "grep shows cpu_cores used only in hardware.py (field, validation, profiles) and in cli _hw_overrides; timing.evaluate never reads it. `main([... '--cpu-cores', '1'])` and `'--cpu-cores', '64'` print identical output (adversarial test_cpu_cores_flag_changes_something fails). SIMULATOR.md sec. 1 lists --cpu-cores among the overrides and does not say it is informational.",
+     "fix_hint": "Say in --help and SIMULATOR.md sec. 1/2.2 that cpu_cores is informational (only recorded in settings), or use it in the compute roofline."
+    },
+    {
+     "severity": "minor",
+     "title": "Result.settings['profile'] records 'array' when profile=None, which simulate treats as the warm-up profile",
+     "file": "python/hearth/sim/core.py",
+     "line": 371,
+     "evidence": "simulate('olmoe-1b-7b', tokens=100, policy='pinned', cache_gb=0.3, profile=None).settings['profile'] == 'array', but _resolve_profile (core.py:192) treats None as 'warmup'. This line was edited this round (str(Path) support).",
+     "fix_hint": "`profile=\"warmup\" if profile is None else (str(profile) if isinstance(profile, (str, Path)) else \"array\")`."
+    }
+   ],
+   "engineer_open_issues": [
+    "Carried over from T04 (not solvable here): no engine run of a MoE model, so calibrate() cannot be fitted yet (T09); no real routing traces, so every SIMULATOR.md sec. 8 number is SIMULATED on synthetic traces; store.c's 'hot victim' prefetch refusal and LFU tie-breaks are not modelled.",
+    "Environment: the temp directory that tool processes inherit (C:\\Users\\Pierce Lonergan\\AppData\\Local\\Packages\\Claude_pzs8sxrjxfjjc\\LocalCache\\Local\\Temp) vanished for a while. One core.py mutation run reported 99.2%, but it was contaminated (fast 'kills' at pytest tmp_path setup) and is not reported. All reported runs set TEMP/TMP to %LOCALAPPDATA%\\hearth\\tmp-h04, as recorded in the handover procedures and in doc sec. 5.",
+    "governance/tools/mutate.py was being modified by another task (H05) while my runs executed; the scores are from whatever version was on disk at each run's start.",
+    "python/hearth/sim/trace.py had CRLF line endings in the working tree from an earlier generation. I normalised it to LF; the content is unchanged and git diff is empty, but git status still lists it (stale index stat). I did not run update-index (no state-changing git).",
+    "Modelling choice kept: the default warm-up profile both seeds lfu-pinned heat and is replayed as live traffic (unchanged semantics, now engine-scaled).",
+    "API change inside the owned package: hearth.sim.feasibility(costs, hw, ...) no longer accepts shape= (the geometry now comes from ModelCosts). Only internal callers and tests used it; external code only calls hearth.sim.main."
+   ],
+   "engineer_contract_issues": [
+    "python/hearth/presets.py Shape.dense_params(): `latent = 2 * D * self.expert_d if self.expert_d else 0` also counts projections when expert_d == d_model, where no projection exists. Proposed change: `latent = 2 * D * self.expert_d if self.expert_d and self.expert_d != D else 0`, or document that a nonzero expert_d always means the projections exist. hearth.sim currently mirrors the presets' rule; the test (test_backbone_accounting_matches_presets_without_double_counting) pins it and would need its explicit expert_d == d_model case updated with the contract.",
+    "docs/FORMAT.md defines no tensors (names/dtypes) for the latent-MoE down/up projections of the kimi_k3 arch. The simulator assumes they are stored at the backbone's bits/weight. Proposed: add them to the per-layer tensor table (e.g. moe_latent_in [expert_d, d_model], moe_latent_out [d_model, expert_d] at dense dtype)."
+   ],
+   "engineer_measurements": [
+    {
+     "metric": "mutation score feasibility.py (all candidates)",
+     "value": 95.1,
+     "unit": "%",
+     "conditions": "seed 11, 58/61, full test_sim.py as oracle; council gen-3 figure 70.8%"
+    },
+    {
+     "metric": "mutation score core.py changed lines + _aggregate",
+     "value": 96.1,
+     "unit": "%",
+     "conditions": "seed 11, 122/127; first run 85.8%"
+    },
+    {
+     "metric": "mutation score cache.py changed lines",
+     "value": 91.5,
+     "unit": "%",
+     "conditions": "seed 11, 43/47"
+    },
+    {
+     "metric": "mutation score timing.py changed lines",
+     "value": 86.2,
+     "unit": "%",
+     "conditions": "seed 11, 25/29, 4 equivalent dataclass-default survivors"
+    },
+    {
+     "metric": "mutation score timing.py evaluate byte-accounting loop (24 sampled)",
+     "value": 95.8,
+     "unit": "%",
+     "conditions": "seed 11, lines 213-253"
+    },
+    {
+     "metric": "mutation score cli.py changed lines",
+     "value": 100,
+     "unit": "%",
+     "conditions": "seed 11, 22/22"
+    },
+    {
+     "metric": "mutation score hardware.py get_hardware",
+     "value": 100,
+     "unit": "%",
+     "conditions": "seed 11, 11/11"
+    },
+    {
+     "metric": "test_sim.py tests",
+     "value": 152,
+     "unit": "tests",
+     "conditions": "all pass, 34.6 s at ~80% CPU load (noisy)"
+    },
+    {
+     "metric": "lfu-pinned hit rate, engine-style heat seed (raw seed: 0.20)",
+     "value": 0.465,
+     "unit": "hit rate",
+     "conditions": "SIMULATED: olmoe, 600 tokens, usage file over 6000 tokens, 128 slots, pin_fraction 0"
+    },
+    {
+     "metric": "Kimi-K3 total parameters (presets / ModelCosts.total_params)",
+     "value": 2752693600256,
+     "unit": "params",
+     "conditions": "computed from hearth.presets, not measured"
+    }
+   ]
+  },
+  "H05-governance": {
+   "final_verifier": "verify:H05-governance#3",
+   "verdict": "pass",
+   "findings": [
+    {
+     "severity": "minor",
+     "title": "README, ADR-0009 and golden.yml say the golden gate refuses any change under tests/golden/, but empty __init__.py files and anything under __pycache__/ can be added or removed without the label",
+     "file": "governance/README.md",
+     "line": 91,
+     "evidence": "README:91-94 says 'nothing may be added ... Any golden change, re-locked or not, fails there until a maintainer ... added the golden-reviewed label'. golden.yml:4 ('nothing added') and the first Decision bullet of ADR-0009 say the same. In the code, compare_base (check_golden.py:408) only counts res['files'] as added. Revision.scan skips __pycache__ contents (line 316, except unchecked-hash .pyc) and empty or whitespace-only __init__.py files (line 321).\n\nI ran my own simulation of golden.yml: a GitHub-like origin with refs/pull/1/merge, a full base clone, `python -I -S base/governance/tools/merge_ref.py --fetch file://... --pr 1`, then `check_golden.py --root pr --rev HEAD --base-manifest base/tests/golden/MANIFEST.sha256`, without the label. Each of these exited with rc 0 and printed 'golden lock OK':\n- deleting tests/golden/__init__.py;\n- adding an empty tests/golden/numpy/__init__.py;\n- adding a whitespace-only tests/golden/sub/__init__.py;\n- adding tests/golden/__pycache__/conftest.py;\n- adding a timestamp-based .pyc in that __pycache__.\n\nAs a control, gut plus relock gave rc 1 without the label and rc 0 with it, and twins, 8.3 names and unchecked .pyc gave rc 1 with or without the label.\n\nNone of these makes a false pass possible. With the init removed, `check_golden.py --run` still passed 21 of 21. Adding the empty numpy package as well made the isolated run fail with '1 errors' (it shadows numpy), so the failure is closed. CODEOWNERS on /tests/golden/ still applies. So this is a documentation inaccuracy in the task's 'make the README accurate' deliverable, not a hole in the gate.",
+     "fix_hint": "Either count added or removed empty __init__.py files (and non-bytecode files under __pycache__) as changes in compare_base, or state the exemption in README:91-94 and 314-320, in the golden.yml header and in ADR-0009 (for example: 'apart from empty __init__.py files and __pycache__/, which the isolated run ignores or recreates')."
+    },
+    {
+     "severity": "minor",
+     "title": "validate_handover: the claim that both engines accept exactly the same schemas is false for deeply nested schemas, and a very deep schema still crashes with a traceback and exit 1",
+     "file": "governance/tools/validate_handover.py",
+     "line": 850,
+     "evidence": "The docstring (line 30) and the gen-003 fix of verifier minor #6 claim 'both engines accept exactly the same schemas'. They do not for deep nesting. I added `\"definitions\": {\"x\": {\"items\": {\"items\": ...}}}` (depth 400) to the real handover schema and ran `validate_handover.py --schema deep.json governance/handovers/H05-governance-gen-003.json`:\n- `--engine builtin` gave rc 0, '1/1 manifest(s) valid';\n- `--engine auto` (jsonschema 4.26) gave rc 2, 'jsonschema cannot check the schema: RecursionError'.\nIn process, by bisection, jsonschema starts refusing at nesting depth 123, where builtin still accepts.\n\nAt depth 3000 both engines print a raw 'RecursionError: maximum recursion depth exceeded while decoding a JSON object' traceback and exit 1. Exit 1 means 'invalid manifest(s)'; the docstring promises exit 2 for an unusable schema. main() catches only (OSError, ValueError, SchemaError) at line 850. The round-1 fix hint for T05 minor #4 said to catch RecursionError.\n\nThe schema is maintainer-owned and realistic schemas are far shallower, so the impact is low. Random differential fuzzing elsewhere agreed fully: 3,500 schema mutations and about 4,500 instance checks, with no engine disagreement on acceptance or verdict.",
+     "fix_hint": "Catch RecursionError around load_json, precheck_schema and jsonschema_check_schema in main() and map it to exit 2. Make precheck_schema refuse nesting above a fixed depth (for example 64), so both engines refuse the same schemas. Add a test with a deep schema."
+    },
+    {
+     "severity": "minor",
+     "title": "ADR-0009's Decision section contradicts itself on how the pull request is read",
+     "file": "governance/decisions/ADR-0009-golden-gate-against-base-revision.md",
+     "line": 56,
+     "evidence": "Bullet 2 says golden.yml runs 'with ... the pull request's merge ref checked out as data only'. A later bullet, the README (lines 361-366) and both workflows say the merge ref is never checked out: merge_ref.py --fetch fetches it as git objects into a repository with no working tree. The structure test asserts that 'refs/pull' does not appear in the workflows. Leftover wording from gen-001 in a decision record that is still Proposed.",
+     "fix_hint": "Reword bullet 2: '... and the pull request's merge commit fetched as git objects only (merge_ref.py --fetch), never checked out'."
+    }
+   ],
+   "engineer_open_issues": [
+    "None of the workflows has run on GitHub. Unverified there: pull_request_target checks as required checks; the GITHUB_TOKEN header path of merge_ref --fetch (only an anonymous https fetch of a public repo's merge ref was run; the env-config header was checked with git config --get-urlmatch); fetch-depth: 0 with sparse-checkout. The bootstrap PR is judged by main's older workflows and tools.",
+    "Maintainer actions outside the repo: branch protection on main (required checks, code-owner review, dismiss stale approvals, include admins), keep main the default branch, create the golden-reviewed and decisions-reviewed labels, confirm @pierce-lonergan, accept or reject ADR-0009 (still Proposed).",
+    "The alias check deliberately over-approximates (README residual 10): any 8.3-shaped name such as notes~1.md, and pairs like sharp s and ss, are refused anywhere in the repo. Other file systems' rules (custom upcase tables, case-insensitive ext4/ZFS) are not modelled.",
+    "Pre-existing, not fixed: check_golden prints UNLISTED/MODIFIED paths unescaped. On a legacy Windows code page a non-ASCII golden path gives a UnicodeEncodeError traceback (exit 1, fails closed). Only alias reports are escaped.",
+    "A non-UTF-8 path anywhere in a commit: adr.py --rev exits 1, check_golden.py/path_aliases.py --rev exit 2 (inconsistent codes, all fail closed).",
+    "Python 3.9 compatibility checked syntactically only.",
+    "33 hearth-mutate-* temp directories dated 2026-10-04 remain in %TEMP% (pre-existing, reported before); none from this generation."
+   ],
+   "engineer_contract_issues": [
+    "governance/INVARIANTS.md, INV-VERIFY row (maintainer-owned, not edited). Current text: '... `governance/tools/check_golden.py` verifies `tests/golden/MANIFEST.sha256` in CI. ...'. Proposed: '... `governance/tools/check_golden.py` verifies the pull request's `tests/golden/` against the base revision's `MANIFEST.sha256` in CI (`.github/workflows/golden.yml`, pull_request_target, label `golden-reviewed`), and refuses a commit whose paths are one file on Windows or macOS (`governance/tools/path_aliases.py`). ...'. Reason: the guarantee now rests on the base comparison and the alias refusal, not on the change's own manifest, and agents rehydrate from this row."
+   ],
+   "engineer_measurements": [
+    {
+     "metric": "tests/py/test_governance.py passed, Windows",
+     "value": 265,
+     "unit": "tests",
+     "conditions": "Python 3.13, 1 skipped, 343.7 s, concurrent load (noisy)"
+    },
+    {
+     "metric": "tests/py/test_governance.py passed, WSL2 Ubuntu 24.04",
+     "value": 264,
+     "unit": "tests",
+     "conditions": "Python 3.12.3, 2 skipped, 93.7 s"
+    },
+    {
+     "metric": "golden suite passed via check_golden --run",
+     "value": 21,
+     "unit": "tests",
+     "conditions": "existing python/hearth/lib/hearth.dll"
+    },
+    {
+     "metric": "mutation score path_aliases.py lines 50-153",
+     "value": 0.932,
+     "unit": "fraction",
+     "conditions": "74 mutants, seed 1, 4 jobs; 2 real survivors fixed (follow-up 4/4), 2 equivalent"
+    },
+    {
+     "metric": "mutation score merge_ref.py lines 46-96,150-170",
+     "value": 0.933,
+     "unit": "fraction",
+     "conditions": "30 mutants, seed 1; 2 equivalent survivors"
+    },
+    {
+     "metric": "mutation score check_golden.py changed lines",
+     "value": 1,
+     "unit": "fraction",
+     "conditions": "7 mutants, seed 1"
+    },
+    {
+     "metric": "mutation score adr.py changed lines",
+     "value": 1,
+     "unit": "fraction",
+     "conditions": "22 mutants, seed 1"
+    },
+    {
+     "metric": "mutation score validate_handover.py changed lines",
+     "value": 0.909,
+     "unit": "fraction",
+     "conditions": "11 mutants, seed 1; survivor got a test, follow-up line 504: 5/5"
+    },
+    {
+     "metric": "hand-made variants killed",
+     "value": 31,
+     "unit": "of 32",
+     "conditions": "1 equivalent survivor"
+    },
+    {
+     "metric": "new/changed tests failing against gen-002 code",
+     "value": 16,
+     "unit": "of 20",
+     "conditions": "scratch tree with gen-002 tools and workflows"
+    },
+    {
+     "metric": "handover manifests valid --strict",
+     "value": 25,
+     "unit": "of 25",
+     "conditions": "jsonschema and builtin engines"
+    },
+    {
+     "metric": "merge_ref --fetch of a real GitHub merge ref",
+     "value": 1.8,
+     "unit": "s",
+     "conditions": "actions/setup-python refs/pull/909/merge, anonymous https, depth 1, fsck on; single run"
+    }
+   ]
+  }
+ }
+}

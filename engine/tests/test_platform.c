@@ -1,21 +1,37 @@
 /*
  * test_platform.c — self-checking tests for hx_platform.h.
  *
- *   test_platform [--dir DIR] [--exhaustive] [--large] [--expect-cpu LIST]
+ *   test_platform [--dir DIR] [--replace-dir DIR] [--exhaustive] [--large] [--expect-cpu LIST]
  *
  * --dir         where scratch files go (default: $HEARTH_TEST_DIR, $HEARTH_DATA,
- *               $TMPDIR, $TEMP, $TMP, /tmp, .); files are small and removed.
+ *               $TMPDIR, $TEMP, $TMP, /tmp, .); files are small and removed. Its volume
+ *               must rename with POSIX semantics (NTFS, any POSIX file system).
+ * --replace-dir also run the hx_file_replace checks in DIR, with whatever rename semantics its
+ *               volume has (\\wsl.localhost\<distro>\tmp exercises the MoveFileExW fallback).
  * --exhaustive  also check f32->f16 and f32->bf16 for all 2^32 inputs (threaded).
  * --large       also do >1 GiB single requests at offsets above 2^31 (writes and
  *               removes a 2.25 GiB file in DIR; keep DIR off cloud-synced folders).
  * --expect-cpu  comma list of hx_cpu features this machine must report, '-name'
  *               for ones it must not, plus optional cores=N / cpus=N
  *               (e.g. avx2,avx512f,-neon,cores=16,cpus=32 on a Ryzen 9 9950X).
- * The program re-runs itself (--log-child FILE) to check the logger's output.
+ * The program re-runs itself (--log-child FILE, --replace-log-child FILE DIR,
+ * --replace-sync-child FILE DIR TAG) to check what it logs, and pinned to a few CPUs (--cpu-child FILE, via start /affinity or taskset) to check
+ * the CPU counts.
  * Exit code 0 = all checks passed.
  */
 #if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-#  define _POSIX_C_SOURCE 200809L   /* setenv/unsetenv under -std=c11 */
+#  define _POSIX_C_SOURCE 200809L   /* setenv/unsetenv, mkdir under -std=c11 */
+#endif
+#if defined(_WIN32)
+#  define WIN32_LEAN_AND_MEAN
+#  define NOMINMAX
+#  include <windows.h>              /* SetEnvironmentVariableA: the CRT cannot create an empty variable */
+#  include <direct.h>
+#  include <io.h>
+#  include <sys/stat.h>
+#else
+#  include <sys/stat.h>
+#  include <unistd.h>
 #endif
 #include "hx_platform.h"
 
@@ -125,7 +141,8 @@ static void test_f16(void) {
         float f = hx_f16_to_f32((uint16_t)h);
         int e = (h >> 10) & 0x1f, m = h & 0x3ff;
         if (e == 31 && m) {
-            bad += !isnan(f);
+            /* as VCVTPH2PS (the F16C kernels): quiet bit set, sign and payload kept */
+            bad += fbits(f) != (((uint32_t)(h & 0x8000) << 16) | 0x7fc00000u | ((uint32_t)m << 13));
             uint16_t back = hx_f32_to_f16(f);
             bad += !(((back >> 10) & 0x1f) == 31 && (back & 0x3ff) && (back & 0x200) && (back & 0x8000) == (h & 0x8000));
             bad += back != (uint16_t)(h | 0x200);              /* payload kept, quieted */
@@ -323,14 +340,16 @@ static void test_time(void) {
     for (size_t i = 0; i < sizeof us_list / sizeof us_list[0]; i++) {
         uint32_t us = us_list[i];
         uint64_t best = UINT64_MAX;
+        int early = 0;
         for (int k = 0; k < 5; k++) {
             uint64_t t0 = hx_now_ns();
             hx_sleep_us(us);
             uint64_t d = hx_now_ns() - t0;
             if (d < best) best = d;
+            early += d < (uint64_t)us * 1000u;
         }
         printf("  hx_sleep_us(%u): min %.1f us\n", us, (double)best / 1e3);
-        CHECK(best + 100000 >= (uint64_t)us * 500, "hx_sleep_us(%u) returned far too early", us);
+        CHECK(early == 0, "hx_sleep_us(%u) returned early %d of 5 times (min %.1f us)", us, early, (double)best / 1e3);
         CHECK(best < (uint64_t)us * 1000 + 100000000ull, "hx_sleep_us(%u) far too long", us);
     }
 }
@@ -437,10 +456,31 @@ static void test_threads(void) {
     hx_mutex_unlock(&s.mu);
     printf("  timedwait(20 ms) -> %d after %.2f ms\n", r, (double)dt / 1e6);
     CHECK(r == 1, "timedwait should time out");
-    CHECK(dt >= 5000000ull && dt < 2000000000ull, "timedwait duration %.2f ms", (double)dt / 1e6);
+    CHECK(dt >= 20000000ull && dt < 2000000000ull, "timedwait duration %.2f ms", (double)dt / 1e6);
     hx_mutex_lock(&s.mu);
     CHECK(hx_cond_timedwait(&s.cv, &s.mu, 0) == 1, "timedwait(0) times out");
     hx_mutex_unlock(&s.mu);
+    /* a timeout is never reported before the interval has passed (Windows' millisecond timer
+     * used to expire up to ~75 us early, about one wait in four) */
+    {
+        int early = 0, timeouts = 0;
+        uint64_t worst = UINT64_MAX;
+        for (int k = 0; k < 24; k++) {
+            uint32_t us = 1000u + 500u * (uint32_t)(k % 3);
+            hx_mutex_lock(&s.mu);
+            uint64_t a = hx_now_ns();
+            int rr = hx_cond_timedwait(&s.cv, &s.mu, us);
+            uint64_t d = hx_now_ns() - a;
+            hx_mutex_unlock(&s.mu);
+            if (rr == 1) {
+                timeouts++;
+                early += d < (uint64_t)us * 1000u;
+                if (d < worst) worst = d;
+            }
+        }
+        CHECK(timeouts > 0 && early == 0, "timedwait timed out early %d of %d times (shortest %.1f us)", early, timeouts,
+              (double)worst / 1e3);
+    }
 
     /* timed wait that is signalled */
     s.go = 0;
@@ -633,7 +673,19 @@ static void test_files(void) {
         CHECK(hx_file_pread(b, NULL, 10, 0) == -1, "NULL buffer rejected");
         CHECK(hx_file_pread(b, buf, 10, UINT64_MAX - 5) == -1, "offset + size overflow rejected");
         CHECK(hx_file_pread(b, buf, 10, (uint64_t)INT64_MAX) == -1, "offset beyond INT64_MAX rejected");
+        CHECK(hx_file_pread(b, buf, 10, (uint64_t)INT64_MAX - 9) == -1, "read ending 1 byte past INT64_MAX rejected");
+        CHECK(hx_file_pread(b, buf, 10, (uint64_t)INT64_MAX - 10) == 0, "read ending at INT64_MAX: past EOF, 0 bytes");
         free(buf);
+        /* A request larger than the 1 GiB internal chunk whose first chunk still fits below
+         * INT64_MAX: only the up-front range check can reject it (the OS would return EOF). The
+         * buffer is committed but never touched. */
+        size_t bign = ((size_t)1 << 30) + HX_PAGE;
+        uint8_t *bigbuf = sizeof(size_t) > 4 ? (uint8_t *)hx_alloc_large(bign, 0) : NULL;
+        if (bigbuf) {
+            CHECK(hx_file_pread(b, bigbuf, bign, (uint64_t)INT64_MAX - ((uint64_t)1 << 30)) == -1,
+                  "multi-chunk read crossing INT64_MAX rejected up front");
+            hx_free_large(bigbuf, bign);
+        }
         hx_file_close(b);
     }
 
@@ -754,6 +806,495 @@ static void test_files(void) {
     free(src);
 }
 
+/* ---------------------------------------------------------- hx_file_replace */
+
+static int put_text(const char *path, const char *text) {
+    hx_file *f = hx_file_open(path, HX_FILE_WRITE | HX_FILE_CREATE, NULL, 0);
+    if (!f) return 0;
+    size_t n = strlen(text);
+    int ok = hx_file_pwrite(f, text, n, 0) == (int64_t)n;
+    hx_file_close(f);
+    return ok;
+}
+
+/* Whole file as a string ("" if missing or unreadable). */
+static const char *get_text(const char *path, char *buf, size_t cap) {
+    buf[0] = 0;
+    hx_file *f = hx_file_open(path, HX_FILE_READ, NULL, 0);
+    if (!f) return buf;
+    int64_t n = hx_file_pread(f, buf, cap - 1, 0);
+    buf[n > 0 ? (size_t)n : 0] = 0;
+    hx_file_close(f);
+    return buf;
+}
+
+static int make_dir(const char *path) {
+#if defined(HX_OS_WINDOWS)
+    return _mkdir(path) == 0;
+#else
+    return mkdir(path, 0700) == 0;
+#endif
+}
+
+static void remove_dir(const char *path) {
+#if defined(HX_OS_WINDOWS)
+    _rmdir(path);
+#else
+    rmdir(path);
+#endif
+}
+
+#if defined(HX_OS_WINDOWS)
+typedef struct { FILE *fp; uint32_t after_us; } closer_job;
+static void *close_later(void *arg) {
+    closer_job *j = (closer_job *)arg;
+    hx_sleep_us(j->after_us);
+    fclose(j->fp);
+    return NULL;
+}
+#endif
+
+/* Readers racing a stream of replaces see a complete old or new version, never a torn one. */
+#define REP_LEN 65536
+typedef struct { const char *path; atomic_int stop; int torn, opened, missing; } rep_reader;
+
+static void *replace_reader(void *arg) {
+    rep_reader *r = (rep_reader *)arg;
+    uint8_t *buf = (uint8_t *)malloc(REP_LEN + 1);
+    while (buf && !atomic_load(&r->stop)) {
+        hx_file *f = hx_file_open(r->path, HX_FILE_READ, NULL, 0);
+        if (!f) { r->missing++; continue; }
+        int64_t n = hx_file_pread(f, buf, REP_LEN + 1, 0);
+        hx_file_close(f);
+        r->opened++;
+        int ok = n == REP_LEN;
+        for (int64_t i = 1; ok && i < n; i++) ok = buf[i] == buf[0];
+        r->torn += !ok;
+    }
+    free(buf);
+    return NULL;
+}
+
+static int make_read_only(const char *path, int ro) {
+#if defined(HX_OS_WINDOWS)
+    return _chmod(path, ro ? _S_IREAD : _S_IREAD | _S_IWRITE) == 0;
+#else
+    return chmod(path, ro ? 0444 : 0644) == 0;
+#endif
+}
+
+/* 1 made, 0 not permitted here (Windows without the symlink privilege or developer mode). */
+static int make_symlink(const char *target, const char *link) {
+#if defined(HX_OS_WINDOWS)
+    wchar_t wt[1200], wl[1200];
+    if (!MultiByteToWideChar(CP_UTF8, 0, target, -1, wt, 1200) || !MultiByteToWideChar(CP_UTF8, 0, link, -1, wl, 1200))
+        return 0;
+    for (wchar_t *q = wt; *q; q++) if (*q == L'/') *q = L'\\';   /* link targets are not normalized */
+    return CreateSymbolicLinkW(wl, wt, 0x2 /* SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE */) != 0;
+#else
+    return symlink(target, link) == 0;
+#endif
+}
+
+static int is_symlink(const char *path) {
+#if defined(HX_OS_WINDOWS)
+    wchar_t w[1200];
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1200)) return 0;
+    DWORD a = GetFileAttributesW(w);
+    return a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_REPARSE_POINT);
+#else
+    struct stat st;
+    return lstat(path, &st) == 0 && S_ISLNK(st.st_mode);
+#endif
+}
+
+/*
+ * require_posix: the volume must rename with POSIX semantics (NTFS on Windows 10+, any POSIX
+ * file system), as the default scratch directory does. Otherwise (--replace-dir on FAT, SMB
+ * or 9P) the semantics are probed with a replace over an open dst, and the checks follow them:
+ * there hx_file_replace uses MoveFileExW, which open handles and a read-only dst refuse.
+ */
+static void test_replace(int require_posix) {
+    printf("hx_file_replace (dir %s)\n", g_dir);
+    char tmp[1200], dst[1200], dir[1200], ut[1200], ud[1200], lt[1500], ld[1500], txt[64];
+    scratch_path(tmp, sizeof tmp, "rep.tmp");
+    scratch_path(dst, sizeof dst, "rep.dst");
+    scratch_path(dir, sizeof dir, "rep_dir");
+    scratch_path(ut, sizeof ut, "rep_\xc3\xa9t\xc3\xa9.tmp");                  /* "Ã©tÃ©" */
+    scratch_path(ud, sizeof ud, "rep_\xe6\x97\xa5\xe6\x9c\xac.dst");          /* "æ—¥æœ¬" */
+
+    CHECK(hx_file_replace(NULL, dst) == -1 && hx_file_replace(tmp, NULL) == -1 && hx_file_replace("", dst) == -1 &&
+          hx_file_replace(tmp, "") == -1, "NULL / empty paths rejected");
+    CHECK(put_text(dst, "old"), "write dst");
+    CHECK(hx_file_replace(tmp, dst) == -1 && strcmp(get_text(dst, txt, sizeof txt), "old") == 0,
+          "missing tmp: fails, dst untouched");
+
+    CHECK(put_text(tmp, "new"), "write tmp");
+    CHECK(hx_file_replace(tmp, dst) == 0, "replace existing dst");
+    CHECK(strcmp(get_text(dst, txt, sizeof txt), "new") == 0 && !hx_path_exists(tmp), "dst has tmp's content, tmp gone");
+    remove(dst);
+    CHECK(put_text(tmp, "fresh") && hx_file_replace(tmp, dst) == 0 && strcmp(get_text(dst, txt, sizeof txt), "fresh") == 0,
+          "replace when dst does not exist");
+
+    /* dst open through hx_file (shares delete access): replaced, and the open handle keeps the old
+     * data -- or, without POSIX renames, refused with both files untouched */
+    hx_file *h = hx_file_open(dst, HX_FILE_READ, NULL, 0);
+    CHECK(h != NULL, "open dst");
+    CHECK(put_text(tmp, "newer"), "write tmp");
+    int posix = hx_file_replace(tmp, dst) == 0;
+    if (require_posix) CHECK(posix, "replace while dst is open");
+    else printf("  %s\n", posix ? "POSIX renames" : "no POSIX renames here: open handles block a replace");
+    if (h) {
+        char old[16] = {0};
+        CHECK(hx_file_pread(h, old, sizeof old - 1, 0) == 5 && strcmp(old, "fresh") == 0, "open handle still reads old data");
+        hx_file_close(h);
+    }
+    if (!posix) {
+        CHECK(strcmp(get_text(dst, txt, sizeof txt), "fresh") == 0 && hx_path_exists(tmp), "refused replace: both untouched");
+        CHECK(hx_file_replace(tmp, dst) == 0, "replace once dst is closed");
+    }
+    CHECK(strcmp(get_text(dst, txt, sizeof txt), "newer") == 0, "dst replaced");
+
+    /* tmp still open by its writer */
+    hx_file *w = hx_file_open(tmp, HX_FILE_WRITE | HX_FILE_CREATE, NULL, 0);
+    CHECK(w && hx_file_pwrite(w, "open", 4, 0) == 4, "write tmp");
+    CHECK(hx_file_replace(tmp, dst) == 0 && strcmp(get_text(dst, txt, sizeof txt), "open") == 0, "replace from an open tmp");
+    if (w) hx_file_close(w);
+
+    /* directories are never replaced, nor moved over a file */
+    CHECK(make_dir(dir), "mkdir %s", dir);
+    CHECK(put_text(tmp, "x"), "write tmp");
+    uint64_t t0 = hx_now_ns();
+    CHECK(hx_file_replace(tmp, dir) == -1, "replace onto a directory fails");
+    CHECK(hx_now_ns() - t0 < 200000000u, "directory refused without retrying (%.0f ms)", (double)(hx_now_ns() - t0) / 1e6);
+    CHECK(hx_file_replace(dir, dst) == -1 && hx_path_exists(dir), "a directory is not moved over a file");
+    CHECK(hx_path_exists(tmp) && strcmp(get_text(dst, txt, sizeof txt), "open") == 0, "both files untouched");
+    {
+        char dir2[1300];                          /* rename(2) itself would move a directory over an empty one */
+        snprintf(dir2, sizeof dir2, "%s2", dir);
+        CHECK(make_dir(dir2), "mkdir %s", dir2);
+        CHECK(hx_file_replace(dir, dir2) == -1 && hx_path_exists(dir) && hx_path_exists(dir2),
+              "a directory is not moved over an empty directory");
+        remove_dir(dir2);
+        CHECK(hx_file_replace(dir, dir2) == -1 && hx_path_exists(dir) && !hx_path_exists(dir2),
+              "a directory is not moved to a new name");
+        remove_dir(dir2);
+    }
+    remove_dir(dir);
+    CHECK(!hx_path_exists(dir), "scratch directory removed");
+
+    /* a destination in a missing directory fails at once: not a sharing error to wait out */
+    {
+        char nodir[1300];
+        snprintf(nodir, sizeof nodir, "%s_missing/x.dst", dir);
+        t0 = hx_now_ns();
+        CHECK(hx_file_replace(tmp, nodir) == -1 && hx_path_exists(tmp), "replace into a missing directory fails");
+        CHECK(hx_now_ns() - t0 < 200000000u, "missing directory refused without retrying (%.0f ms)",
+              (double)(hx_now_ns() - t0) / 1e6);
+    }
+
+    /* UTF-8 names, and paths beyond the classic 260 characters */
+    CHECK(put_text(ut, "utf8") && hx_file_replace(ut, ud) == 0 && strcmp(get_text(ud, txt, sizeof txt), "utf8") == 0 &&
+          !hx_path_exists(ut), "UTF-8 paths");
+    {
+        char lname[240];
+        memset(lname, 'R', 200);
+        snprintf(lname + 200, sizeof lname - 200, ".tmp");
+        scratch_path(lt, sizeof lt, lname);
+        snprintf(lname + 200, sizeof lname - 200, ".dst");
+        scratch_path(ld, sizeof ld, lname);
+        CHECK(put_text(lt, "long") && hx_file_replace(lt, ld) == 0 && strcmp(get_text(ld, txt, sizeof txt), "long") == 0 &&
+              !hx_path_exists(lt), "long paths (%zu chars)", strlen(ld));
+        CHECK(put_text(lt, "long2") && hx_file_replace(lt, ld) == 0 && strcmp(get_text(ld, txt, sizeof txt), "long2") == 0,
+              "long path onto an existing file");
+    }
+
+#if defined(HX_OS_WINDOWS)
+    /* A reader without FILE_SHARE_DELETE (the CRT's fopen) blocks the rename: retried for a while, then given up. */
+    CHECK(put_text(tmp, "retry"), "write tmp");
+    FILE *fp = fopen(dst, "rb");
+    CHECK(fp != NULL, "fopen dst");
+    if (fp) {
+        closer_job cj = {fp, 30000};
+        hx_thread *ct;
+        CHECK(hx_thread_create(&ct, close_later, &cj) == 0, "thread create");
+        CHECK(hx_file_replace(tmp, dst) == 0, "replace succeeds once a non-sharing reader closes dst");
+        hx_thread_join(ct);
+        CHECK(strcmp(get_text(dst, txt, sizeof txt), "retry") == 0, "dst replaced after the retry");
+    }
+    CHECK(put_text(tmp, "blocked"), "write tmp");
+    fp = fopen(dst, "rb");
+    if (fp) {
+        t0 = hx_now_ns();
+        int rc = hx_file_replace(tmp, dst);
+        double ms = (double)(hx_now_ns() - t0) / 1e6;
+        fclose(fp);
+        CHECK(rc == -1 && ms < 5000.0, "replace gives up while dst stays locked (%d after %.0f ms)", rc, ms);
+        CHECK(strcmp(get_text(dst, txt, sizeof txt), "retry") == 0 && hx_path_exists(tmp), "locked dst untouched");
+    }
+    /* tmp held without delete sharing: nothing is renamed, and that is reported */
+    fp = fopen(tmp, "rb");
+    if (fp) {
+        int rc = hx_file_replace(tmp, dst);
+        fclose(fp);
+        CHECK(rc == -1 && strcmp(get_text(dst, txt, sizeof txt), "retry") == 0 && hx_path_exists(tmp),
+              "replace from a tmp held without delete sharing fails, dst untouched (%d)", rc);
+    }
+#else
+    CHECK(put_text(dst, "retry"), "write dst");
+#endif
+
+    /* a read-only dst is replaced, as rename(2) does (permission is the directory's); without POSIX
+     * renames it is up to the file system (FAT refuses, a 9P share replaces): a refusal comes at
+     * once, since waiting would not help */
+    CHECK(put_text(tmp, "ro") && make_read_only(dst, 1), "make dst read-only");
+    t0 = hx_now_ns();
+    {
+        int rc = hx_file_replace(tmp, dst);
+        double ms = (double)(hx_now_ns() - t0) / 1e6;
+        make_read_only(dst, 0);
+        if (posix || rc == 0)
+            CHECK(rc == 0 && strcmp(get_text(dst, txt, sizeof txt), "ro") == 0, "read-only dst replaced (%d)", rc);
+        else
+            CHECK(ms < 200.0 && strcmp(get_text(dst, txt, sizeof txt), "retry") == 0 && hx_path_exists(tmp),
+                  "read-only dst refused without retrying (%d after %.0f ms)", rc, ms);
+        remove(tmp);
+    }
+
+    /* a symbolic link tmp is moved as a link; its target stays where it is */
+    {
+        char target[1200];
+        scratch_path(target, sizeof target, "rep.target");
+        CHECK(put_text(target, "target"), "write link target");
+        if (make_symlink(target, tmp)) {
+            CHECK(hx_file_replace(tmp, dst) == 0, "replace from a symbolic link");
+            CHECK(is_symlink(dst) && !hx_path_exists(tmp), "dst is now the link");
+            CHECK(strcmp(get_text(target, txt, sizeof txt), "target") == 0 &&
+                      strcmp(get_text(dst, txt, sizeof txt), "target") == 0,
+                  "the link's target stays in place");
+            remove(dst);
+        } else {
+            printf("  (symbolic links not permitted here: link check skipped)\n");
+        }
+        remove(target);
+    }
+
+    /* concurrent readers never see a missing or torn dst */
+    {
+        uint8_t *blk = (uint8_t *)malloc(REP_LEN);
+        rep_reader rr;
+        rr.path = dst;
+        atomic_init(&rr.stop, 0);
+        rr.torn = rr.opened = rr.missing = 0;
+        memset(blk, 'A', REP_LEN);
+        hx_file *f = hx_file_open(dst, HX_FILE_WRITE | HX_FILE_CREATE, NULL, 0);
+        if (f) { hx_file_pwrite(f, blk, REP_LEN, 0); hx_file_close(f); }
+        hx_thread *rt;
+        CHECK(hx_thread_create(&rt, replace_reader, &rr) == 0, "thread create");
+        int fails = 0, rounds = 300;
+        for (int i = 0; i < rounds; i++) {
+            memset(blk, 'B' + i % 20, REP_LEN);
+            f = hx_file_open(tmp, HX_FILE_WRITE | HX_FILE_CREATE, NULL, 0);
+            if (!f) { fails++; continue; }
+            hx_file_pwrite(f, blk, REP_LEN, 0);
+            hx_file_close(f);
+            fails += hx_file_replace(tmp, dst) != 0;
+        }
+        atomic_store(&rr.stop, 1);
+        hx_thread_join(rt);
+        free(blk);
+        printf("  %d replaces under a concurrent reader: %d failed; reader: %d reads, %d torn, %d open failures\n",
+               rounds, fails, rr.opened, rr.torn, rr.missing);
+        if (posix) CHECK(fails == 0, "%d of %d replaces failed under a concurrent reader", fails, rounds);
+        CHECK(rr.torn == 0 && rr.missing == 0 && rr.opened > 0, "reader saw %d torn and %d missing files", rr.torn,
+              rr.missing);
+    }
+
+    remove(tmp);
+    remove(dst);
+    remove_utf8(ud);
+#if defined(HX_OS_WINDOWS)
+    {
+        char x[1600];                             /* the CRT needs the \\?\ form for a long path */
+        int unc = (ld[0] == '\\' || ld[0] == '/') && (ld[1] == '\\' || ld[1] == '/');
+        snprintf(x, sizeof x, unc ? "\\\\?\\UNC\\%s" : "\\\\?\\%s", unc ? ld + 2 : ld);
+        for (char *q = x + 4; *q; q++) if (*q == '/') *q = '\\';
+        remove(x);
+    }
+#else
+    remove(ld);
+#endif
+    CHECK(!hx_path_exists(tmp) && !hx_path_exists(dst) && !hx_path_exists(ud) && !hx_path_exists(ld),
+          "replace scratch files removed");
+}
+
+/* Child: log (at debug level) a replace of a missing tmp into a missing directory. */
+static int replace_log_child(const char *out, const char *dir) {
+    char tmp[1200], dst[1200];
+    unsigned long long tag = (unsigned long long)hx_now_ns();
+    snprintf(tmp, sizeof tmp, "%s/hx_missing_%llx.tmp", dir, tag);
+    snprintf(dst, sizeof dst, "%s/hx_missing_dir_%llx/x.dst", dir, tag);
+    if (!freopen(out, "w", stderr)) return 3;
+    hx_set_log_level(HX_LOG_DEBUG);
+    int rc = hx_file_replace(tmp, dst);
+    fflush(stderr);
+    return rc == -1 ? 0 : 4;
+}
+
+/* The failure is reported with tmp's error (file not found), not dst's (path not found). */
+static void test_replace_log(const char *self) {
+    printf("hx_file_replace error report\n");
+    if (!self[0]) { printf("  skipped: cannot locate this executable from argv[0]\n"); return; }
+    char out[1200], cmd[4096];
+    scratch_path(out, sizeof out, "replace_log.txt");
+#if defined(HX_OS_WINDOWS)
+    snprintf(cmd, sizeof cmd, "\"\"%s\" --replace-log-child \"%s\" \"%s\"\"", self, out, g_dir);
+    const char *want = "(error 2)";             /* ERROR_FILE_NOT_FOUND; dst's would be 3 */
+#else
+    snprintf(cmd, sizeof cmd, "'%s' --replace-log-child '%s' '%s'", self, out, g_dir);
+    const char *want = "No such file or directory";
+#endif
+    fflush(stdout);
+    int rc = system(cmd);
+    char got[2048];
+    size_t n = 0;
+    FILE *fp = fopen(out, "r");
+    if (fp) { n = fread(got, 1, sizeof got - 1, fp); fclose(fp); }
+    got[n] = 0;
+    remove(out);
+    CHECK(rc == 0 && strstr(got, "hx_file_replace") && strstr(got, want), "replace log (exit %d): %s", rc, got);
+}
+
+/* Child (POSIX): replace into DIR by an absolute path, then by a bare name after chdir(DIR), with
+ * debug logging into OUT; the parent looks for the directory fsync of each. */
+static int replace_sync_child(const char *out, const char *dir, const char *tag) {
+#if defined(HX_OS_WINDOWS)
+    (void)out; (void)dir; (void)tag;
+    return 0;
+#else
+    char tmp[1200], dst[1200];
+    int rc = 0;
+    if (!freopen(out, "w", stderr)) return 3;
+    hx_set_log_level(HX_LOG_DEBUG);
+    for (int rel = 0; rel < 2; rel++) {
+        if (rel && chdir(dir) != 0) return 5;
+        snprintf(tmp, sizeof tmp, "%s%shx_sync_%s_%d.tmp", rel ? "" : dir, rel ? "" : "/", tag, rel);
+        snprintf(dst, sizeof dst, "%s%shx_sync_%s_%d.dst", rel ? "" : dir, rel ? "" : "/", tag, rel);
+        FILE *fp = fopen(tmp, "wb");
+        if (!fp) return 6;
+        fputs("x", fp);
+        fclose(fp);
+        rc |= hx_file_replace(tmp, dst);
+        remove(dst);
+    }
+    fflush(stderr);
+    return rc == 0 ? 0 : 4;
+#endif
+}
+
+/* POSIX: after the rename, the directory holding dst is fsync'ed (a bare name: "."). */
+static void test_replace_sync(const char *self) {
+    printf("hx_file_replace directory sync\n");
+#if defined(HX_OS_WINDOWS)
+    (void)self;
+    printf("  not applicable on Windows (the rename is the only step)\n");
+#else
+    if (!self[0]) { printf("  skipped: cannot locate this executable from argv[0]\n"); return; }
+    char out[1200], cmd[4096], tag[40], want_abs[1400];
+    scratch_path(out, sizeof out, "replace_sync.txt");
+    snprintf(tag, sizeof tag, "%llx", (unsigned long long)hx_now_ns());
+    snprintf(cmd, sizeof cmd, "'%s' --replace-sync-child '%s' '%s' '%s'", self, out, g_dir, tag);
+    snprintf(want_abs, sizeof want_abs, "hx_file_replace: synced directory %s\n", g_dir);
+    fflush(stdout);
+    int rc = system(cmd);
+    char got[4096];
+    size_t n = 0;
+    FILE *fp = fopen(out, "r");
+    if (fp) { n = fread(got, 1, sizeof got - 1, fp); fclose(fp); }
+    got[n] = 0;
+    remove(out);
+    CHECK(rc == 0 && strstr(got, want_abs) && strstr(got, "hx_file_replace: synced directory .\n"),
+          "directory fsync after replace (exit %d): %s", rc, got);
+#endif
+}
+
+/* ------------------------------------------------- CPU counts under an affinity mask */
+
+static int cpu_child(const char *out) {
+    FILE *fp = fopen(out, "w");
+    if (!fp) return 3;
+    fprintf(fp, "%d %d\n", hx_num_cpus(), hx_num_physical_cores());
+    fclose(fp);
+    return 0;
+}
+
+static char g_self[1100];
+
+/* Runs this program pinned to `mask`; 1 and the child's counts on success. */
+static int counts_pinned(unsigned long long mask, int *cpus, int *cores) {
+    char out[1300], cmd[3000];
+    scratch_path(out, sizeof out, "cpus.txt");
+#if defined(HX_OS_WINDOWS)
+    snprintf(cmd, sizeof cmd, "start \"\" /b /wait /affinity %llx \"%s\" --cpu-child \"%s\"", mask, g_self, out);
+#else
+    snprintf(cmd, sizeof cmd, "taskset 0x%llx '%s' --cpu-child '%s'", mask, g_self, out);
+#endif
+    fflush(stdout);
+    int rc = system(cmd);
+    FILE *fp = fopen(out, "r");
+    int ok = fp && fscanf(fp, "%d %d", cpus, cores) == 2;
+    if (fp) fclose(fp);
+    remove(out);
+    if (!ok) printf("  pinned child failed (status %d)\n", rc);
+    return ok;
+}
+
+/* Whether CPUs 0 and 1 are hardware threads of one core: -1 if unknown. */
+static int cpu01_siblings(void) {
+#if defined(HX_OS_WINDOWS)
+    /* Windows numbers the SMT threads of a core next to each other. */
+    return hx_num_cpus() == 2 * hx_num_physical_cores();
+#else
+    FILE *fp = fopen("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "r");
+    if (!fp) return -1;
+    char line[256];
+    int res = -1;
+    if (fgets(line, sizeof line, fp)) {
+        res = 0;
+        for (char *tok = strtok(line, ",\n"); tok; tok = strtok(NULL, ",\n")) {
+            int a = -1, b = -1;
+            if (sscanf(tok, "%d-%d", &a, &b) == 2) res |= a <= 1 && 1 <= b;
+            else if (sscanf(tok, "%d", &a) == 1) res |= a == 1;
+        }
+    }
+    fclose(fp);
+    return res;
+#endif
+}
+
+static void test_cpu_affinity(void) {
+    printf("cpu counts under an affinity mask\n");
+    if (hx_num_cpus() < 3) { printf("  skipped (fewer than 3 CPUs)\n"); return; }
+    if (!g_self[0]) { printf("  skipped: cannot locate this executable from argv[0]\n"); return; }
+#if !defined(HX_OS_WINDOWS)
+    if (system("command -v taskset >/dev/null 2>&1") != 0) { printf("  skipped: no taskset\n"); return; }
+#endif
+    int sib = cpu01_siblings();
+    struct { unsigned long long mask; int cpus, cores; } cases[3] = {{0x1, 1, 1}, {0x5, 2, 2}, {0x3, 2, -1}};
+    cases[2].cores = sib < 0 ? -1 : sib ? 1 : 2;
+    for (int i = 0; i < 3; i++) {
+        int cpus = -1, cores = -1;
+        if (!counts_pinned(cases[i].mask, &cpus, &cores)) { CHECK(0, "pinned child (mask %llx)", cases[i].mask); continue; }
+        printf("  mask %llx: %d cpus, %d cores\n", cases[i].mask, cpus, cores);
+        CHECK(cpus == cases[i].cpus, "mask %llx: hx_num_cpus %d, want %d", cases[i].mask, cpus, cases[i].cpus);
+        if (cases[i].cores >= 0)
+            CHECK(cores == cases[i].cores, "mask %llx: hx_num_physical_cores %d, want %d", cases[i].mask, cores,
+                  cases[i].cores);
+        else
+            CHECK(cores >= 1 && cores <= cpus, "mask %llx: hx_num_physical_cores %d", cases[i].mask, cores);
+    }
+}
+
 /* Opt-in (--large): one request larger than the 1 GiB internal chunk, at an
  * offset above 2^31, on direct and buffered handles. Writes a 2.25 GiB file. */
 static uint64_t big_word(uint64_t off) { return off * 0x9e3779b97f4a7c15ull ^ 0x5bd1e995u; }
@@ -823,13 +1364,119 @@ static void set_env(const char *k, const char *v) {
 #endif
 }
 
+/* A variable set to "" reads as "" (not NULL), whatever lookups came before it. */
+static void test_env_empty(void) {
+#if defined(HX_OS_WINDOWS)
+    SetEnvironmentVariableA("HX_TEST_EMPTY", "");
+#else
+    setenv("HX_TEST_EMPTY", "", 1);
+#endif
+    const char *a = hx_env_str("HX_TEST_EMPTY");
+    CHECK(hx_env_str("HX_TEST_SURELY_UNSET_VAR") == NULL, "unset var is NULL");   /* leaves "not found" behind */
+    const char *b = hx_env_str("HX_TEST_EMPTY");
+    CHECK(a && *a == 0, "empty variable reads as \"\" (got %s)", a ? "a non-empty string" : "NULL");
+    CHECK(b && *b == 0, "empty variable still reads as \"\" after an unset lookup (got %s)", b ? "a non-empty string" : "NULL");
+    CHECK(hx_env_int("HX_TEST_EMPTY", 7) == 7 && hx_env_double("HX_TEST_EMPTY", 2.5) == 2.5, "empty variable -> defaults");
+#if defined(HX_OS_WINDOWS)
+    SetEnvironmentVariableA("HX_TEST_EMPTY", NULL);   /* not in the CRT's copy, so _putenv_s would not remove it */
+#else
+    set_env("HX_TEST_EMPTY", NULL);
+#endif
+    CHECK(hx_env_str("HX_TEST_EMPTY") == NULL, "removed empty variable is NULL");
+}
+
+/* A variable whose value keeps changing must not slow down later lookups of others (the
+ * Windows cache once kept every value ever seen, in one list searched linearly). */
+static void test_env_churn(void) {
+    set_env("HX_TEST_A", "a");
+    hx_env_str("HX_TEST_A");
+    uint64_t t0 = hx_now_ns();
+    for (int i = 0; i < 2000; i++) hx_env_str("HX_TEST_A");
+    uint64_t before = hx_now_ns() - t0;
+    char v[32];
+    t0 = hx_now_ns();
+    for (int i = 0; i < 30000; i++) {
+        snprintf(v, sizeof v, "%d", i);
+        set_env("HX_TEST_CHURN", v);
+        const char *got = hx_env_str("HX_TEST_CHURN");
+        if (!got || strcmp(got, v) != 0) { CHECK(0, "churn value %d read back as %s", i, got ? got : "NULL"); break; }
+    }
+    uint64_t churn = hx_now_ns() - t0;
+    t0 = hx_now_ns();
+    for (int i = 0; i < 2000; i++) hx_env_str("HX_TEST_A");
+    uint64_t after = hx_now_ns() - t0;
+    printf("  env: 2000 lookups %.2f ms before / %.2f ms after 30000 values of another variable (%.2f s)\n",
+           (double)before / 1e6, (double)after / 1e6, (double)churn * 1e-9);
+    CHECK(after < before * 10 + 20000000u, "lookups slowed down by another variable's history");
+#if defined(HX_OS_WINDOWS)
+    /* returned pointers stay valid for the next 8 changes of the variable (ASan checks this) */
+    set_env("HX_TEST_CHURN", "first");
+    const char *first = hx_env_str("HX_TEST_CHURN");
+    for (int i = 0; i < 8; i++) {
+        snprintf(v, sizeof v, "next%d", i);
+        set_env("HX_TEST_CHURN", v);
+        hx_env_str("HX_TEST_CHURN");
+    }
+    CHECK(first && strcmp(first, "first") == 0, "value pointer valid after 8 changes");
+    /* each variable keeps its own cached copy across lookups of others */
+    set_env("HX_TEST_B", "b");
+    const char *pa = hx_env_str("HX_TEST_A"), *pb = hx_env_str("HX_TEST_B");
+    CHECK(pa && pb && hx_env_str("HX_TEST_A") == pa && hx_env_str("HX_TEST_B") == pb && strcmp(pa, "a") == 0,
+          "interleaved lookups keep each variable's cached copy");
+    set_env("HX_TEST_B", NULL);
+#endif
+    set_env("HX_TEST_CHURN", NULL);
+    set_env("HX_TEST_A", NULL);
+}
+
+/* hx_env_double parses C syntax whatever LC_NUMERIC the host process uses. */
+/* A locale with a decimal comma, found before any library call could have disturbed the
+ * thread's locale (NULL if none is installed). */
+static const char *g_comma_locale;
+
+static void find_comma_locale(void) {
+    static const char *const comma[] = {"de_DE.UTF-8", "de_DE.utf8", "de_DE", "de-DE", "German_Germany.1252",
+                                        "fr_FR.UTF-8", "fr_FR.utf8", "fr-FR", "nl_NL.UTF-8", "ru_RU.UTF-8"};
+    for (size_t i = 0; i < sizeof comma / sizeof comma[0] && !g_comma_locale; i++)
+        if (setlocale(LC_NUMERIC, comma[i]) && localeconv()->decimal_point[0] == ',') g_comma_locale = comma[i];
+    setlocale(LC_NUMERIC, "C");
+}
+
+static void test_env_locale(void) {
+    const char *used = g_comma_locale;
+    if (!used) {
+        printf("  (no locale with a decimal comma is installed: LC_NUMERIC check skipped)\n");
+        return;
+    }
+    setlocale(LC_NUMERIC, used);
+    CHECK(localeconv()->decimal_point[0] == ',', "LC_NUMERIC=%s no longer takes effect on this thread", used);
+    int saved = hx_get_log_level();
+    hx_set_log_level(HX_LOG_ERROR);
+    set_env("HX_TEST_V", "0.25");
+    double a = hx_env_double("HX_TEST_V", -1.0);
+    set_env("HX_TEST_V", "0,25");
+    double b = hx_env_double("HX_TEST_V", -1.0);
+    set_env("HX_TEST_V", "-1.5e3");
+    double c = hx_env_double("HX_TEST_V", -1.0);
+    int kept = localeconv()->decimal_point[0] == ',';   /* the caller's locale is left as it was */
+    setlocale(LC_NUMERIC, "C");
+    CHECK(kept, "hx_env_double restored the calling thread's locale");
+    hx_set_log_level(saved);
+    set_env("HX_TEST_V", NULL);
+    printf("  LC_NUMERIC=%s: \"0.25\" -> %g, \"0,25\" -> %g\n", used, a, b);
+    CHECK(a == 0.25 && c == -1500.0, "hx_env_double under LC_NUMERIC=%s: %g, %g", used, a, c);
+    CHECK(b == -1.0, "decimal comma rejected under LC_NUMERIC=%s (got %g)", used, b);
+}
+
 static void test_env_log(int initial_level, const char *initial_env) {
     printf("env & logging\n");
     long long want = HX_LOG_WARN;
     if (initial_env && *initial_env) {
         char *end;
         long long v = strtoll(initial_env, &end, 10);
-        if (end != initial_env && *end == 0) want = v < 0 ? 0 : v > 3 ? 3 : v;
+        int ok = end != initial_env;
+        while (ok && (*end == ' ' || *end == '\t' || *end == '\r' || *end == '\n')) end++;   /* as the library */
+        if (ok && *end == 0) want = v < 0 ? 0 : v > 3 ? 3 : v;
     }
     CHECK(initial_level == (int)want, "initial log level %d (HEARTH_LOG=%s), want %lld", initial_level,
           initial_env ? initial_env : "<unset>", want);
@@ -840,6 +1487,7 @@ static void test_env_log(int initial_level, const char *initial_env) {
     CHECK(hx_get_log_level() == 0, "level clamps low");
 
     CHECK(hx_env_str("HX_TEST_SURELY_UNSET_VAR") == NULL, "unset var is NULL");
+    CHECK(hx_env_str(NULL) == NULL && hx_env_str("") == NULL, "NULL / empty name is NULL");
     CHECK(hx_env_int("HX_TEST_SURELY_UNSET_VAR", 17) == 17, "unset int default");
     CHECK(hx_env_double("HX_TEST_SURELY_UNSET_VAR", 2.5) == 2.5, "unset double default");
     set_env("HX_TEST_V", "42");
@@ -868,6 +1516,15 @@ static void test_env_log(int initial_level, const char *initial_env) {
     CHECK(hx_env_double("HX_TEST_V", 9.0) == 9.0, "bad double -> default");
     set_env("HX_TEST_V", "1e999");
     CHECK(hx_env_double("HX_TEST_V", 9.0) == 9.0, "out-of-range double -> default");
+    set_env("HX_TEST_V", "-1e999");
+    CHECK(hx_env_double("HX_TEST_V", 9.0) == 9.0, "negative out-of-range double -> default");
+    /* glibc sets ERANGE for these, the MS CRT does not: both platforms keep the rounded value */
+    set_env("HX_TEST_V", "1e-320");
+    CHECK(hx_env_double("HX_TEST_V", 9.0) == 1e-320, "subnormal double kept (%g)", hx_env_double("HX_TEST_V", 9.0));
+    set_env("HX_TEST_V", "-4.9e-324");
+    CHECK(hx_env_double("HX_TEST_V", 9.0) == -4.9e-324, "smallest subnormal kept");
+    set_env("HX_TEST_V", "1e-400");
+    CHECK(hx_env_double("HX_TEST_V", 9.0) == 0.0, "underflow to zero -> 0 (%g)", hx_env_double("HX_TEST_V", 9.0));
     set_env("HX_TEST_V", " 0.25 ");
     CHECK(hx_env_double("HX_TEST_V", 9.0) == 0.25, "double with spaces");
 #if defined(HX_OS_WINDOWS)
@@ -878,6 +1535,9 @@ static void test_env_log(int initial_level, const char *initial_env) {
     CHECK(hx_env_str("HX_TEST_V") && strcmp(hx_env_str("HX_TEST_V"), "\xc3\xa9t\xc3\xa9") == 0, "env value is UTF-8");
     set_env("HX_TEST_V", NULL);
     CHECK(hx_env_int("HX_TEST_V", 3) == 3, "removed var -> default");
+    test_env_empty();
+    test_env_churn();
+    test_env_locale();
 
     char e[16];
     CHECK(hx_fail(e, sizeof e, "code %d: %s", 12, "a long message here") == NULL, "hx_fail returns NULL");
@@ -969,16 +1629,24 @@ static void test_log_output(const char *self) {
 
 int main(int argc, char **argv) {
     if (argc == 3 && strcmp(argv[1], "--log-child") == 0) return log_child(argv[2]);
+    if (argc == 3 && strcmp(argv[1], "--cpu-child") == 0) return cpu_child(argv[2]);
+    if (argc == 4 && strcmp(argv[1], "--replace-log-child") == 0) return replace_log_child(argv[2], argv[3]);
+    if (argc == 5 && strcmp(argv[1], "--replace-sync-child") == 0) return replace_sync_child(argv[2], argv[3], argv[4]);
+    find_comma_locale();
     int initial_level = hx_get_log_level();
     const char *initial_env = getenv("HEARTH_LOG");
     int exhaustive = 0, large = 0;
-    const char *dir = NULL, *expect_cpu = NULL;
+    const char *dir = NULL, *expect_cpu = NULL, *replace_dir = NULL;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--exhaustive") == 0) exhaustive = 1;
         else if (strcmp(argv[i], "--large") == 0) large = 1;
         else if (strcmp(argv[i], "--expect-cpu") == 0 && i + 1 < argc) expect_cpu = argv[++i];
         else if (strcmp(argv[i], "--dir") == 0 && i + 1 < argc) dir = argv[++i];
-        else { printf("usage: test_platform [--dir DIR] [--exhaustive] [--large] [--expect-cpu LIST]\n"); return 2; }
+        else if (strcmp(argv[i], "--replace-dir") == 0 && i + 1 < argc) replace_dir = argv[++i];
+        else {
+            printf("usage: test_platform [--dir DIR] [--replace-dir DIR] [--exhaustive] [--large] [--expect-cpu LIST]\n");
+            return 2;
+        }
     }
     if (!dir) {
         const char *cands[] = {"HEARTH_TEST_DIR", "HEARTH_DATA", "TMPDIR", "TEMP", "TMP"};
@@ -1000,7 +1668,19 @@ int main(int argc, char **argv) {
     test_memory();
     test_time();
     test_threads();
+    snprintf(g_self, sizeof g_self, "%s", argv[0]);
+    if (!hx_path_exists(g_self)) snprintf(g_self, sizeof g_self, "%s.exe", argv[0]);
+    if (!hx_path_exists(g_self)) g_self[0] = 0;
     test_files();
+    test_replace(1);
+    test_replace_log(g_self);
+    test_replace_sync(g_self);
+    if (replace_dir) {
+        snprintf(g_dir, sizeof g_dir, "%s", replace_dir);
+        test_replace(0);
+        snprintf(g_dir, sizeof g_dir, "%s", dir);
+    }
+    test_cpu_affinity();
     test_log_output(argv[0]);
     if (expect_cpu) check_expected_cpu(expect_cpu);
     if (large) test_large();

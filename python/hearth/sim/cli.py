@@ -16,7 +16,10 @@ from .timing import GPU_MODES, Calibration, model_costs
 
 
 def _floats(s: str) -> list:
-    return [float(x) for x in s.split(",") if x.strip()]
+    out = [float(x) for x in s.split(",") if x.strip()]
+    if not out:
+        raise ValueError(f"empty list {s!r}: give comma-separated numbers")
+    return out
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -36,12 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
     g.add_argument("--io-cap-gbs", type=float, help="platform cap on aggregate storage GB/s")
     g.add_argument("--int8-tops", type=float, dest="cpu_int8_tops")
     g.add_argument("--os-reserve-gib", type=float)
+    g.add_argument("--cpu-cores", type=int)
     g.add_argument("--vram-gib", type=float)
     g.add_argument("--vram-gbs", type=float)
     g.add_argument("--pcie-gbs", type=float)
+    g.add_argument("--gpu-sync-us", type=float, help="latency of one host<->GPU hand-off (GPU what-ifs)")
+    g.add_argument("--unified", action=argparse.BooleanOptionalAction, default=None,
+                   help="GPU memory is the system RAM (Apple silicon)")
     g.add_argument("--expert-bits", type=float, default=4.25, help="expert bits/weight (Q4 = 4.25)")
     g.add_argument("--dense-bits", type=float, default=8.25, help="backbone bits/weight (Q8 = 8.25)")
+    g.add_argument("--embed-bits", type=float, default=8.25, help="embedding table bits/weight (Q8 = 8.25)")
     g.add_argument("--context", type=int, default=1024, help="average context length during decode")
+    g.add_argument("--max-seq", type=int, default=4096, help="KV cache capacity in positions (feasibility)")
     g.add_argument("--kv-bytes", type=float, default=4.0, help="bytes per KV element")
     g = p.add_argument_group("trace")
     g.add_argument("--trace", help="routing trace (.hrtr, docs/FORMAT.md sec. 9) instead of a synthetic one")
@@ -93,7 +102,8 @@ def build_parser() -> argparse.ArgumentParser:
 def _hw_overrides(a) -> dict:
     ov = dict(ram_gib=a.ram_gib, dram_gbs=a.dram_gbs, nvme_latency_us=a.nvme_latency_us,
               nvme_capacity_gb=a.nvme_capacity_gb, io_cap_gbs=a.io_cap_gbs, cpu_int8_tops=a.cpu_int8_tops,
-              os_reserve_gib=a.os_reserve_gib, vram_gib=a.vram_gib, vram_gbs=a.vram_gbs, pcie_gbs=a.pcie_gbs)
+              os_reserve_gib=a.os_reserve_gib, vram_gib=a.vram_gib, vram_gbs=a.vram_gbs, pcie_gbs=a.pcie_gbs,
+              cpu_cores=a.cpu_cores, gpu_sync_us=a.gpu_sync_us, unified=a.unified)
     if a.nvme:
         ov["nvme_count"], ov["nvme_gbs"] = parse_nvme(a.nvme)
     return {k: v for k, v in ov.items() if v is not None}
@@ -143,16 +153,17 @@ def _run(a) -> int:
     base = dict(model=a.model, hardware=hw, policy=a.policy, cache_gb=a.cache_gb,
                 prefetch=Prefetch(a.prefetch, a.prefetch_extra), spec=Spec(a.spec_k, a.spec_alpha), lossy=lossy, gpu=a.gpu,
                 warmup=a.warmup, profile=a.profile, expert_bits=a.expert_bits, dense_bits=a.dense_bits,
-                context=a.context, kv_elem_bytes=a.kv_bytes, io_threads=a.io_threads, lfu_decay=a.lfu_decay,
+                embed_bits=a.embed_bits, context=a.context, max_seq=a.max_seq, kv_elem_bytes=a.kv_bytes,
+                io_threads=a.io_threads, lfu_decay=a.lfu_decay,
                 lfu_samples=a.lfu_samples, pin_fraction=a.pin_fraction, calib=_calib(a), seed=a.seed)
     trace = a.trace if a.trace else TraceSpec(a.tokens, a.zipf, a.reuse, a.seed)
     out = []
     payload = {}
 
     if a.feasibility:
-        costs = model_costs(shape, expert_bits=a.expert_bits, dense_bits=a.dense_bits, context=a.context,
-                            kv_elem_bytes=a.kv_bytes)
-        f = check(costs, hw, gpu_mode=a.gpu, io_threads=a.io_threads, shape=shape)
+        costs = model_costs(shape, expert_bits=a.expert_bits, dense_bits=a.dense_bits, embed_bits=a.embed_bits,
+                            context=a.context, max_seq=a.max_seq, kv_elem_bytes=a.kv_bytes)
+        f = check(costs, hw, gpu_mode=a.gpu, io_threads=a.io_threads)
         out.append(f"{shape.name} on {hw.name}:")
         out.append(report.format_feasibility(f, md))
         payload["feasibility"] = f.to_dict()

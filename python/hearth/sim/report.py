@@ -97,6 +97,8 @@ def format_result(r, markdown: bool = False) -> str:
 def format_feasibility(f, markdown: bool = False) -> str:
     kv = [
         ("fits", "yes" if f.fits else "NO - " + "; ".join(f.reasons)),
+        ("parameters", f"{f.params_total / 1e9:.0f} B, of which {f.params_resident / 1e9:.2f} B resident "
+                       "(backbone incl. embeddings)"),
         ("backbone", f"{f.backbone_gib:.1f} GiB in {f.backbone_location}; KV {f.kv_gib:.2f} GiB"),
         ("RAM left for expert cache", f"{f.ram_free_for_cache_gib:.1f} GiB (engine minimum {f.min_cache_gib:.2f} GiB)"),
         ("minimum RAM", f"{f.min_ram_gib:.1f} GiB"),

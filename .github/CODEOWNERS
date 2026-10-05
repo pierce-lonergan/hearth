@@ -1,0 +1,37 @@
+# Paths that define what "correct" means for Hearth, and the machinery that checks it.
+# A pull request touching any of them needs an approving review from a code owner.
+# This only binds with branch protection on main: "Require review from Code Owners", "Dismiss
+# stale pull request approvals when new commits are pushed" and the required status checks
+# (governance/README.md, "CI"). GitHub ignores a line whose owner has no write access, so keep the
+# owners real accounts or teams of this repository. The last matching line wins.
+# Patterns are case-sensitive: a twin such as governance/invariants.md is not covered here. The
+# required gates (golden.yml, decisions.yml) refuse any merge commit with such twins.
+
+# Verification authority (INV-VERIFY) and the zero-loss constraint lane
+/tests/golden/                  @pierce-lonergan
+/governance/INVARIANTS.md       @pierce-lonergan
+
+# The golden suite's oracle: tests/golden takes its expected values and fixtures from these
+# modules (the reference model, quantisation, the synthetic models and what they import from
+# the package), so changing them changes what the golden tests accept
+/python/hearth/__init__.py      @pierce-lonergan
+/python/hearth/reference.py     @pierce-lonergan
+/python/hearth/quant.py         @pierce-lonergan
+/python/hearth/synth.py         @pierce-lonergan
+/python/hearth/format.py        @pierce-lonergan
+/python/hearth/presets.py       @pierce-lonergan
+
+# Decisions: rewriting or retiring an ADR trips the breaker, and the label alone is not the review
+/governance/decisions/          @pierce-lonergan
+
+# The tools that judge a change, and the workflows and rules that run them
+/governance/tools/              @pierce-lonergan
+/governance/schemas/            @pierce-lonergan
+/.github/                       @pierce-lonergan
+
+# Contracts (maintainer-only per governance/README.md, "Elastic autonomy")
+/engine/include/hearth.h        @pierce-lonergan
+/engine/src/hx_*.h              @pierce-lonergan
+/docs/FORMAT.md                 @pierce-lonergan
+/docs/NUMERICS.md               @pierce-lonergan
+/governance/tasks.json          @pierce-lonergan

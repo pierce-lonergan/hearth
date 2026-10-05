@@ -1,0 +1,218 @@
+{
+  "generation_id": "gen-001-h03-forward-hardening",
+  "parent_generation": null,
+  "timestamp": "2026-10-05T19:36:51Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H03-forward",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified, uncommitted (H03-owned files only): engine/src/api.c (+55/-8), engine/src/hx_model.h (+33/-7), engine/src/model.c (+189/-86), engine/tests/test_model.c (+678/-29), engine/tools/hearth_bench.c (+16/-5), python/hearth/engine.py (+20/-3), new: governance/handovers/H03-forward-gen-001.json. Build product python/hearth/lib/hearth.dll (gitignored) rebuilt with hxcc --shared from the final sources (md5 549fc67a2a2b0312bd579ce341f44aad). HEAD is e9d1bfd through other engineers' commits; none touches these files except 02fe0ef (engine.py read_errors mirror, kept). Built and tested against H01's store.c/modelfile.c and H02's pool.c/platform_*.c from the working tree (uncommitted). Predecessor on these files: T08-forward gen-002-forward-sched-fixes."
+  },
+  "constraints_touched": [
+    "INV-DET-1",
+    "INV-DET-2",
+    "INV-DET-3",
+    "INV-NUM-1",
+    "INV-NUM-2",
+    "INV-FMT",
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY",
+    "INV-LOSSLESS-DEFAULT"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "hx_store_count_uses replaces the (n-1) extra try_acquire/release pairs per batched expert; per-expert heat, usage_out and hits + misses = expert_uses stay independent of batching.",
+        "evidence": "test_usage_counts (heat memcmp-equal for one batch / chunks of 5 / token by token) still passes; targeted mutant 'count_uses removed' fails it ('hits 15 + misses 1 != uses 20'). count_uses(0) is skipped (u_n > 1 guard; the >= mutant is equivalent).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Region sizing with hx_pool_for_n: a region gets one thread per PAR_THREAD_NS = 3000 ns of estimated work (at least 2, at most the forward call's threads; below PAR_MIN_NS = 6000 ns it stays on the caller). One pool of n_threads replaces the per-core + all-thread pool pair: batches under 256 tokens use min(n_threads, physical cores) threads of it, larger ones all. Spin stays 50 us.",
+        "evidence": "Interleaved A/B on a synthetic Qwen3-30B-A3B Q4 container (9950X, shared machine, load 10-100%): two pools vs one pool, spin 50/300/1000 us all within noise for fully cached decode (16 thr 21.5-21.9, 32 thr 21.2-21.9 tok/s vs base 21.88/21.99), 512-token prefill (16 thr 374-379 vs base 364.5; 32 thr 448-461 vs 446.8), 4 GiB direct-I/O decode (9.82-9.87 vs 9.81) and a tiny 64-expert model at 1/4/16/32 threads (no collapse at 32: 18338 tok/s). Kept the simplest: one pool, 50 us (31 workers at 32 threads instead of 46). Tests: tiny regions on the pool use exactly 2 threads, forced regions all per-core threads, 1-thread engines run no region, 2-thread engines regions of 2, a 300-token batch on an SMT engine uses every thread (seam hx_model_region_max). Targeted mutant 'no region sizing' fails ('1168 threads in 146 regions, want 2 each').",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "read_errors: hearth_stats.read_errors is filled from hx_store_stats.read_errors (also failed prefetch reads, store semantics); the ctypes mirror already had the field (director commit 02fe0ef), Engine.stats() returns every field, and the ABI checker passes.",
+        "evidence": "test_io_failure / test_truncated / test_trace_failures assert read_errors > 0 after failures and == 0 when a mirror covered a damaged copy; mutant 'read_errors not reported' fails. tests/py (incl. test_ctypes_structs_match_header, test_struct_sizes_follow_natural_alignment) + tests/golden: 798 passed, 2 skipped (golden 21 passed via check_golden.py --run) with the rebuilt DLL.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "I/O errors fail cleanly and fast: hearth_eval returns HX_E_IO (-4) and leaves pos, the routing trace and every hearth_stats counter except read_errors unchanged (hearth.h contract). The MoE wait loop switches to blocking acquires as soon as the store's read_errors moves (instead of after STUCK_NS = 1 s without progress); on failure it waits for the failing layer's other demand reads, and hx_model_eval restores all model counters (times included) and subtracts the call's store counter deltas (hits, misses, evictions, prefetch, bytes, read time) from what get_stats reports; reset_stats clears that offset.",
+        "evidence": "Real I/O error test without new store APIs: test_truncated copies the MLA container, opens it, truncates the open file to its first slab offset (Windows FILE_SHARE_WRITE handles and POSIX both allow it), and gets rc -4, pos unchanged, trace 24 bytes, all counters equal, read_errors > 0; rewriting the file makes the same call succeed with the clean logits. A truncated mirror is covered by the primary (read_errors 0, logits clean); both truncated fail. test_io_failure (read hook): failure takes < 0.9 s (mutant without the read_errors trigger: 1.016 s) and counters equal; test_trace_failures checks the hidden amount equals the store's delta exactly. Python end to end (scratch script, not committed): HearthError '...(code -4)...: I/O error: expert data could not be read', pos unchanged, stats equal, read_errors 18, logits identical after restore. Mutants killed: no drain, delta not hidden, old partial restore, failed-call time counted, reset_stats not clearing the offset.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "GQA and MLA attention value passes share one value_sum(): restrict pointers and a constant 32-dim inner loop that MSVC (SSE2) and gcc vectorise across dims; every element keeps its sequential-in-position order, so results are bit-identical. Parallel decomposition unchanged (token x kv group x 32-dim chunk items, already spread over the pool since T08 gen-002).",
+        "evidence": "Microbenchmark (8 heads x 32 dims, positions 64/512/2048, one thread): 17.8/18.1/16.9 GMAC/s vs 15.6/15.8/15.0 for the old loop (+13-15%). Engine, 16 threads, fully cached, 2048-token prefill: 226.3 vs 212.3 tok/s (+6.6%), attention 5.87 vs 6.42 s. Bit-exact against the naive NUMERICS reference incl. new containers with head_dim 48 and kv_lora_rank 80 (partial 16-dim chunks) and a stale-scratch scenario (batch at later positions, rewind, batch at earlier ones); mutants reading one row past the prefix fail.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "T08 minor findings fixed: (1) prefetch_extra is capped at n_experts at open, so K + extra cannot overflow (INT_MAX now predicts every expert); (2) the five untested behaviours are pinned: expert_loads_unique exactly (distinct ids per call and MoE layer from the trace), one store tick per token (usage_out tokens_observed = 7 for a 6-token batch + 1), stall_s >= 2 ms with 2 ms reads, NEXT/SHARED predictions equal the naive reference's router top-(K+extra) on rmsnorm(h [+ rs*shared], ffn_norm[L+1]) token by token and as a batch union (seam hx_model_set_prediction_log); (3) trace_start refuses (-1) an existing non-empty file that does not start with the trace magic (model, mirror, heat profile) and leaves it untouched; (4) verbose raises the process log level only while the engine is open and the host's level comes back (spin-locked counts, a host change in between is respected); (6) hearth-bench prints the hit rate per unique load (1 - misses / expert_loads_unique) and read_errors. (5) is the value pass above.",
+        "evidence": "Targeted mutants all killed: old prefetch_extra (predictions differ, 16 vs 80 ints), NEXT with this layer's router, SHARED without the shared output, one tick per call (2 vs 7), unique loads = T*K (28 vs 18), stall not counted, trace guard off, 6 log-level mutants (no restore, always restore, base not refreshed, failed open keeps the raise, close keeps it, debug counted as info, base recaptured while counted), bench rate mutants.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Trace ids >= 256 are covered by a C test: an MLA container with 272 experts whose router bias makes experts 256..271 win; every traced id is in 256..271, replaying the trace reproduces the logits, and the full invariant battery (naive reference, 12 configurations, routing agreement, malformed traces) passes on it. Fixed a latent test bug on the way: the 'id out of range' malformed trace wrote only the low byte of n_experts.",
+        "evidence": "Mutant 'trace high byte dropped' fails ('mla 272 experts: traced routing differs from the naive reference's', replay differs).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The naive reference in test_model.c calls sinf/cosf through non-inlined wrappers, as model.c does, so no compiler can fuse them into a sincos routine (the leading hypothesis for the macOS arm64 CI failure at test_model.c:1157/1405).",
+        "evidence": "Windows and Linux results unchanged (bit-exact). NOT verified on macOS (no machine here).",
+        "verdict": "INCONCLUSIVE"
+      },
+      {
+        "claim": "Everything still holds: test_model, ctest, golden and Python suites, sanitizers, warning-free builds.",
+        "evidence": "test_model 2064 checks, 0 failed (was 1098; MSVC /O2 seeds 1-4 ~4 s; MSVC ASan /Od seeds 1, 9; gcc 13 -O2, ASan+UBSan, TSan (0 warnings) on WSL); CMake VS2022 Release build without warnings, ctest 6/6; gcc -Wall -Wextra -Wpedantic -Wshadow clean on the owned C files; python -m pytest tests/golden tests/py: 798 passed, 2 skipped (golden 21 passed via check_golden.py --run) against the rebuilt DLL (copied to python/hearth/lib/hearth.dll).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Mutation testing (governance/tools/mutate.py, every candidate on the changed lines, --lines from git diff, seed 3): model.c 77.5% (214 killed + 6 timeouts of 284), api.c 81.7% (47 + 2 of 60), hearth_bench.c 66.7% (12 of 18); plus 30 hand-written targeted mutants of the new behaviours (scratch harness), all 30 killed. Continues T08-forward gen-002-forward-sched-fixes.",
+        "evidence": "Survivors classified: equivalent (boundary <=/< with identical results, count_uses(0) no-op, seam NULL guards, calloc(2,...)), scheduling/perf-only (region thread counts and chunk sizes, the blocking-wait trigger conditions, chunk 1->2), concurrency-only (the log spin lock; tests are single-threaded), leak-only (hx_file_close / hx_pool_destroy skipped, drain-loop acquire without release: no store seam exposes refcounts), prefetch counter lines of the hidden delta (prefetch is off in the strict failure tests because prefetch reads may finish after the call), log/print text, an unreachable calloc/pool-create failure branch.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "A smaller per-thread work quantum (PAR_THREAD_NS 1000) or no sizing beats 3000 ns for decode.",
+        "evidence": "Same session, 16 threads, fully cached, 4 interleaved reps: ctx ~100 decode base 23.36 / 3000 23.34 / 1000 23.55 / no sizing 23.61 tok/s; ctx ~550 21.84 / 21.88 / 22.26 / 22.01 (ranges overlap, load 10-86%). Not distinguishable on this shared machine; kept 3000.",
+        "verdict": "INCONCLUSIVE"
+      },
+      {
+        "claim": "A longer worker spin (300 / 1000 us) recovers the ~2% T08 measured in the I/O-bound case now that the pool yields.",
+        "evidence": "4 GiB direct-I/O decode, greedy synthetic routing, 16 threads: spin 50 9.83 / 300 9.84 tok/s (3 reps, ranges overlap); fully cached 32 threads spin 1000 21.23 vs 50 21.70. No gain measured; kept 50.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Blocking only after STUCK_NS = 1 s without progress (the previous I/O-error detection) is adequate.",
+        "evidence": "Every failed read cost >= 1 s per call (targeted mutant: 1.016 s); with the read_errors trigger the whole test_model run went from 4.5 s to ~3.5 s despite 900 more checks.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "The value pass is limited to what portable C gets from the compiler (SSE2 under MSVC). A register-blocked AVX-512 kernel (8 heads x 32 dims in 16 zmm accumulators, mul then add, no FMA) measured 94-136 GMAC/s vs 15-18 single-threaded and bit-identical (scratch prototype); it needs an hx_kernels entry (contract_issues) owned by the kernels task, then value_sum calls it.",
+      "Failed-call counter rollback is exact for demand reads; prefetch reads the call queued that complete after it returned are counted when they complete (no store API to wait for them). read_errors also counts failed prefetch reads, so it can be > 0 without any failed call.",
+      "The failure path ticks the store once (FAIL_NOW must clear so the next call retries); usage_out's tokens_observed and LFU decay therefore count a failed call as one token.",
+      "PAR_THREAD_NS (3000) and PAR_MIN_NS (6000) were calibrated on this Zen 5 machine under load; 1000 looked ~1-2% better for decode at 550 context but within noise. Re-measure on a quiet machine.",
+      "engine.py's clearer HearthError text for codes -1..-6 (e.g. '...: I/O error: expert data could not be read (see stats()['read_errors'])') is verified only by a scratch script: tests/py/test_runtime.py belongs to T07. Proposed test: fake_api with eval returning -4 -> pytest.raises(HearthError, match='I/O error').",
+      "macOS arm64: the sincos-fusion hypothesis behind the test_model.c reference failure is untested here; the reference now calls sinf/cosf through non-inlined wrappers like model.c."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o test_model.exe engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c engine/tests/test_model.c   # ~4 s, 2064 checks; -- --seed N, --dir D. Expected stderr noise: injected/truncation I/O failures ('could not be read', 'giving up after N read attempts'), malformed-trace and refused-trace errors, hearth-bench smoke output, INFO/DEBUG lines of the log-level cases",
+    "python scripts/hxcc.py --asan --debug --platform -o test_model_asan.exe <same sources>; run with VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 on PATH (~30 s)",
+    "python scripts/hxcc.py --shared --platform -o h03dll/hearth.dll engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c ; copy to python/hearth/lib/hearth.dll ; python -m pytest tests/golden tests/py -q",
+    "cmake -S . -B %LOCALAPPDATA%\\hearth\\build\\cmake_h03 -G \"Visual Studio 17 2022\" -A x64 && cmake --build <dir> --config Release && ctest --test-dir <dir> -C Release --output-on-failure",
+    "WSL: copy engine/ to ~/h03w; gcc -std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -Isrc -Iinclude on pool.c quant.c modelfile.c store.c model.c api.c platform_posix.c tests/test_model.c (+ quant_avx2.c -mavx2 -mfma -mf16c, quant_avx512.c -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma -mf16c), -lm; variants -O2, -O1 -g -fsanitize=address,undefined, -O1 -g -fsanitize=thread (run under setarch $(uname -m) -R)",
+    "python governance/tools/mutate.py --file engine/src/model.c --lines <git diff -U0 HEAD ranges> --test \"{python} scripts/hxcc.py --platform --run -o {tmp}/h03m.exe <the 9 sources above>\" --max-mutants 0 --jobs 8 --seed 3   # ~25 min for ~290 mutants; same for engine/src/api.c and engine/tools/hearth_bench.c",
+    "PERF (synthetic container, >10 GB: delete afterwards, INV-DATA): PYTHONPATH=python python -c \"from hearth import synth, _native; synth.make_shaped(_native.data_dir()/'models'/'q30.hearth', preset='qwen3-30b-a3b')\"; usage profile: hearth-bench q30.hearth --threads 16 --cache-gb 20 --prompt 512 --tokens 0 --usage-out q30.usage",
+    "hearth-bench q30.hearth --threads {16,32} --cache-gb 20 --usage-in q30.usage --warm 1 --prompt 512 --warmup 8 --tokens 64   # fully cached prefill 512 + decode at ~550 context",
+    "hearth-bench q30.hearth --threads 16 --cache-gb 4 --direct 1 --prompt 32 --warmup 64 --tokens 128   # streaming decode",
+    "hearth-bench q30.hearth --threads 16 --cache-gb 20 --usage-in q30.usage --warm 1 --prompt 2048 --warmup 4 --tokens 32   # attention-heavy prefill"
+  ],
+  "measurements": [
+    {
+      "metric": "decode, fully cached (warm start from a usage profile), ~520-584 context, 16 threads",
+      "value": 21.88,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b: Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X 16C/32T, 61.6 GB DDR5, Samsung 990 PRO, Windows 11, MSVC /O2 AVX-512 kernels; machine shared with other engineers' jobs (instantaneous CPU load 10-86% during runs); median of 3-4 interleaved runs, base = the T08 gen-002 sources with the H01/H02 working tree; --cache-gb 20 --usage-in --warm 1 --prompt 512 --warmup 8 --tokens 64; base 21.84 in the same session (4 reps, ranges 21.03-22.30 vs 21.48-22.46). Another session: 21.10 vs base 21.84 (load 43-69%), a third (first A/B): 21.86 vs 21.88. Flat within noise: decode is memory-bandwidth-bound (~2 GB of weights per token)",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode, fully cached, ~520-584 context, 32 threads",
+      "value": 21.33,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b: Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X 16C/32T, 61.6 GB DDR5, Samsung 990 PRO, Windows 11, MSVC /O2 AVX-512 kernels; machine shared with other engineers' jobs (instantaneous CPU load 10-86% during runs); median of 3-4 interleaved runs, base = the T08 gen-002 sources with the H01/H02 working tree; base 21.46 same session; first A/B 21.70 vs 21.99",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 512 tokens, fully cached, 16 threads",
+      "value": 345.64,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b: Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X 16C/32T, 61.6 GB DDR5, Samsung 990 PRO, Windows 11, MSVC /O2 AVX-512 kernels; machine shared with other engineers' jobs (instantaneous CPU load 10-86% during runs); median of 3-4 interleaved runs, base = the T08 gen-002 sources with the H01/H02 working tree; base 335.15 same session (+3.1%); other sessions 374.2 vs 364.5 (+2.7%) and 375.1 vs 367.5 (+2.1%)",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 512 tokens, fully cached, 32 threads (all threads for T >= 256)",
+      "value": 432.72,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b: Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X 16C/32T, 61.6 GB DDR5, Samsung 990 PRO, Windows 11, MSVC /O2 AVX-512 kernels; machine shared with other engineers' jobs (instantaneous CPU load 10-86% during runs); median of 3-4 interleaved runs, base = the T08 gen-002 sources with the H01/H02 working tree; base 425.00 same session (+1.8%); first A/B 459.9 vs 446.8 (+2.9%)",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode, 4 GiB expert cache, direct I/O, synthetic greedy routing, 16 threads",
+      "value": 9.85,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b: Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X 16C/32T, 61.6 GB DDR5, Samsung 990 PRO, Windows 11, MSVC /O2 AVX-512 kernels; machine shared with other engineers' jobs (instantaneous CPU load 10-86% during runs); median of 3-4 interleaved runs, base = the T08 gen-002 sources with the H01/H02 working tree; --cache-gb 4 --direct 1 --prompt 32 --warmup 64 --tokens 128; base 9.84; I/O-bound (MoE phase 9.75 s of ~13 s)",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 2048 tokens, fully cached, 16 threads (attention-heavy)",
+      "value": 226.32,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b: Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X 16C/32T, 61.6 GB DDR5, Samsung 990 PRO, Windows 11, MSVC /O2 AVX-512 kernels; machine shared with other engineers' jobs (instantaneous CPU load 10-86% during runs); median of 3-4 interleaved runs, base = the T08 gen-002 sources with the H01/H02 working tree; base 212.33 (+6.6%); attention phase 5.87 vs 6.42 s; decode after it (~2050 context) 17.75 vs 17.67 tok/s",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode, tiny 64-expert Q4 model, max_batch 1, 32 threads",
+      "value": 18338,
+      "unit": "tok/s",
+      "conditions": "make_tiny(qwen3_moe, Q4, n_layers 4, E 64, top-6); 1/4/16/32 threads 15192/17971/17863/18338 vs base 14151/17649/16246/17490; no collapse at the logical CPU count; noisy (ranges ~+-5%)",
+      "kind": "measured"
+    },
+    {
+      "metric": "value pass, one thread, 8 heads x 32 dims, 512 positions: portable restrict loop (model.c)",
+      "value": 18.0,
+      "unit": "GMAC/s",
+      "conditions": "MSVC /O2 x64 (SSE2), scratch microbenchmark; old loop 15.8; positions 64/2048: 17.8/16.9 vs 15.6/15.0",
+      "kind": "measured"
+    },
+    {
+      "metric": "value pass prototype, AVX-512 register-blocked (not in the engine: needs an hx_kernels entry)",
+      "value": 94.0,
+      "unit": "GMAC/s at 512 positions",
+      "conditions": "scratch file compiled /arch:AVX512, one thread, load ~38%; 102.5 / 136.1 GMAC/s at 64 / 2048 positions; bit-identical to the portable loop",
+      "kind": "measured"
+    },
+    {
+      "metric": "test_model checks",
+      "value": 2064,
+      "unit": "checks, 0 failed",
+      "conditions": "was 1098; MSVC /O2 ~4 s; MSVC ASan; gcc 13 -O2, ASan+UBSan, TSan on WSL",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score model.c (changed lines, all candidates)",
+      "value": 77.5,
+      "unit": "percent",
+      "conditions": "mutate.py seed 3, 214 killed + 6 timeouts, 64 survived of 284",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score api.c (changed lines, all candidates)",
+      "value": 81.7,
+      "unit": "percent",
+      "conditions": "47 killed + 2 timeouts, 11 survived of 60",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score hearth_bench.c (changed lines, all candidates)",
+      "value": 66.7,
+      "unit": "percent",
+      "conditions": "12 killed + 0 timeouts, 6 survived of 18; survivors on a re-wrapped printf line and boundary-equivalent rate guards",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "The value pass runs at portable-C speed: the 5-8x AVX-512 kernel needs an hx_kernels contract change (proposed in contract_issues) and the kernels owner.",
+    "No Python test for the new HearthError text in engine.py (tests/py/test_runtime.py is T07's); verified by a scratch script.",
+    "All performance numbers on synthetic weights on a shared machine (load 10-86%); differences under ~3% are within noise."
+  ]
+}

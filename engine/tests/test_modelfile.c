@@ -11,6 +11,10 @@
  * placed before or after the expert region. Every container is opened and each
  * parsed field and byte is compared with what was written.
  *
+ * Every container carries the canonical tensors of its config (FORMAT.md §4.1); a
+ * further test breaks them one at a time (missing, mis-shaped, extra rank, forbidden
+ * dtype) until every rule of §4.1 was broken, and expects a rejection naming the tensor.
+ *
  * The fuzzer then opens thousands of variants. Variants that are invalid by
  * construction (truncations, huge counts, misaligned / overlapping /
  * out-of-range entries, inconsistent metadata) must fail with a message.
@@ -324,12 +328,16 @@ static uint64_t t_layout(int dt, uint64_t D, uint64_t F, uint64_t *og, uint64_t 
     return al(*od + D * rf, 4096);
 }
 
+enum { K_EXTRA = 0, K_VEC = 1, K_MAT = 2, K_F32MAT = 3 };   /* FORMAT.md §4.1 role of a tensor */
+
 typedef struct {
     char name[HX_NAME_LEN];
     int dtype, ndim;
     uint32_t shape[4];
     uint64_t nbytes, off;
     uint8_t *data;
+    int kind;                 /* K_*: canonical F32 vector / matrix / F32 matrix, or an extra tensor */
+    char key[32];             /* canonical: suffix plus the variant of its shape rule */
 } ttensor;
 
 typedef struct {
@@ -448,6 +456,7 @@ static void emit_meta(model *m) {
 static void add_tensor(model *m, const char *name, int dtype, int ndim, const uint32_t *shape) {
     ttensor *t = &m->t[m->nt++];
     memset(t, 0, sizeof *t);
+    t->kind = K_EXTRA;
     snprintf(t->name, sizeof t->name, "%s", name);
     t->dtype = dtype;
     t->ndim = ndim;
@@ -466,29 +475,88 @@ static int rnd_wdtype(int small) {
     return small ? wsmall[rndn(7)] : (int)rndn(5);
 }
 
+/* A matrix dtype (F32, F16, BF16, Q8, Q4); quantized only when cols is a multiple of 64. */
+static int rnd_mdtype(int small, uint32_t cols) {
+    int dt = rnd_wdtype(small);
+    return (dt == 3 || dt == 4) && cols % 64 ? (int)rndn(3) : dt;
+}
+
+/* A canonical tensor: layer < 0 global, else "blk.<layer>.<suffix>"; rows 0 = vector [cols]. */
+static void add_canon(model *m, int layer, const char *suffix, const char *variant, int kind, uint32_t rows, uint32_t cols,
+                      int small) {
+    char name[HX_NAME_LEN];
+    uint32_t sh[2] = {rows ? rows : cols, cols};
+    if (layer < 0) snprintf(name, sizeof name, "%s", suffix);
+    else snprintf(name, sizeof name, "blk.%d.%s", layer, suffix);
+    add_tensor(m, name, kind == K_MAT ? rnd_mdtype(small, cols) : 0, rows ? 2 : 1, sh);
+    ttensor *t = &m->t[m->nt - 1];
+    t->kind = kind;
+    snprintf(t->key, sizeof t->key, "%s%s", suffix, variant);
+}
+
+/* Every FORMAT.md §4.1 tensor of the config (as hearth.format.canonical_tensors), matrices
+ * in random allowed dtypes, plus a few extra tensors (ignored by the reader). A tied model
+ * sometimes carries an unused lm_head. */
 static void gen_tensors(model *m, int small) {
     const hx_config *c = &m->want;
     char name[HX_NAME_LEN];
     uint32_t sh[4];
-    m->t = (ttensor *)calloc(16 + 4 * (size_t)c->n_layers, sizeof *m->t);
-    if (c->rope_dim > 0) { sh[0] = (uint32_t)c->rope_dim / 2; add_tensor(m, "rope_inv_freq", 0, 1, sh); }
-    sh[0] = (uint32_t)c->vocab_size; sh[1] = (uint32_t)c->d_model;
-    add_tensor(m, "tok_embd", rnd_wdtype(small), 2, sh);
-    if (!c->tie_embeddings) add_tensor(m, "lm_head", rnd_wdtype(small), 2, sh);
-    sh[0] = (uint32_t)c->d_model;
-    add_tensor(m, "out_norm", 0, 1, sh);
-    for (int i = 0; i < c->n_layers; i++) {
-        snprintf(name, sizeof name, "blk.%d.attn_norm", i);
-        sh[0] = (uint32_t)c->d_model;
-        add_tensor(m, name, 0, 1, sh);
-        if (c->layer_kind[i]) {
-            snprintf(name, sizeof name, "blk.%d.moe_router", i);
-            sh[0] = (uint32_t)c->n_experts; sh[1] = (uint32_t)c->d_model;
-            add_tensor(m, name, 0, 2, sh);
-        } else if (!small || chance(50)) {
-            snprintf(name, sizeof name, "blk.%d.ffn_down", i);
-            sh[0] = (uint32_t)c->d_model; sh[1] = (uint32_t)c->dense_ffn_dim;
-            add_tensor(m, name, rnd_wdtype(small), 2, sh);
+    const uint32_t D = (uint32_t)c->d_model, V = (uint32_t)c->vocab_size, H = (uint32_t)c->n_heads;
+    m->t = (ttensor *)calloc(32 + 20 * (size_t)c->n_layers, sizeof *m->t);
+    if (c->rope_dim > 0) add_canon(m, -1, "rope_inv_freq", "", K_VEC, 0, (uint32_t)c->rope_dim / 2, small);
+    add_canon(m, -1, "tok_embd", "", K_MAT, V, D, small);
+    if (!c->tie_embeddings) add_canon(m, -1, "lm_head", "", K_MAT, V, D, small);
+    else if (chance(20)) { sh[0] = V; sh[1] = D; add_tensor(m, "lm_head", rnd_mdtype(small, D), 2, sh); }
+    add_canon(m, -1, "out_norm", "", K_VEC, 0, D, small);
+    for (int l = 0; l < c->n_layers; l++) {
+        add_canon(m, l, "attn_norm", "", K_VEC, 0, D, small);
+        add_canon(m, l, "ffn_norm", "", K_VEC, 0, D, small);
+        if (c->attn_kind == HX_ATTN_MLA) {
+            const uint32_t nope = (uint32_t)c->qk_nope_dim, rope = (uint32_t)c->qk_rope_dim, C = (uint32_t)c->kv_lora_rank;
+            const uint32_t ql = (uint32_t)c->q_lora_rank, vd = (uint32_t)c->v_head_dim;
+            if (ql) {
+                add_canon(m, l, "attn_q_a", "", K_MAT, ql, D, small);
+                add_canon(m, l, "attn_q_a_norm", "", K_VEC, 0, ql, small);
+                add_canon(m, l, "attn_q_b", "", K_MAT, H * (nope + rope), ql, small);
+            } else {
+                add_canon(m, l, "attn_q", "/mla", K_MAT, H * (nope + rope), D, small);
+            }
+            add_canon(m, l, "attn_kv_a", "", K_MAT, C + rope, D, small);
+            add_canon(m, l, "attn_kv_a_norm", "", K_VEC, 0, C, small);
+            add_canon(m, l, "attn_kv_b", "", K_MAT, H * (nope + vd), C, small);
+            add_canon(m, l, "attn_o", "/mla", K_MAT, D, H * vd, small);
+        } else {
+            const uint32_t hd = (uint32_t)c->head_dim, q = H * hd, kv = (uint32_t)c->n_kv_heads * hd;
+            add_canon(m, l, "attn_q", "", K_MAT, q, D, small);
+            add_canon(m, l, "attn_k", "", K_MAT, kv, D, small);
+            add_canon(m, l, "attn_v", "", K_MAT, kv, D, small);
+            add_canon(m, l, "attn_o", "", K_MAT, D, q, small);
+            if (c->qkv_bias) {
+                add_canon(m, l, "attn_q_bias", "", K_VEC, 0, q, small);
+                add_canon(m, l, "attn_k_bias", "", K_VEC, 0, kv, small);
+                add_canon(m, l, "attn_v_bias", "", K_VEC, 0, kv, small);
+            }
+            if (c->qk_norm) {
+                const char *v = c->qk_norm == 1 ? "/head" : "/full";
+                add_canon(m, l, "attn_q_norm", v, K_VEC, 0, c->qk_norm == 1 ? hd : q, small);
+                add_canon(m, l, "attn_k_norm", v, K_VEC, 0, c->qk_norm == 1 ? hd : kv, small);
+            }
+        }
+        if (!c->layer_kind[l]) {
+            const uint32_t Fd = (uint32_t)c->dense_ffn_dim;
+            add_canon(m, l, "ffn_gate", "", K_MAT, Fd, D, small);
+            add_canon(m, l, "ffn_up", "", K_MAT, Fd, D, small);
+            add_canon(m, l, "ffn_down", "", K_MAT, D, Fd, small);
+            continue;
+        }
+        add_canon(m, l, "moe_router", "", K_F32MAT, (uint32_t)c->n_experts, D, small);
+        if (c->score_bias) add_canon(m, l, "moe_router_bias", "", K_VEC, 0, (uint32_t)c->n_experts, small);
+        if (c->shared_ffn_dim) {
+            const uint32_t Fs = (uint32_t)c->shared_ffn_dim;
+            add_canon(m, l, "shexp_gate", "", K_MAT, Fs, D, small);
+            add_canon(m, l, "shexp_up", "", K_MAT, Fs, D, small);
+            add_canon(m, l, "shexp_down", "", K_MAT, D, Fs, small);
+            if (c->shared_gate) add_canon(m, l, "shexp_gate_inp", "", K_MAT, 1, D, small);
         }
     }
     int extra = (int)rndn(small ? 3 : 6);
@@ -641,6 +709,18 @@ static void assemble(model *m) {
     w64(f + 48, (uint64_t)m->ne);
     w32(f + 56, 4096);
     w32(f + 60, 0);
+}
+
+/* Tensors again from the (changed) config in m->g; experts unchanged. */
+static void regen_tensors(model *m, int small) {
+    for (int i = 0; i < m->nt; i++) free(m->t[i].data);
+    free(m->t);
+    m->t = NULL;
+    m->nt = 0;
+    expect_cfg(&m->g, &m->want);
+    gen_tensors(m, small);
+    emit_meta(m);
+    assemble(m);
 }
 
 static void make_model(model *m, int small) {
@@ -926,6 +1006,32 @@ static void fuzz_preamble(const model *m) {
         patch64(m, "edir_off=max", 40, UINT64_MAX - 7, 0);
         patch64(m, "edir_off=size", 40, sz, 0);
     }
+    /* the section at offset 64 moved one byte down: it overlaps only the preamble's last byte
+     * (reserved, otherwise ignored) */
+    const struct { uint64_t off, n; size_t at; const char *what; } sec[3] = {
+        {m->meta_off, m->meta.n, 8, "metadata"}, {m->tdir_off, 128 * (uint64_t)m->nt, 24, "tensor directory"},
+        {m->edir_off, 32 * ne, 40, "expert directory"}};
+    for (int s = 0; s < 3; s++) {
+        if (sec[s].off != 64 || !sec[s].n) continue;
+        uint8_t *d = dup_file(m);
+        char what[96];
+        memmove(d + 63, d + 64, (size_t)sec[s].n);
+        w64(d + sec[s].at, 63);
+        snprintf(what, sizeof what, "%s overlapping the preamble's last byte", sec[s].what);
+        try_variant(what, d, m->size, 0);
+        free(d);
+    }
+}
+
+/* The smallest tensor moved entirely inside the expert directory, past its first 64 bytes:
+ * only the directory's full length (n_e * 32) reveals the overlap. 0 if m has no room. */
+static int tensor_inside_edir(const model *m) {
+    int s = 0;
+    for (int i = 1; i < m->nt; i++) if (m->t[i].nbytes < m->t[s].nbytes) s = i;
+    uint64_t at = al(m->edir_off + 64, 64), end = m->edir_off + 32 * (uint64_t)m->ne;
+    if (!m->nt || at + m->t[s].nbytes > end) return 0;
+    patch64(m, "smallest tensor inside the expert directory", (size_t)(m->tdir_off + 128 * (uint64_t)s + 104), at, 0);
+    return 1;
 }
 
 static void fuzz_tensor_entries(const model *m) {
@@ -1263,6 +1369,17 @@ static void test_slab_layout(void) {
     CHECK(v.gate == NULL, "hx_slab_view_make(NULL mf)");
 }
 
+static void test_overlap_inside_edir(void) {
+    int done = 0;
+    for (int k = 0; k < 200 && !done; k++) {
+        model m;
+        make_model(&m, 1);
+        done = tensor_inside_edir(&m);
+        free_model(&m);
+    }
+    CHECK(done, "no container with room for a tensor inside its expert directory");
+}
+
 static void test_open_errors(void) {
     char err[300];
     char p[800];
@@ -1296,10 +1413,7 @@ static void test_attn_scale_values(void) {
         m.g.has[G_ATTN_SCALE] = 0;
         set_u(&m.g, G_HEAD_DIM, cases[i].hd);
         set_u(&m.g, G_ROPE_DIM, 0);
-        for (int k = 0; k < m.nt; k++)
-            if (!strcmp(m.t[k].name, "rope_inv_freq")) strcpy(m.t[k].name, "zz.not_rope");
-        emit_meta(&m);
-        assemble(&m);
+        regen_tensors(&m, 1);   /* the attention shapes follow head_dim; no rope_inv_freq */
         char err[600];
         write_file(g_path, m.file, m.size);
         hx_modelfile *mf = hx_modelfile_open(g_path, 0, err, sizeof err);
@@ -1329,6 +1443,184 @@ static void test_string_boundary(void) {
         hx_modelfile_close(mf);
         free_model(&m);
     }
+}
+
+/* ------------------------------------------------- canonical tensors (§4.1) */
+
+/* Every shape rule of FORMAT.md §4.1 (suffix plus variant), each to be broken at least once. */
+static const char *CANON_KEYS[] = {
+    "tok_embd", "lm_head", "out_norm", "rope_inv_freq", "attn_norm", "ffn_norm", "attn_q", "attn_k", "attn_v",
+    "attn_o", "attn_q_bias", "attn_k_bias", "attn_v_bias", "attn_q_norm/head", "attn_k_norm/head", "attn_q_norm/full",
+    "attn_k_norm/full", "attn_q/mla", "attn_q_a", "attn_q_a_norm", "attn_q_b", "attn_kv_a", "attn_kv_a_norm",
+    "attn_kv_b", "attn_o/mla", "ffn_gate", "ffn_up", "ffn_down", "moe_router", "moe_router_bias", "shexp_gate",
+    "shexp_up", "shexp_down", "shexp_gate_inp"};
+#define N_CANON_KEYS ((int)(sizeof CANON_KEYS / sizeof CANON_KEYS[0]))
+
+static int g_canon_variants;
+
+/* 1 accepted, 0 rejected (message in err). */
+static int open_assembled(model *m, char *err, size_t n) {
+    assemble(m);
+    if (!write_file(g_path, m->file, m->size)) {
+        if (snprintf(err, n, "cannot write %s", g_path) < 0) err[0] = 0;   /* truncation is fine for a message */
+        return -1;
+    }
+    g_opens++;
+    g_canon_variants++;
+    err[0] = 0;
+    hx_modelfile *mf = hx_modelfile_open(g_path, (int)(rnd() & 1), err, n);
+    if (!mf) return 0;
+    walk(mf);
+    hx_modelfile_close(mf);
+    return 1;
+}
+
+/* The message names the tensor and contains detail (if not NULL). */
+static void expect_rejected(model *m, const char *what, const char *name, const char *detail) {
+    char err[600], quoted[HX_NAME_LEN + 4];
+    snprintf(quoted, sizeof quoted, "'%s'", name);
+    int r = open_assembled(m, err, sizeof err);
+    CHECK(r == 0 && strstr(err, quoted) && (!detail || strstr(err, detail)), "%s %s: %s (want '%s')", name, what,
+          r == 1 ? "accepted" : err, detail ? detail : "");
+}
+
+/* "has shape [a, b], expected [c, d]" as modelfile.c reports it */
+static void shape_detail(char *buf, size_t n, int ndim, const uint32_t *got, int wdim, const uint32_t *want) {
+    size_t k = (size_t)snprintf(buf, n, "has shape [");
+    for (int i = 0; i < ndim && k < n; i++) k += (size_t)snprintf(buf + k, n - k, "%s%u", i ? ", " : "", got[i]);
+    if (k < n) k += (size_t)snprintf(buf + k, n - k, "], expected [");
+    for (int i = 0; i < wdim && k < n; i++) k += (size_t)snprintf(buf + k, n - k, "%s%u", i ? ", " : "", want[i]);
+    if (k < n) snprintf(buf + k, n - k, "]");
+}
+
+static void expect_accepted(model *m, const char *what, const char *name) {
+    char err[600];
+    CHECK(open_assembled(m, err, sizeof err) == 1, "%s %s: rejected: %s", name, what, err);
+}
+
+/* Replaces tensor i by one of the given dtype and shape with fresh random bytes (the caller
+ * keeps a copy of the original for restore()). */
+static void reshape(model *m, int i, int dtype, int ndim, const uint32_t *shape) {
+    char name[HX_NAME_LEN];
+    int kind = m->t[i].kind, nt = m->nt;
+    memcpy(name, m->t[i].name, sizeof name);
+    m->nt = i;
+    add_tensor(m, name, dtype, ndim, shape);   /* writes slot i */
+    m->nt = nt;
+    m->t[i].kind = kind;
+}
+
+static void restore(model *m, int i, const ttensor *keep) {
+    if (m->t[i].data != keep->data) free(m->t[i].data);
+    m->t[i] = *keep;
+}
+
+/* Breaks canonical tensor i every way the reader must notice: absent, one row / element
+ * too many, 64 columns too many, an extra leading dimension of 1 (same bytes), a dtype its
+ * rule forbids. A matrix in another allowed dtype is accepted. */
+static void break_canonical(model *m, int i) {
+    const ttensor keep = m->t[i];
+    const int vec = keep.kind == K_VEC, f32 = keep.kind != K_MAT;
+    uint32_t sh[4];
+    char detail[160];
+    snprintf(m->t[i].name, sizeof m->t[i].name, "zz.renamed.%d", i);
+    expect_rejected(m, "missing", keep.name, "is missing");
+    m->t[i] = keep;
+
+    memcpy(sh, keep.shape, sizeof sh);
+    sh[0]++;
+    reshape(m, i, keep.dtype, keep.ndim, sh);
+    shape_detail(detail, sizeof detail, keep.ndim, sh, keep.ndim, keep.shape);
+    expect_rejected(m, vec ? "one element too long" : "one row too many", keep.name, detail);
+    restore(m, i, &keep);
+    if (!vec) {
+        memcpy(sh, keep.shape, sizeof sh);
+        sh[1] += 64;
+        reshape(m, i, keep.dtype, 2, sh);
+        shape_detail(detail, sizeof detail, 2, sh, 2, keep.shape);
+        expect_rejected(m, "64 columns too many", keep.name, detail);
+        restore(m, i, &keep);
+    }
+
+    m->t[i].ndim = keep.ndim + 1;
+    m->t[i].shape[0] = 1;
+    for (int k = 0; k < keep.ndim; k++) m->t[i].shape[k + 1] = keep.shape[k];
+    shape_detail(detail, sizeof detail, keep.ndim + 1, m->t[i].shape, keep.ndim, keep.shape);
+    expect_rejected(m, "with a leading dimension of 1", keep.name, detail);
+    m->t[i] = keep;
+
+    static const int bad_f32[4] = {1, 2, 5, 6}, bad_mat[2] = {5, 6};   /* F16, BF16, I32, U8 */
+    int dt = f32 ? bad_f32[rndn(4)] : bad_mat[rndn(2)];
+    reshape(m, i, dt, keep.ndim, keep.shape);
+    expect_rejected(m, f32 ? "not F32" : "with a non-matrix dtype", keep.name, f32 ? "must be F32" : "matrices must be");
+    restore(m, i, &keep);
+    if (!f32) {
+        int cols = (int)keep.shape[keep.ndim - 1], alt = keep.dtype;
+        while (alt == keep.dtype) alt = rnd_mdtype(1, (uint32_t)cols);
+        reshape(m, i, alt, keep.ndim, keep.shape);
+        expect_accepted(m, "in another matrix dtype", keep.name);
+        restore(m, i, &keep);
+    }
+}
+
+/* Containers whose canonical tensors are broken one at a time must be rejected with a
+ * message naming the tensor, until every rule of §4.1 has been broken at least once.
+ * The optional features rotate per model so that every rule is reached. Also:
+ * rope_inv_freq present with rope_dim 0 is rejected. */
+static void test_canonical(int quick) {
+    int covered[N_CANON_KEYS], need = N_CANON_KEYS, models = 0, min_models = quick ? 8 : 30;
+    int extra_per_model = quick ? 2 : 8, rope_iff = 0, seen_ql1 = 0, seen_fs1 = 0;   /* smallest nonzero widths */
+    memset(covered, 0, sizeof covered);
+    g_canon_variants = 0;
+    for (int k = 0; k < 600 && (need > 0 || models < min_models || !seen_ql1 || !seen_fs1); k++) {
+        model m;
+        make_model(&m, 1);
+        set_u(&m.g, G_QK_NORM, (uint32_t)(k % 3));
+        set_u(&m.g, G_QKV_BIAS, (uint32_t)(k / 3 % 2));
+        set_u(&m.g, G_SHARED_FFN, k % 4 ? (k % 4 == 3 ? 1u : 64u) : 0u);
+        set_u(&m.g, G_SHARED_GATE, (uint32_t)(k / 2 % 2));
+        set_u(&m.g, G_SCORE_BIAS, (uint32_t)(k / 5 % 2));
+        set_u(&m.g, G_TIE, (uint32_t)(k / 7 % 2));
+        if (m.want.attn_kind == HX_ATTN_MLA) set_u(&m.g, G_Q_LORA, (uint32_t)(k / 2 % 3 == 2 ? 1 : k / 2 % 3 * 24));
+        regen_tensors(&m, 1);
+        char err[600];
+        CHECK(open_assembled(&m, err, sizeof err) == 1, "canonical base model %d rejected: %s", k, err);
+        seen_ql1 |= m.want.attn_kind == HX_ATTN_MLA && m.want.q_lora_rank == 1;
+        int extra = extra_per_model;
+        for (int i = 0; i < m.nt; i++) {
+            if (m.t[i].kind == K_EXTRA) continue;
+            int key = -1;
+            for (int j = 0; j < N_CANON_KEYS; j++)
+                if (!strcmp(CANON_KEYS[j], m.t[i].key)) key = j;
+            CHECK(key >= 0, "no coverage key for %s", m.t[i].key);
+            int fresh = key >= 0 && !covered[key];
+            int fs1 = !seen_fs1 && m.want.shared_ffn_dim == 1 && !strcmp(m.t[i].key, "shexp_gate");
+            if (!fresh && !fs1 && !(extra > 0 && chance(15))) continue;
+            if (!fresh && !fs1) extra--;
+            seen_fs1 |= fs1;
+            break_canonical(&m, i);
+            if (fresh) { covered[key] = 1; need--; }
+        }
+        if (m.want.rope_dim > 0) {   /* present iff rope_dim > 0 */
+            gencfg keep = m.g;
+            set_u(&m.g, G_ROPE_DIM, 0);
+            emit_meta(&m);
+            expect_rejected(&m, "present with rope_dim 0", "rope_inv_freq", "rope_dim is 0");
+            for (int i = 0; i < m.nt; i++)
+                if (!strcmp(m.t[i].name, "rope_inv_freq")) strcpy(m.t[i].name, "zz.not_rope");
+            expect_accepted(&m, "absent with rope_dim 0", "rope_inv_freq");
+            m.g = keep;
+            rope_iff++;
+        }
+        free_model(&m);
+        models++;
+    }
+    for (int j = 0; j < N_CANON_KEYS; j++) CHECK(covered[j], "canonical rule %s was never exercised", CANON_KEYS[j]);
+    CHECK(rope_iff > 0 && seen_ql1 && seen_fs1, "never exercised: rope_inv_freq iff rope_dim > 0 (%d), q_lora_rank 1 "
+          "(%d), shared_ffn_dim 1 (%d)", rope_iff, seen_ql1, seen_fs1);
+    printf("  canonical tensors: %d containers, %d variants (each tensor missing, mis-shaped, of rank + 1, of a "
+           "forbidden dtype; matrices in another allowed dtype accepted), all %d rules of FORMAT 4.1 broken\n",
+           models, g_canon_variants, N_CANON_KEYS);
 }
 
 /* --------------------------------------------------------------- --dump */
@@ -1421,8 +1713,10 @@ int main(int argc, char **argv) {
 
     test_slab_layout();
     test_open_errors();
+    test_overlap_inside_edir();
     test_attn_scale_values();
     test_string_boundary();
+    test_canonical(quick);
 
     /* round trips */
     int n_models = quick ? 40 : 200, n_mla = 0, n_dense = 0, n_alias = 0, n_shuffled = 0, n_after = 0, n_gap = 0;

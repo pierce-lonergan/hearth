@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -34,6 +35,8 @@ cg = _load("check_golden")
 mutate = _load("mutate")
 friction = _load("friction")
 adr = _load("adr")
+merge_ref = _load("merge_ref")
+path_aliases = _load("path_aliases")
 
 
 def tool(name, *args, cwd=None, timeout=600, env=None):
@@ -390,13 +393,23 @@ ECMA_MATCHES = [(bs(p), s, want) for p, s, want in [   # (pattern, string, ECMA-
     ("%Bx", E_ACUTE + "x", False), ("^[%b]$", "\b", True), ("^%cJ$", "\n", True), ("^%x41%u0042%u{43}$", "ABC", True),
     ("^%uD83D%uDE00$", GRIN, True), ("^[%uD83D%uDE00]$", GRIN, True), ("^%uD83D$", LEAD, True),
     ("^%uD83D%u0041$", LEAD + "A", True), ("^[%u{1F600}]$", GRIN, True), ("^[%x41-%x43]$", "B", True),
-    ("^[%x41-%x43]$", "D", False), ("^(?<y>a)%k<y>$", "aa", True), ("^(a)%1$", "aa", True),
+    ("^[%x41-%x43]$", "D", False), ("^(?<y>a)b$", "ab", True), ("^(a)(?:b)$", "ab", True),
     ("^[a-c-]+$", "b-a", True), ("^[%-]$", "-", True), ("^a{2,}$", "aaa", True), ("^a+?%/$", "aa/", True),
     ("^[[]$", "[", True), ("^[&&~|]+$", "&~|", True), ("^%0$", chr(0), True), ("^%$%^$", "$^", True),
+    ("^a*?$", "aa", True), ("^a??b$", "b", True), ("^a{2}?$", "aa", True), ("^(?:a)*$", "aaa", True),
+    ("^()*a$", "a", True), ("^(?=a)a$", "a", True), ("^(?!b)a$", "a", True), ("^(a|b)+$", "abba", True),
+    ("^(?:(?=a)a)+$", "aa", True), ("^(?<=)a$", "a", True), ("(a)|b", "b", True),
 ]]
 ECMA_INVALID = [bs(p) for p in [
     "^[]a]$", "]", "}", "a{", "a{,3}", "%a", "%e", "%-", "%01", "%c" + E_ACUTE, "%p{L}", "(?P<x>a)", "(?i)a",
     "(?#c)", "a++", "a*?+", "[%d-z]", "[a-%w]", "[z-a]", "[a", "%", "(?<=a+)b", "%k<q>", "%u{110000}", "%x4", "%uD83",
+    # backreferences: ECMA-262 matches one to a group that did not take part as empty, Python never matches
+    "^(?<y>a)%k<y>$", "^(a)%1$", "^(?:(z)|gen)%1-[0-9]{3,}-[a-z0-9-]+$", "%k", "(a)%2",
+    # quantified assertions and empty repeats are syntax errors under the "u" flag
+    "(?=a)*", "(?!a)+", "(?<=a)?", "(?<!b)+", "%b{2}", "%B*?", "^*", "$+", "a|*", "(*)", "*a", "{2}",
+    "a**", "a{2}{3}", "a*??", "a?+", "a)", "(a", "(?:a))",
+    # repeat counts Python's re cannot represent
+    "a{3,4294967296}", "x{4294967296}", "x{99999999999999999999}",
 ]]
 
 
@@ -413,6 +426,185 @@ def test_ecma_pattern_semantics(engine):
     schema = {"type": "object", "properties": {"pattern": {"type": "string", "pattern": "^ok$"}},
               "enum": [{"pattern": "(("}], "default": {"pattern": "(("}}
     assert list(vh.schema_patterns(schema)) == ["^ok$"]
+
+
+BAD_SCHEMAS = {   # property schema for task_id -> what must be reported
+    "unknown type": {"type": "strin"},
+    "type object": {"type": {"x": 1}},
+    "type list": {"type": []},
+    "required string": {"type": "object", "required": "generation_id"},
+    "required numbers": {"type": "object", "required": [1]},
+    "minLength string": {"minLength": "5"},
+    "maxItems negative": {"maxItems": -1},
+    "minItems float": {"minItems": 1.5},
+    "minimum string": {"minimum": "0"},
+    "maximum bool": {"maximum": True},
+    "enum string": {"enum": "abc"},
+    "properties list": {"type": "object", "properties": []},
+    "pattern number": {"pattern": 5},
+    "format list": {"format": ["date-time"]},
+    "defs list": {"$defs": []},
+    "bad items": {"type": "array", "items": {"minLength": "5"}},
+    "bad additionalProperties": {"type": "object", "additionalProperties": {"required": "x"}},
+    "huge repeat": {"pattern": "^gen-[0-9]{3,4294967296}$"},
+    "quantified lookahead": {"pattern": "^(?=gen-)*gen-"},
+    "backreference": {"pattern": "^(?:(z)|gen)" + chr(92) + "1-"},
+}
+
+
+@pytest.mark.parametrize("case", sorted(BAD_SCHEMAS))
+def test_handover_cli_rejects_malformed_schemas(case, tmp_path):
+    """Council round 1: these crashed, passed or failed per file instead of exiting 2."""
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    schema = write_json(tmp_path / "s.json", {"type": "object", "properties": {"task_id": BAD_SCHEMAS[case]}})
+    for engine in ["builtin"] + (["auto", "jsonschema"] if vh.have_jsonschema() else []):
+        r = tool("validate_handover", m, "--schema", schema, "--engine", engine)
+        assert r.returncode == 2 and r.stderr.startswith("validate_handover: "), (case, engine, r.stdout, r.stderr)
+        assert "Traceback" not in r.stderr and r.stdout == "", (case, engine)
+    with pytest.raises(vh.SchemaError):
+        vh.MiniValidator({"type": "object", "properties": {"task_id": BAD_SCHEMAS[case]}})
+
+
+def test_builtin_engine_accepts_well_formed_keyword_values(tmp_path):
+    v = vh.MiniValidator({"type": ["object", "null"], "required": [], "properties": {}, "$defs": {},
+                          "additionalProperties": {"type": "integer", "minimum": -1.5, "maximum": 3,
+                                                   "minLength": 0, "maxItems": 2.0, "enum": [1, 2]}})
+    assert v.errors({"a": 1}) == [] and v.errors(None) == [] and len(v.errors({"a": 3})) == 1
+    # ECMA-262 syntax that Python's re rejects: valid patterns, whichever engine checks the schema
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    for pattern in ("^(?<task>T[0-9]{2})-[a-z]+$", bs("^T%u{30}5-[^]+$")):
+        schema = write_json(tmp_path / "s.json", {"type": "object", "properties": {"task_id": {"pattern": pattern}}})
+        for engine in ENGINES:
+            r = tool("validate_handover", m, "--schema", schema, "--engine", engine, "--tasks", "")
+            assert r.returncode == 0, (pattern, engine, r.stdout, r.stderr)
+    for pattern, msg in (("(a)%1", "backreference"), ("(?<y>a)%k<y>", "backreference"), ("[%1]", "not an ECMA"),
+                         ("%e", "not an ECMA"), ("%q", "not an ECMA")):
+        with pytest.raises(re.error, match=msg):
+            vh.ecma_translate(bs(pattern))
+    if vh.have_jsonschema():
+        vh.jsonschema_check_schema(SCHEMA)
+        with pytest.raises(vh.SchemaError, match="not valid JSON Schema"):
+            vh.jsonschema_check_schema({"type": "object", "required": "x"})
+        # a keyword only jsonschema implements is refused by every engine (verifier round 3)
+        schema = write_json(tmp_path / "s.json", {"type": "object", "properties": {"task_id": {"anyOf": [{}]}}})
+        for engine in ("auto", "jsonschema", "builtin"):
+            r = tool("validate_handover", m, "--schema", schema, "--engine", engine, "--tasks", "")
+            assert r.returncode == 2 and "'anyOf' is not supported (under any engine" in r.stderr, (engine, r.stderr)
+
+
+UNUSABLE_SCHEMAS = {   # whole schema -> part of the message; every engine must exit 2 (verifier round 2)
+    "null": (None, "must be a JSON object"), "true": (True, "must be a JSON object"),
+    "false": (False, "must be a JSON object"), "list": ([], "must be a JSON object"),
+    "$schema number": ({"$schema": 5, "type": "object"}, "$schema 5 is not one of"),
+    "$schema draft-07": ({"$schema": "http://json-schema.org/draft-07/schema#", "type": "object"}, "is not one of"),
+    "$schema unknown": ({"$schema": "http://example.com/unknown", "type": "object"}, "is not one of"),
+    "ref nowhere": ({"type": "object", "properties": {"task_id": {"$ref": "#/$defs/nope"}}}, "unresolvable $ref"),
+    "ref remote": ({"type": "object", "properties": {"task_id": {"$ref": "https://example.com/s.json"}}},
+                   "only local $ref"),
+    "ref anchor": ({"type": "object", "$defs": {"a": {"$anchor": "x"}}, "properties": {"task_id": {"$ref": "#x"}}},
+                   "only local $ref"),
+    "ref non-schema": ({"type": "object", "required": ["task_id"], "properties": {"task_id": {"$ref": "#/required"}}},
+                       "does not name a schema"),
+    "ref into data": ({"type": "object", "properties": {"task_id": {"$ref": "#/$defs/a/default"}},
+                       "$defs": {"a": {"default": {"minLength": 99}}}}, "points into instance data"),
+    "ref in allOf to nowhere": ({"type": "object", "allOf": [{"$ref": "#/$defs/missing"}]}, "unresolvable $ref"),
+    "dynamicRef": ({"type": "object", "properties": {"task_id": {"$dynamicRef": "#meta"}}}, "$dynamicRef is not"),
+    "nested $id": ({"type": "object", "properties": {"task_id": {"$id": "https://example.com/x", "type": "string"}}},
+                   "$id is supported only at the root"),
+    "required duplicates": ({"type": "object", "required": ["task_id", "task_id"]}, "task_id"),
+    "type duplicates": ({"type": "object", "properties": {"task_id": {"type": ["string", "string"]}}}, "string"),
+    "title number": ({"title": 5, "type": "object"}, "string"),
+    "$id number": ({"$id": 5, "type": "object"}, "string"),
+    "$id fragment": ({"$id": "https://example.com/s.json#frag", "type": "object"}, "without a fragment"),
+    "description list": ({"description": [], "type": "object"}, "string"),
+    "deprecated string": ({"deprecated": "yes", "type": "object"}, "boolean"),
+    "examples object": ({"examples": {}, "type": "object"}, "array"),
+    "repeat above bound": ({"type": "object", "properties": {"task_id": {"pattern": "(?:){2147483648}"}}},
+                           "above 65535"),
+    "nested repeats": ({"type": "object", "properties": {"task_id": {"pattern": "^((?:x){300}){300}$"}}},
+                       "force 90000 repetitions"),
+    "pattern in allOf": ({"type": "object", "allOf": [{"properties": {"task_id": {"pattern": "a{,3}"}}}]}, "pattern"),
+    "patternProperties": ({"type": "object", "properties": {"workspace": {"patternProperties": {"^b": {}}}}},
+                          "patternProperties is not supported"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(UNUSABLE_SCHEMAS))
+def test_handover_engines_agree_on_unusable_schemas(case, tmp_path):
+    schema_doc, needle = UNUSABLE_SCHEMAS[case]
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    schema = write_json(tmp_path / "s.json", schema_doc)
+    for engine in ["builtin"] + (["auto", "jsonschema"] if vh.have_jsonschema() else []):
+        r = tool("validate_handover", m, "--schema", schema, "--engine", engine, "--tasks", "")
+        assert r.returncode == 2 and r.stderr.startswith("validate_handover: ") and needle in r.stderr, \
+            (case, engine, r.stdout, r.stderr)
+        assert "Traceback" not in r.stderr and r.stdout == "", (case, engine)
+
+
+def test_handover_schema_precheck_and_references(tmp_path, monkeypatch):
+    for dialect in vh.DIALECTS:
+        vh.precheck_schema(dict(SCHEMA, **{"$schema": dialect}))
+    vh.precheck_schema({"type": "object"})                                       # no $schema: 2020-12
+    root = {"$defs": {"a/b": {"type": "string"}, "t~x": {"type": "integer"}, "sp ace": True},
+            "allOf": [{"type": "object"}], "prefixItems": [{"const": 1}]}
+    assert vh.resolve_ref(root, "#") is root and vh.resolve_ref(root, "#/$defs/a~1b") == {"type": "string"}
+    assert vh.resolve_ref(root, "#/$defs/t~0x") == {"type": "integer"} and vh.resolve_ref(root, "#/$defs/sp%20ace")
+    assert vh.resolve_ref(root, "#/allOf/0") == {"type": "object"}
+    for bad in ("#/allOf/1", "#/allOf/01", "#/allOf/-1", "#/allOf/x", "#/$defs/a~1b/type", "x#/a", "#a", 5, None):
+        with pytest.raises(vh.SchemaError):
+            vh.resolve_ref(root, bad)
+    nodes = list(vh.schema_nodes({"properties": {"a": {"items": [{"x": 1}], "not": {"y": 2}}},
+                                  "anyOf": [True, {"z": 3}], "const": {"q": 4}, "unknown": {"w": 5}}))
+    assert sorted(k for n in nodes for k in n if k in "xyzqw") == ["x", "y", "z"]
+    vh.precheck_schema({"$defs": {"a": {"type": "string"}}, "properties": {"x": {"$ref": "#/$defs/a"}},
+                        "items": {"$ref": "#"}})
+    # the jsonschema engine: any failure of jsonschema itself on the schema is an unusable schema
+    if vh.have_jsonschema():
+        import jsonschema
+
+        def boom(schema, *a, **k):
+            raise AttributeError("'int' object has no attribute 'decode'")
+        monkeypatch.setattr(jsonschema.validators, "validator_for", boom)
+        with pytest.raises(vh.SchemaError, match="jsonschema cannot check the schema: AttributeError"):
+            vh.jsonschema_check_schema({"type": "object"})
+        monkeypatch.undo()
+        vh.jsonschema_check_schema({"$id": "not a uri at all", "type": "object"})    # formats are not asserted
+        vh.jsonschema_check_schema(SCHEMA)
+
+
+def test_handover_engines_assert_the_same_formats(tmp_path):
+    """jsonschema asserted every format it knows (some only with optional packages); the built-in
+    engine only date-time. Now both assert date-time and treat the others as annotations."""
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    for fmt, valid in (("email", True), ("ipv4", True), ("uri", True), ("hostname", True), ("regex", True),
+                       ("date", True), ("date-time", False)):
+        schema = write_json(tmp_path / "s.json", {"type": "object", "properties": {"task_id": {"format": fmt}}})
+        for engine in ENGINES:
+            r = tool("validate_handover", m, "--schema", schema, "--engine", engine, "--tasks", "")
+            assert r.returncode == (0 if valid else 1), (fmt, engine, r.stdout, r.stderr)
+            errs = vh.schema_errors({"type": "string", "format": fmt}, "T05-governance(", engine)
+            assert (errs == []) is valid, (fmt, engine, errs)
+
+
+def test_ecma_repeat_bounds():
+    ok = ("x{65535}", "^(?:a{3}){3}$", "(?:x{255}){257}", "^a{0,65535}$", "(?:a*){65535}", "(?=a{9})a", "a{2}?b{3}",
+          "(x{65535})", "x{65535}y{65535}", "(?:(?:a){5}|b){5}",
+          "x{300}(?:(?:y)z){300}", "x{300}(?:y{2}z){300}", "(?:(?:x){0}){65535}", "(?:x+){65535}")
+    for pattern in ok:
+        vh.ecma_translate(pattern)
+    assert vh.ecma_regex("^(?:a{2}){3}$").search("a" * 6) and not vh.ecma_regex("^(?:a{2}){3}$").search("a" * 5)
+    for pattern, needle in (("x{65536}", "repeat count 65536"), ("x{0,65536}", "repeat count 65536"),
+                            ("x{65536,}", "repeat count 65536"), ("x{0000000000065535}", None),
+                            ("x{" + "9" * 5000 + "}", "repeat count 99999"), ("(?:x{256}){256}", "force 65536"),
+                            ("(?:(?:a){2}b){32768}", "force 65536"), ("(?:x+){2}(?:y{300}){300}", "force 90000"),
+                            ("(?=(?:x){300}){300}", "nothing to repeat"), ("((?:x){256}){256}", "force 65536"),
+                            ("(?:(?:x{300})z){300}", "force 90000"), ("((((x{2})))){40000}", "force 80000"),
+                            ("*", "nothing to repeat"), (")", "unbalanced")):
+        if needle is None:
+            vh.ecma_translate(pattern)
+            continue
+        with pytest.raises(re.error, match=re.escape(needle)):
+            vh.ecma_translate(pattern)
 
 
 def test_handover_cli_rejects_untranslatable_patterns(tmp_path):
@@ -817,7 +1009,7 @@ def test_golden_lock_rejects_unchecked_bytecode(tmp_path):
                        invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
     py_compile.compile(src, cfile=str(cache / "b.pyc"), doraise=True,
                        invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH)
-    (cache / "short.pyc").write_bytes(b"\x00\x00\x00\x00\x01")
+    (cache / "short.pyc").write_bytes(b"\x00\x00\x00\x00\x01\x00\x00")              # 7 bytes: no flags word
     assert tool("check_golden", "--root", root).returncode == 0
     planted = plant_pyc(tmp_path, NEUTRALISE, cache, "__init__")
     assert cg.unchecked_pyc(planted) and not cg.unchecked_pyc(cache / "b.pyc")
@@ -843,6 +1035,26 @@ def test_golden_lock_rejects_links(tmp_path):
     assert make_dir_link(root / "tests" / "golden", tmp_path / "real_golden")
     r = tool("check_golden", "--root", root)
     assert r.returncode == 1 and "LINK      tests/golden " in r.stdout, r.stdout
+    r = tool("check_golden", "--root", root, "--update", "--i-am-a-maintainer")
+    assert r.returncode == 2 and "refusing to lock through links: tests/golden" in r.stderr
+    assert cg.check(tmp_path / "real_golden")["errors"]                            # nothing was written there
+    # round 2: a link one level up, into a checkout whose lock matches (the base, in CI's workspace)
+    os.rmdir(root / "tests" / "golden") if os.name == "nt" else os.unlink(root / "tests" / "golden")
+    other = tmp_path / "other"
+    other.mkdir()
+    shutil.move(str(root / "tests"), str(other / "tests"))
+    shutil.move(str(tmp_path / "real_golden"), str(other / "tests" / "golden"))
+    assert cg.passed(cg.check(other))                                                # a consistent lock ...
+    assert make_dir_link(root / "tests", other / "tests")
+    assert (root / "tests" / "golden" / "MANIFEST.sha256").is_file()                 # ... reachable through it
+    res = cg.check(root)
+    assert res["links"] == ["tests"] and res["ok"] == [] and res["errors"] == [] and not cg.passed(res)
+    r = tool("check_golden", "--root", root, "--run")
+    assert r.returncode == 1 and "LINK      tests " in r.stdout and "golden suite" not in r.stdout, r.stdout
+    r = tool("check_golden", "--root", root, "--base-manifest", other / "tests" / "golden" / "MANIFEST.sha256")
+    assert r.returncode == 1 and "matches the base" not in r.stdout
+    r = tool("check_golden", "--root", root, "--update", "--i-am-a-maintainer")
+    assert r.returncode == 2 and "refusing to lock through links: tests" in r.stderr
 
 
 def test_golden_stage_copies_only_locked_files(tmp_path):
@@ -937,6 +1149,1159 @@ def test_golden_run_refuses_a_broken_lock(tmp_path):
     (root / "tests" / "golden" / "test_gold.py").write_text(GOLDEN_DEMO + "\n# edit\n", encoding="utf-8")
     r = tool("check_golden", "--root", root, "--run")
     assert r.returncode == 1 and "MODIFIED" in r.stdout and "golden suite" not in r.stdout
+
+
+# ------------------------------------- golden lock against the base revision (CI: golden.yml)
+GUTTED = "def test_answer():\n    pass\n"
+WORKFLOWS = ROOT / ".github" / "workflows"
+needs_git = pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
+
+
+def relock(root):
+    """What anyone can do: the maintainer confirmation of --update is an honour system."""
+    r = tool("check_golden", "--root", root, "--update", env={"HEARTH_MAINTAINER": "1"})
+    assert r.returncode == 0, r.stderr
+
+
+def test_golden_base_comparison(tmp_path):
+    root = golden_demo_repo(tmp_path)
+    g = root / "tests" / "golden"
+    manifest = g / "MANIFEST.sha256"
+    base_bytes = manifest.read_bytes()
+    base = tmp_path / "base-MANIFEST.sha256"
+    base.write_bytes(base_bytes)
+
+    def against_base(*extra):
+        return tool("check_golden", "--root", root, "--base-manifest", base, *extra)
+
+    def reset():
+        for p in g.glob("test_*.py"):
+            p.unlink()
+        (g / "test_gold.py").write_text(GOLDEN_DEMO, encoding="utf-8")
+        manifest.write_bytes(base_bytes)
+
+    r = against_base()
+    assert r.returncode == 0 and "golden lock matches the base revision (1 file(s)" in r.stdout, r.stdout
+    manifest.write_bytes(base_bytes.replace(b"\n", b"\r\n"))                  # a CRLF checkout is no change
+    assert against_base().returncode == 0
+    reset()
+    (g / "test_gold.py").write_text(GUTTED, encoding="utf-8")
+    relock(root)
+    assert tool("check_golden", "--root", root).returncode == 0              # the change's own lock agrees
+    r = against_base()
+    assert r.returncode == 1, r.stdout
+    assert "RELOCKED  tests/golden/MANIFEST.sha256 differs from the base revision's" in r.stdout
+    assert "MODIFIED  tests/golden/test_gold.py  (against the base revision's lock)" in r.stdout
+    assert "(1 modified, 0 removed, 0 added, manifest changed; base: " in r.stdout and "golden-reviewed" in r.stdout
+    r = against_base("--acknowledged")
+    assert r.returncode == 0 and "acknowledged by a maintainer" in r.stdout and "golden lock OK" in r.stdout
+    r = against_base("--run")
+    assert r.returncode == 1 and "golden suite" not in r.stdout             # never runs the re-locked suite
+    r = against_base("--run", "--acknowledged")
+    assert r.returncode == 0 and "golden suite OK: 1 passed" in r.stdout, r.stdout   # the change's own lock
+    reset()
+    manifest.write_bytes(base_bytes + b"# reviewed\n")                        # the manifest alone
+    r = against_base()
+    assert r.returncode == 1 and "RELOCKED" in r.stdout and "(0 modified, 0 removed, 0 added, manifest changed" \
+        in r.stdout, r.stdout
+    reset()
+    (g / "test_new.py").write_text("def test_new():\n    pass\n", encoding="utf-8")
+    relock(root)
+    r = against_base()
+    assert r.returncode == 1 and "ADDED     tests/golden/test_new.py" in r.stdout, r.stdout
+    reset()
+    (g / "test_gold.py").unlink()
+    (g / "test_other.py").write_text(GOLDEN_DEMO, encoding="utf-8")
+    relock(root)
+    r = against_base()
+    assert r.returncode == 1 and "REMOVED   tests/golden/test_gold.py" in r.stdout and "ADDED" in r.stdout
+    reset()
+    (g / "test_gold.py").write_text(GUTTED, encoding="utf-8")                # not re-locked: the own lock fails
+    r = against_base()
+    assert r.returncode == 1 and "golden lock BROKEN" in r.stdout and "against the base" not in r.stdout
+    reset()
+    assert against_base("-q").stdout == ""
+
+
+def test_golden_compare_base_and_arguments(tmp_path):
+    root = golden_demo_repo(tmp_path)
+    g = root / "tests" / "golden"
+    base_text = (g / "MANIFEST.sha256").read_text(encoding="utf-8")
+    res = cg.check(root)
+    same = {"manifest_changed": False, "modified": [], "removed": [], "added": []}
+    assert cg.compare_base(root, res, base_text) == same and not cg.changed(same)
+    for k in same:
+        assert cg.changed(dict(same, **{k: True if k == "manifest_changed" else ["x"]})), k
+    assert cg.compare_base(root, res, None) == dict(same, manifest_changed=True, added=["tests/golden/test_gold.py"])
+    other = "0" * 64 + "  tests/golden/test_gold.py\n" + "1" * 64 + "  tests/golden/gone.py\n"
+    assert cg.compare_base(root, res, other) == {"manifest_changed": True, "modified": ["tests/golden/test_gold.py"],
+                                                 "removed": ["tests/golden/gone.py"], "added": []}
+    (g / "MANIFEST.sha256").unlink()
+    assert cg.compare_base(root, res, base_text) == dict(same, manifest_changed=True)
+    bad = tmp_path / "bad.sha256"
+    bad.write_text("not a manifest\n", encoding="utf-8")
+    binary = tmp_path / "binary.sha256"
+    binary.write_bytes(b"\xff\xfe")
+    for args, needle in ((["--acknowledged"], "--acknowledged needs"),
+                         (["--base-manifest", tmp_path / "none"], "base manifest"),
+                         (["--base-manifest", bad], "base manifest"), (["--base-manifest", binary], "base manifest")):
+        r = tool("check_golden", "--root", root, *args)
+        assert r.returncode == 2 and needle in r.stderr, (args, r.stderr)
+    r = tool("check_golden", "--root", root, "--update", "--i-am-a-maintainer", "--base-manifest", bad)
+    assert r.returncode == 2 and "does not take a base" in r.stderr
+    r = tool("check_golden", "--root", root, "--base-manifest", bad, "--base-rev", "HEAD")
+    assert r.returncode == 2 and "not allowed with" in r.stderr
+    nogit = tmp_path / "nogit"
+    nogit.mkdir()
+    with pytest.raises(cg.ManifestError):
+        cg.base_manifest_at(nogit, "HEAD")
+    for rev in ("-x", ""):
+        with pytest.raises(cg.ManifestError, match="is not a revision"):
+            cg.base_manifest_at(root, rev)
+
+
+def export_rev(repo: Path, rev: str, dst: Path) -> Path:
+    """The tree of a revision, as a CI checkout would have it."""
+    import io
+    import tarfile
+    r = subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", rev], capture_output=True, timeout=120)
+    assert r.returncode == 0, r.stderr
+    with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+        tf.extractall(dst, **({"filter": "data"} if hasattr(tarfile, "data_filter") else {}))
+    return dst
+
+
+def git_golden_repo(tmp_path) -> Path:
+    """The demo golden suite, its lock and governance/tools/{check_golden,path_aliases}.py, committed
+    and tagged 'base'."""
+    root = golden_demo_repo(tmp_path)
+    (root / "governance" / "tools").mkdir(parents=True)
+    for name in ("check_golden.py", "path_aliases.py"):
+        shutil.copyfile(TOOLS / name, root / "governance" / "tools" / name)
+    for args in (("init", "-q"), ("add", "-A"), ("commit", "-q", "-m", "base"), ("tag", "base"),
+                 ("checkout", "-q", "-b", "pr")):
+        r = _git(*args, cwd=root)
+        assert r.returncode == 0, (args, r.stderr)
+    return root
+
+
+def workflow_text(name: str, code_only: bool = False) -> str:
+    text = (WORKFLOWS / name).read_text(encoding="utf-8")
+    if not code_only:
+        return text
+    return "\n".join(line.split(" #")[0] for line in text.splitlines() if not line.lstrip().startswith("#"))
+
+
+def workflow_env(name: str, step: str) -> dict:
+    """The env: block of the step named `step`."""
+    lines = workflow_text(name).splitlines()
+    i = next(k for k, line in enumerate(lines) if line.strip() == f"- name: {step}")
+    out = {}
+    for line in lines[i + 1:]:
+        if line.strip().startswith(("- ", "run:")):
+            break
+        m = re.fullmatch(r"\s+([A-Z_]+): (.+)", line)
+        if m:
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def workflow_run(name: str, step: str) -> str:
+    """The command of the step named `step`, joined into one line as YAML folds `run: >`."""
+    lines = workflow_text(name).splitlines()
+    i = next(k for k, line in enumerate(lines) if line.strip() == f"- name: {step}")
+    j = next(k for k in range(i + 1, len(lines)) if lines[k].strip().startswith("run:"))
+    head = lines[j].split("run:", 1)[1].strip()
+    if head not in (">", "|"):
+        return head
+    indent = len(lines[j]) - len(lines[j].lstrip())
+    body = []
+    for line in lines[j + 1:]:
+        if line.strip() and len(line) - len(line.lstrip()) <= indent:
+            break
+        body.append(line.strip())
+    return " ".join(x for x in body if x)
+
+
+def run_workflow_command(cmd: str, workspace: Path, ack: bool, head: str = "", url: str = "", pr: str = ""):
+    """A workflow's `python ...` command line, run where the workflow's checkouts would be."""
+    for var, value in (("$ACK", "--acknowledged" if ack else ""), ('"$HEAD_SHA"', head), ('"$REPO_URL"', url),
+                       ('"$PR_NUMBER"', pr)):
+        cmd = cmd.replace(var, shlex.quote(value) if value else value)
+    argv = shlex.split(cmd)
+    assert argv[0] == "python", cmd
+    return subprocess.run([sys.executable, *argv[1:]], cwd=workspace, capture_output=True, text=True, timeout=300)
+
+
+def git_rev(repo: Path, rev: str = "HEAD") -> str:
+    r = _git("rev-parse", "--verify", f"{rev}^{{commit}}", cwd=repo)
+    assert r.returncode == 0, r.stderr
+    return r.stdout.strip()
+
+
+def git_commit(repo: Path, msg: str, *paths) -> str:
+    """Commits the given paths (everything with none) and returns the commit id."""
+    r = _git("add", *(paths or ("-A",)), cwd=repo)
+    assert r.returncode == 0, r.stderr
+    r = _git("commit", "-q", "-m", msg, cwd=repo)
+    assert r.returncode == 0, r.stderr
+    return git_rev(repo)
+
+
+def git_special_entry(repo: Path, path: str, target: str, mode: str = "120000") -> None:
+    """Stages a symbolic link to `target` (mode 120000) or a submodule at commit `target`
+    (mode 160000) at `path`, in the index only: no privilege needed for links on Windows."""
+    oid = target
+    if mode == "120000":
+        oid = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=target,
+                             capture_output=True, text=True, timeout=60).stdout.strip()
+    r = _git("update-index", "--add", "--cacheinfo", f"{mode},{oid},{path}", cwd=repo)
+    assert r.returncode == 0, r.stderr
+
+
+def clone_at(repo: Path, rev: str, dst: Path, depth: int = 0) -> Path:
+    """A checkout as actions/checkout leaves one: its own .git, HEAD detached at rev
+    (depth 1: a shallow fetch, as of a ref; rev must then be a branch tip)."""
+    sha = git_rev(repo, rev)
+    src = repo.resolve().as_uri() if depth else str(repo)
+    extra = ["--depth", str(depth), "--no-single-branch"] if depth else []
+    r = _git("clone", "-q", "--no-checkout", *extra, src, str(dst), cwd=repo.parent)
+    assert r.returncode == 0, r.stderr
+    r = _git("checkout", "-q", "--detach", sha, cwd=dst)
+    assert r.returncode == 0, r.stderr
+    return dst
+
+
+def rmtree_force(path: Path) -> None:
+    """shutil.rmtree that also removes read-only files (git's objects on Windows)."""
+    def retry(func, p, _exc):
+        os.chmod(p, 0o700)
+        func(p)
+    shutil.rmtree(path, **({"onexc": retry} if sys.version_info >= (3, 12) else {"onerror": retry}))
+
+
+def _rmlink(p: Path) -> None:
+    if os.path.isdir(p) and not os.path.islink(p):
+        os.rmdir(p)                       # a junction
+    else:
+        os.unlink(p)
+
+
+def dir_link_as_checked_out(link: Path, target: Path) -> bool:
+    """A committed link to a directory: git's own checkout of it where that resolves (POSIX), else
+    (Windows without symlink rights checks out a plain file) a symlink or junction made here."""
+    if os.path.isdir(link):
+        return True
+    if os.path.lexists(link):
+        _rmlink(link)
+    return make_dir_link(link, target)
+
+
+@needs_git
+def test_golden_change_that_relocks_itself_fails_against_the_base(tmp_path):
+    """The council's round-1 reproduction, as a pull request against a base branch."""
+    root = git_golden_repo(tmp_path)
+    (root / "tests" / "golden" / "test_gold.py").write_text(GUTTED, encoding="utf-8")
+    relock(root)
+    weakened = "import sys\nprint('golden lock OK')\nsys.exit(0)\n"          # the change weakens its own tool too
+    (root / "governance" / "tools" / "check_golden.py").write_text(weakened, encoding="utf-8")
+    assert _git("commit", "-q", "-am", "gut the golden test and re-lock it", cwd=root).returncode == 0
+    # the hole: the change is consistent with its own lock and the gutted suite passes
+    assert tool("check_golden", "--root", root).returncode == 0
+    r = tool("check_golden", "--root", root, "--run")
+    assert r.returncode == 0 and "golden suite OK: 1 passed" in r.stdout, r.stdout
+    # against the base revision's lock it fails, before anything runs
+    r = tool("check_golden", "--root", root, "--base-rev", "base", "--run")
+    assert r.returncode == 1 and "RELOCKED" in r.stdout and "MODIFIED  tests/golden/test_gold.py" in r.stdout
+    assert "base: tests/golden/MANIFEST.sha256 at base" in r.stdout and "golden suite" not in r.stdout
+    r = tool("check_golden", "--root", root, "--base-rev", "base", "--acknowledged")
+    assert r.returncode == 0 and "acknowledged by a maintainer" in r.stdout
+    assert tool("check_golden", "--root", root, "--base-rev", "pr").returncode == 0      # same revision
+    # golden.yml, as GitHub would run it: tool and lock from the base, the change as git objects only
+    ws = tmp_path / "ws"
+    clone_at(root, "base", ws / "base")
+    clone_at(root, "pr", ws / "pr")
+    gate = workflow_run("golden.yml", "Golden lock against the base revision")
+    r = run_workflow_command(gate, ws, ack=False)
+    assert r.returncode == 1 and "golden tests CHANGED against the base" in r.stdout, r.stdout + r.stderr
+    assert run_workflow_command(gate, ws, ack=True).returncode == 0
+    own = subprocess.run([sys.executable, "-E", str(ws / "pr" / "governance" / "tools" / "check_golden.py")],
+                         capture_output=True, text=True, timeout=60)
+    assert own.returncode == 0                                # why the gate never uses the change's tool
+    # a change that leaves tests/golden alone passes the gate
+    _git("checkout", "-q", "-b", "harmless", "base", cwd=root)
+    (root / "README.txt").write_text("docs only\n", encoding="utf-8")
+    git_commit(root, "docs")
+    rmtree_force(ws / "pr")
+    clone_at(root, "harmless", ws / "pr")
+    r = run_workflow_command(gate, ws, ack=False)
+    assert r.returncode == 0 and "golden lock matches the base revision" in r.stdout, r.stdout + r.stderr
+    assert "change: " in r.stdout and " at HEAD (" in r.stdout
+
+
+@needs_git
+def test_golden_gate_never_follows_a_linked_tests_directory(tmp_path):
+    """Verifier round 2: the change replaces tests/ with an absolute link to $WS/base/tests and
+    carries its gutted, re-locked suite in base/tests/. Both workflows' layouts resolve the link
+    to a lock that matches: the base checkout (golden.yml) or the change's own copy (ci.yml)."""
+    root = git_golden_repo(tmp_path)
+    ws = tmp_path / "ws"
+    _git("checkout", "-q", "-b", "linked", "base", cwd=root)
+    own = root / "base" / "tests" / "golden"
+    own.mkdir(parents=True)
+    (own / "__init__.py").write_text("", encoding="utf-8")
+    (own / "test_gold.py").write_text(GUTTED, encoding="utf-8")
+    relock(root / "base")
+    assert _git("rm", "-rq", "tests", cwd=root).returncode == 0
+    git_special_entry(root, "tests", str(ws / "base" / "tests"))
+    linked = git_commit(root, "move tests", "base")
+    assert _git("ls-tree", linked, "tests", cwd=root).stdout.startswith("120000 blob")
+    # golden.yml: base/ is the base branch, pr/ the change; pr/tests leads to base/tests
+    clone_at(root, "base", ws / "base")
+    clone_at(root, "linked", ws / "pr")
+    if not dir_link_as_checked_out(ws / "pr" / "tests", ws / "base" / "tests"):
+        pytest.skip("cannot create a symbolic link or junction here")
+    assert (ws / "pr" / "tests" / "golden" / "MANIFEST.sha256").is_file()           # the link works ...
+    r = tool("check_golden", "--root", ws / "pr", "--base-manifest", ws / "base" / "tests" / "golden" / "MANIFEST.sha256")
+    assert r.returncode == 1 and "LINK      tests " in r.stdout                     # ... and is refused
+    gate = workflow_run("golden.yml", "Golden lock against the base revision")
+    for ack in (False, True):                                    # no label makes a link acceptable
+        r = run_workflow_command(gate, ws, ack=ack)
+        assert r.returncode == 1 and "LINK      tests  (symbolic links" in r.stdout, r.stdout + r.stderr
+        assert "golden lock OK" not in r.stdout and "matches the base" not in r.stdout
+    # ci.yml: the change is checked out at the workspace root, so the link leads to its own base/tests
+    _rmlink(ws / "pr" / "tests")
+    rmtree_force(ws)
+    clone_at(root, "linked", ws)
+    assert dir_link_as_checked_out(ws / "tests", ws / "base" / "tests")
+    assert (ws / "tests" / "golden" / "test_gold.py").read_text(encoding="utf-8") == GUTTED
+    shutil.copytree(TOOLS, ws / ".trusted" / "governance" / "tools", ignore=shutil.ignore_patterns("__pycache__"))
+    assert cg.passed(cg.check(ws / "base"))                      # the change's own copy is consistent
+    for step in ("Golden-test lock (INV-VERIFY)", "Golden tests, isolated (INV-VERIFY)"):
+        r = run_workflow_command(workflow_run("ci.yml", step), ws, ack=False)
+        assert r.returncode == 1 and "LINK      tests  (symbolic links" in r.stdout, (step, r.stdout, r.stderr)
+        assert "golden suite" not in r.stdout
+    _rmlink(ws / "tests")
+
+
+@needs_git
+def test_golden_rev_reads_git_objects_only(tmp_path):
+    root = git_golden_repo(tmp_path)
+    head = git_rev(root)
+    g = "tests/golden"
+    base_manifest = root / g / "MANIFEST.sha256"
+    base_text = base_manifest.read_text(encoding="utf-8")
+    r = tool("check_golden", "--root", root, "--rev", "HEAD", "--base-manifest", base_manifest)
+    assert r.returncode == 0 and f" at HEAD ({head[:12]})" in r.stdout, r.stdout
+    # the working tree is not read: gutting it changes nothing, and the commit is what is judged
+    (root / g / "test_gold.py").write_text(GUTTED, encoding="utf-8")
+    shutil.rmtree(root / "governance")
+    assert tool("check_golden", "--root", root).returncode == 1
+    assert tool("check_golden", "--root", root, "--rev", "HEAD").returncode == 0
+    _git("checkout", "-q", "-f", "--", ".", cwd=root)
+    res = cg.check(cg.Revision(root, "HEAD"))
+    assert cg.passed(res) and res["ok"] == [f"{g}/test_gold.py"] and res["inits"] == [f"{g}/__init__.py"]
+
+    def case():
+        assert _git("checkout", "-q", "-f", "-B", "case", "base", cwd=root).returncode == 0
+
+    def judged(rev):
+        src = cg.Revision(root, rev)
+        res = cg.check(src)
+        return res, (cg.compare_base(src, res, base_text) if cg.passed(res) else None)
+
+    # links and submodules in the tree, at every level (index-only entries: no privilege needed)
+    for path in ("tests", g, f"{g}/more", f"{g}/MANIFEST.sha256"):
+        for mode in ("120000", "160000"):
+            case()
+            if path != f"{g}/more":
+                assert _git("rm", "-rq", "--cached", path, cwd=root).returncode == 0
+            git_special_entry(root, path, head if mode == "160000" else "../elsewhere", mode)
+            assert _git("commit", "-q", "-m", f"{path} {mode}", cwd=root).returncode == 0
+            res, _ = judged("HEAD")
+            assert res["links"] == [path] and not cg.passed(res), (path, mode, res)
+            assert res["ok"] == [] or path == f"{g}/more", (path, mode, res)
+    r = tool("check_golden", "--root", root, "--rev", "HEAD")       # the manifest itself is a submodule
+    assert r.returncode == 2 and f"LINK      {g}/MANIFEST.sha256" in r.stdout and "not found" in r.stdout
+    # a file where the directory belongs: there is no golden suite
+    case()
+    _git("rm", "-rq", "tests", cwd=root)
+    (root / "tests").write_text("not a directory\n", encoding="utf-8")
+    res, _ = judged(git_commit(root, "tests is a file"))
+    assert res["links"] == [] and res["errors"] and "not found" in res["errors"][0]
+    assert tool("check_golden", "--root", root, "--rev", "HEAD").returncode == 2
+    # committed bytecode, __init__ files, extra and modified files
+    case()
+    planted = plant_pyc(tmp_path, NEUTRALISE, root / g / "__pycache__", "x")
+    (root / g / "__pycache__" / "plain.txt").write_text("abcdefgh\n", encoding="utf-8")   # byte 4 looks unchecked
+    (root / g / "sub").mkdir()
+    (root / g / "sub" / "__init__.py").write_text("import os\n", encoding="utf-8")
+    (root / g / "__init__.py").write_text("\n", encoding="utf-8")                    # whitespace only: exempt
+    _git("add", "-f", "-A", cwd=root)                                               # past any global gitignore
+    res, _ = judged(git_commit(root, "extras"))
+    assert res["bytecode"] == [f"{g}/__pycache__/{planted.name}"] and res["unlisted"] == [f"{g}/sub/__init__.py"]
+    assert res["inits"] == [f"{g}/__init__.py"] and res["links"] == [] and not cg.passed(res)
+    case()
+    (root / g / "test_gold.py").write_text(GUTTED, encoding="utf-8")
+    relock(root)
+    res, delta = judged(git_commit(root, "relocked"))
+    assert cg.passed(res) and delta["manifest_changed"] and delta["modified"] == [f"{g}/test_gold.py"]
+    r = tool("check_golden", "--root", root, "--rev", "HEAD", "--base-rev", "base")
+    assert r.returncode == 1 and "RELOCKED" in r.stdout
+    # arguments
+    for args, needle in ((["--rev", "HEAD", "--run"], "--rev reads git objects"),
+                         (["--rev", "HEAD", "--update", "--i-am-a-maintainer"], "--rev reads git objects"),
+                         (["--rev", "no-such-rev"], "is not a commit"), (["--rev=-x"], "is not a revision")):
+        r = tool("check_golden", "--root", root, *args)
+        assert r.returncode == 2 and needle in r.stderr, (args, r.stderr)
+    r = tool("check_golden", "--root", root / "tests", "--rev", "HEAD")          # would read the parent repo
+    assert r.returncode == 2 and "is not the top level of a git checkout" in r.stderr
+    nogit = tmp_path / "nogit"
+    nogit.mkdir()
+    with pytest.raises(cg.ManifestError, match="is not the top level"):
+        cg.Revision(nogit, "HEAD")
+
+
+@needs_git
+def test_golden_base_rev_edge_cases(tmp_path):
+    root = git_golden_repo(tmp_path)
+    r = tool("check_golden", "--root", root, "--base-rev", "no-such-rev")
+    assert r.returncode == 2 and "is not a commit" in r.stderr
+    r = tool("check_golden", "--root", root, "--base-rev", "--version")
+    assert r.returncode == 2
+    blob = _git("rev-parse", "base:tests/golden/test_gold.py", cwd=root).stdout.strip()
+    r = tool("check_golden", "--root", root, "--base-rev", blob)                       # a blob is not a commit
+    assert r.returncode == 2 and "is not a commit" in r.stderr
+    _git("checkout", "-q", "--orphan", "empty", cwd=root)                               # a base without golden tests
+    _git("rm", "-rq", "--cached", "tests", cwd=root)
+    assert _git("commit", "-q", "--allow-empty", "-m", "nothing locked", cwd=root).returncode == 0
+    assert cg.base_manifest_at(root, "empty") is None
+    assert [rel for _, rel in cg.parse_manifest(cg.base_manifest_at(root, "base"))] == ["tests/golden/test_gold.py"]
+    r = tool("check_golden", "--root", root, "--base-rev", "empty")
+    assert r.returncode == 1 and "NO BASE" in r.stdout and "ADDED     tests/golden/test_gold.py" in r.stdout
+
+
+MERGE_STEP = "Merge commit of this event's head into this base (git objects only)"
+
+
+def test_golden_and_decision_gates_never_execute_the_pull_request():
+    for name, tool_name in (("golden.yml", "check_golden.py"), ("decisions.yml", "adr.py")):
+        text, code = workflow_text(name), workflow_text(name, code_only=True)
+        # verifier round 3: pull_request_target runs the default branch's copy with github.sha at its head,
+        # whatever the base, so the gates judge pull requests into main (the default branch) only
+        assert re.search(r"^on:\n  pull_request_target:\n    branches: \[main\]\n    types: \[opened, synchronize, "
+                         r"reopened, labeled, unlabeled\]\n", text, re.M), name
+        assert re.search(r"^permissions:\n  contents: read\n", text, re.M), name
+        assert "the head of main, the default branch" in text and "base branch head" not in text, name
+        # the base is the only checkout: actions/checkout refuses fork pull requests here (round 3), and the
+        # gates never write the pull request to disk
+        assert code.count("uses: actions/checkout@v4") == code.count("persist-credentials: false") == 1, name
+        assert [r.strip() for r in re.findall(r"^\s+ref: (.*)$", code, re.M)] == ["${{ github.sha }}"], name
+        assert "refs/pull" not in code and "allow-unsafe-pr-checkout" not in code, name
+        assert code.count("fetch-depth: 0") == 1, name
+        runs = [line.split("run:", 1)[1].strip() for line in code.splitlines() if line.strip().startswith("run:")]
+        assert len(runs) == 2, name
+        for banned in ("pip", "pytest", "--run", "cmake", "secrets", "npm", "make ", "cache", "PYTHONPATH"):
+            assert banned not in code, (name, banned)
+        assert workflow_run(name, MERGE_STEP) == ('python -I -S base/governance/tools/merge_ref.py --fetch "$REPO_URL" '
+                                                  '--pr "$PR_NUMBER" --merge pr --head "$HEAD_SHA" --base base'), name
+        assert workflow_env(name, MERGE_STEP) == {
+            "REPO_URL": "${{ github.server_url }}/${{ github.repository }}",
+            "PR_NUMBER": "${{ github.event.pull_request.number }}",
+            "HEAD_SHA": "${{ github.event.pull_request.head.sha }}", "GITHUB_TOKEN": "${{ github.token }}"}, name
+        assert code.count("github.token") == 1, name                           # the fetch alone gets the token
+        assert code.index("merge_ref.py") < code.index(tool_name), name        # nothing is judged before it
+    gate = workflow_run("golden.yml", "Golden lock against the base revision")
+    assert gate == ("python -I -S base/governance/tools/check_golden.py --root pr --rev HEAD "
+                    "--base-manifest base/tests/golden/MANIFEST.sha256 $ACK")
+    assert "contains(github.event.pull_request.labels.*.name, 'golden-reviewed') && '--acknowledged'" \
+        in workflow_text("golden.yml")
+    assert workflow_run("decisions.yml", "Decision circuit breaker") == \
+        "python -I -S base/governance/tools/adr.py breaker --root pr --rev HEAD --base-root base $ACK"
+    assert "contains(github.event.pull_request.labels.*.name, 'decisions-reviewed') && '--acknowledged'" \
+        in workflow_text("decisions.yml")
+
+
+
+def test_ci_runs_governance_tools_from_the_base_revision():
+    code = workflow_text("ci.yml", code_only=True)
+    for m in re.finditer(r"\S*governance/tools/\w+\.py", code):              # never the change's own tools ...
+        assert m.group().startswith(".trusted/governance/tools/"), m.group()
+    calls = re.findall(r"python -I -S \.trusted/governance/tools/(\w+)\.py", code)   # ... and isolated, no site
+    assert sorted(calls) == ["adr", "check_golden", "check_golden", "check_golden", "check_golden",
+                             "validate_handover", "waves"], calls
+    assert "GOV_TOOLS" not in code and "t=governance/tools" not in code       # no fallback to the change's copy
+    assert re.findall(r"python (?:-\w+ )*-m pip", code) == re.findall(r"python -I -m pip", code) != []
+    jobs = re.split(r"\n  (?=[a-z][a-z0-9-]*:\n)", code.split("\njobs:\n", 1)[1])
+    trusted = [j for j in jobs if "path: .trusted" in j]
+    assert len(trusted) == 4
+    for job in trusted:          # whatever the change put at .trusted is gone before the base is checked out
+        assert job.index("run: rm -rf .trusted") < job.index("path: .trusted") < job.index("pip install")
+    gov = next(j for j in jobs if j.lstrip().startswith("governance:"))
+    first_change_code = gov.index("pip install")                  # nothing from the change has run before it
+    for step in ("Golden-test lock (INV-VERIFY)", "Task DAG", "Handover manifests", "Decision records"):
+        assert gov.index(f"- name: {step}") < first_change_code, step
+        cmd = workflow_run("ci.yml", step)
+        assert cmd.startswith("python -I -S .trusted/governance/tools/"), cmd
+        cmd = cmd.replace(".trusted/governance/tools", shlex.quote(TOOLS.as_posix()))
+        r = run_workflow_command(cmd, ROOT, ack=False)
+        assert r.returncode == 0, (step, r.stdout[-2000:], r.stderr[-2000:])
+    for job in trusted[1:]:      # build jobs: the golden run comes last; the change's code ran before it
+        assert job.index("pytest tests/py") < job.index("check_golden.py --root . --run")
+
+
+
+def write_decisions(root: Path, files: dict, inv: str = None) -> None:
+    inv = INV_BASE if inv is None else inv
+    d = root / "governance" / "decisions"
+    if d.exists():
+        shutil.rmtree(d)
+    d.mkdir(parents=True)
+    for n, text in files.items():
+        (d / n).write_text(text, encoding="utf-8")
+    (root / "governance" / "INVARIANTS.md").write_text(inv, encoding="utf-8")
+
+
+@needs_git
+def test_decisions_gate_as_the_workflow_runs_it(tmp_path):
+    base = adr_files(8)
+    retired = {n: adr_text(i, status="Deprecated") for i, n in enumerate(sorted(base), 1)}
+    shadowed = dict(retired, **{f"ADR-{i:04d}-zz-shadow.md": adr_text(i) for i in range(1, 9)})
+    repo, ws = tmp_path / "repo", tmp_path / "ws"
+    write_decisions(repo, base)
+    assert _git("init", "-q", cwd=repo).returncode == 0
+    git_commit(repo, "base")
+    _git("tag", "base", cwd=repo)
+    clone_at(repo, "base", ws / "base")                          # the trusted side: tools, decisions, invariants
+    shutil.copytree(TOOLS, ws / "base" / "governance" / "tools", ignore=shutil.ignore_patterns("__pycache__"))
+    cmd = workflow_run("decisions.yml", "Decision circuit breaker")
+
+    def change(build):
+        _git("checkout", "-q", "-f", "-B", "change", "base", cwd=repo)
+        build()
+        assert _git("commit", "-q", "-m", "change", cwd=repo).returncode == 0
+        if (ws / "pr").exists():
+            rmtree_force(ws / "pr")
+        clone_at(repo, "change", ws / "pr")
+
+    change(lambda: (write_decisions(repo, shadowed), _git("add", "-A", cwd=repo)))
+    r = run_workflow_command(cmd, ws, ack=False)
+    assert r.returncode == 1 and "duplicate ADR id(s)" in r.stdout and "8 of 8" in r.stdout, r.stdout + r.stderr
+    assert run_workflow_command(cmd, ws, ack=True).returncode == 0
+    write_decisions(ws / "pr", base)                             # the working tree is not what is judged
+    assert run_workflow_command(cmd, ws, ack=False).returncode == 1
+    # verifier round 2: governance/ becomes an absolute link to $WS/base/governance, and the change's
+    # real records (every decision deprecated, the invariants gutted) live in base/governance/
+    gutted = "# Invariants\n\nNone.\n"
+
+    def linked():
+        assert _git("rm", "-rq", "governance", cwd=repo).returncode == 0
+        write_decisions(repo / "base", retired, gutted)
+        _git("add", "base", cwd=repo)
+        git_special_entry(repo, "governance", str(ws / "base" / "governance"))
+
+    change(linked)
+    if not dir_link_as_checked_out(ws / "pr" / "governance", ws / "base" / "governance"):
+        pytest.skip("cannot create a symbolic link or junction here")
+    assert (ws / "pr" / "governance" / "decisions" / "ADR-0001-d1.md").read_text(encoding="utf-8") == base[
+        "ADR-0001-d1.md"]                                         # through the link: the base's records
+    for ack in (False, True):
+        r = run_workflow_command(cmd, ws, ack=ack)
+        assert r.returncode == 1 and "governance is not a directory at HEAD (mode 120000)" in r.stdout, r.stdout
+        assert "decision breaker OK" not in r.stdout
+        r = tool("adr", "breaker", "--root", ws / "pr", "--base-root", ws / "base", *(["--acknowledged"] * ack))
+        assert r.returncode == 1 and "governance is a symbolic link or junction" in r.stdout, r.stdout
+    control = tmp_path / "control"
+    write_decisions(control, retired, gutted)                    # the same content as plain files
+    r = tool("adr", "breaker", "--root", control, "--base-root", ws / "base")
+    assert r.returncode == 1 and "8 of 8" in r.stdout and "INVARIANTS.md changed" in r.stdout
+    _rmlink(ws / "pr" / "governance")
+
+
+
+def test_codeowners_cover_the_verification_paths():
+    rules = {}
+    for line in (ROOT / ".github" / "CODEOWNERS").read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        path, *owners = line.split()
+        assert owners and all(re.fullmatch(r"@[A-Za-z0-9-]+(/[A-Za-z0-9_.-]+)?", o) for o in owners), line
+        assert path.startswith("/") and path not in rules, line
+        rules[path] = owners
+    for path in ("/tests/golden/", "/governance/INVARIANTS.md", "/governance/tools/", "/.github/",
+                 "/governance/schemas/", "/governance/decisions/"):
+        assert path in rules, path
+    # verifier round 3: the modules tests/golden takes its expected values from are code-owned, as is
+    # everything they import from the package (the engine binding is the code under test)
+    for module in golden_oracle_modules():
+        assert f"/python/hearth/{module}.py" in rules, module
+
+
+def _hearth_imports(path: Path) -> set:
+    """Modules of the hearth package that a file imports (absolute or relative, at any depth)."""
+    import ast
+    out = set()
+    for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+        if isinstance(node, ast.ImportFrom):
+            mod = node.module or ""
+            if (node.level == 1 and not mod) or (node.level == 0 and mod == "hearth"):   # from . / hearth import x
+                out.update(a.name for a in node.names)
+            elif node.level == 1:                                                       # from .x import y
+                out.add(mod.split(".")[0])
+            elif node.level == 0 and mod.startswith("hearth."):                         # from hearth.x import y
+                out.add(mod.split(".")[1])
+        elif isinstance(node, ast.Import):
+            out.update(a.name.split(".")[1] for a in node.names if a.name.startswith("hearth."))
+    return out
+
+
+def golden_oracle_modules() -> list:
+    """What the golden suite's expectations depend on: what tests/golden imports from hearth, minus the
+    code under test (engine, _native), closed over the package's own imports, plus __init__."""
+    under_test = {"engine", "_native"}
+    todo = set().union(*(_hearth_imports(f) for f in (ROOT / "tests" / "golden").glob("*.py"))) - under_test
+    seen = {"__init__"}
+    while todo:
+        mod = todo.pop()
+        seen.add(mod)
+        todo |= _hearth_imports(ROOT / "python" / "hearth" / f"{mod}.py") - under_test - seen
+    return sorted(seen)
+
+
+def merge_ref_repo(tmp_path) -> tuple:
+    """b0 -> b1 -> b2 on 'trunk'; 'topic' (head h) and 'side' branch off b0; 'merge' = b1 + h,
+    'octo' = b1 + h + side."""
+    o = tmp_path / "origin"
+    o.mkdir()
+    assert _git("init", "-q", cwd=o).returncode == 0
+    ids = {}
+
+    def commit(name):
+        (o / f"{name}.txt").write_text(name + "\n", encoding="utf-8")
+        ids[name] = git_commit(o, name)
+
+    commit("b0")
+    _git("checkout", "-q", "-b", "topic", cwd=o)
+    commit("h")
+    _git("checkout", "-q", "-b", "side", ids["b0"], cwd=o)
+    commit("s")
+    _git("checkout", "-q", "-b", "trunk", ids["b0"], cwd=o)
+    commit("b1")
+    for branch, heads in (("merge", ["topic"]), ("octo", ["topic", "side"])):
+        _git("checkout", "-q", "-b", branch, ids["b1"], cwd=o)
+        assert _git("merge", "-q", "--no-ff", "-m", branch, *heads, cwd=o).returncode == 0
+        ids[branch] = git_rev(o)
+    _git("checkout", "-q", "trunk", cwd=o)
+    commit("b2")
+    return o, ids
+
+
+@needs_git
+def test_merge_ref_must_be_this_events_head_merged_into_the_base(tmp_path):
+    """Verifier round 2: refs/pull/N/merge is updated asynchronously, so a run for a new head
+    could judge the previous merge commit."""
+    o, ids = merge_ref_repo(tmp_path)
+    ws = tmp_path / "ws"
+    pr = clone_at(o, "merge", ws / "pr", depth=1)               # as actions/checkout fetches the merge ref
+    assert _git("rev-parse", "--verify", "-q", "HEAD^2", cwd=pr).returncode != 0   # shallow: no parents here
+    bases = {}
+
+    def check(base_rev, head, depth=0, merge=pr, *extra):
+        key = (base_rev, depth)
+        if key not in bases:
+            bases[key] = clone_at(o, base_rev, ws / f"base{len(bases)}", depth=depth)
+        return tool("merge_ref", "--merge", merge, "--head", head, "--base", bases[key], *extra)
+
+    m, b1, h = ids["merge"], ids["b1"], ids["h"]
+    r = check(b1, h)
+    assert r.returncode == 0 and r.stdout.strip() == f"merge ref OK: {m[:12]} = base {b1[:12]} + head {h[:12]}"
+    r = check(ids["b2"], h.upper())                              # the base moved on since: still this merge
+    assert r.returncode == 0 and f"(an ancestor of base {ids['b2'][:12]})" in r.stdout, r.stdout
+    r = check(b1, ids["s"])                                      # a newer head was pushed: stale merge ref
+    assert r.returncode == 1 and f"second parent {h[:12]} is not the head commit {ids['s'][:12]}" in r.stdout
+    assert "merge ref REJECTED" in r.stdout and "push again" in r.stdout
+    r = check(ids["b0"], h)                                      # merged into a newer base than the lock's
+    assert r.returncode == 1 and f"first parent {b1[:12]} is not the base {ids['b0'][:12]}" in r.stdout
+    r = check("trunk", h, 1)                                     # a shallow base cannot vouch for ancestry
+    assert r.returncode == 1 and "unknown to the base checkout" in r.stdout and "fetch-depth: 0" in r.stdout
+    full = clone_at(o, "merge", ws / "full")
+    for rev, n in ((ids["h"], 1), (ids["octo"], 3), (ids["b0"], 0)):
+        r = check(b1, h, 0, full, "--rev", rev)
+        assert r.returncode == 1 and f"has {n} parent(s), not 2" in r.stdout, (n, r.stdout)
+    res = merge_ref.verify(full, h, bases[(b1, 0)], ids["octo"])
+    assert res["parents"] == [b1, h, ids["s"]] and len(res["problems"]) == 1
+    tree = _git("rev-parse", "HEAD^{tree}", cwd=full).stdout.strip()
+    raw = f"tree {tree}\nparent --output=x\nparent {h}\nauthor a <a@b> 0 +0000\ncommitter a <a@b> 0 +0000\n\nx\n"
+    bogus = subprocess.run(["git", "-C", str(full), "hash-object", "-t", "commit", "--literally", "-w", "--stdin"],
+                           input=raw, capture_output=True, text=True, timeout=60).stdout.strip()
+    r = check(b1, h, 0, full, "--rev", bogus)                    # git itself refuses to read it as a commit ...
+    assert r.returncode == 2 and "is not a commit" in r.stderr, (r.stdout, r.stderr)
+    real_git = merge_ref._git                                    # ... and parent ids are checked before use as arguments
+    merge_ref._git = lambda repo, *args: subprocess.CompletedProcess(args, 0, raw.encode(), b"")
+    try:
+        with pytest.raises(merge_ref.GitError, match="malformed parent line '--output=x'"):
+            merge_ref.parents(full, bogus)
+    finally:
+        merge_ref._git = real_git
+    assert merge_ref.parents(full, ids["merge"]) == [b1, h]
+    _git("checkout", "-q", "--detach", b1, cwd=full)             # a message line "parent X" is not a parent
+    assert _git("merge", "-q", "--no-ff", "-m", f"m\n\nparent {ids['s']}\nparent {ids['b0']}", h, cwd=full).returncode == 0
+    assert merge_ref.parents(full, git_rev(full)) == [b1, h]
+    assert merge_ref.main(["--merge", str(full), "--head", h, "--base", str(bases[(b1, 0)])]) == 0
+    # bad input: exit 2
+    nogit = tmp_path / "nogit"
+    nogit.mkdir()
+    (pr / "sub").mkdir()
+    base1 = bases[(b1, 0)]
+    for over, extra, needle in (({"--head": "abc123"}, [], "is not a full commit id"),
+                                ({"--merge": nogit}, [], "not the top level"),
+                                ({"--merge": pr / "sub"}, [], "not the top level"),
+                                ({"--base": nogit}, [], "not the top level"),
+                                ({}, ["--rev=-x"], "is not a revision"),
+                                ({}, ["--rev", "no-such"], "is not a commit")):
+        argv = dict({"--merge": pr, "--head": h, "--base": base1}, **over)
+        r = tool("merge_ref", *[x for kv in argv.items() for x in kv], *extra)
+        assert r.returncode == 2 and needle in r.stderr, (over, extra, r.stdout, r.stderr)
+    # the workflows' own step, in the workflows' layout: it fetches refs/pull/1/merge itself
+    assert _git("update-ref", "refs/pull/1/merge", m, cwd=o).returncode == 0
+    lay = tmp_path / "lay"
+    clone_at(o, b1, lay / "base")
+    shutil.copytree(TOOLS, lay / "base" / "governance" / "tools", ignore=shutil.ignore_patterns("__pycache__"))
+    step = workflow_run("golden.yml", MERGE_STEP)
+    assert step == workflow_run("decisions.yml", MERGE_STEP)
+    url = o.resolve().as_uri()
+    r = run_workflow_command(step, lay, ack=False, head=h, url=url, pr="1")
+    assert r.returncode == 0 and f"fetched refs/pull/1/merge = {m[:12]}" in r.stdout, r.stdout + r.stderr
+    assert os.listdir(lay / "pr") == [".git"] and git_rev(lay / "pr") == m        # objects only, HEAD at the merge
+    r = run_workflow_command(step, lay, ack=False, head=h, url=url, pr="1")     # a second run never reuses pr/
+    assert r.returncode == 2 and "already exists" in r.stderr
+    rmtree_force(lay / "pr")
+    r = run_workflow_command(step, lay, ack=False, head=ids["s"], url=url, pr="1")
+    assert r.returncode == 1 and "stale" in r.stdout
+
+
+@needs_git
+def test_merge_ref_fetches_the_merge_commit_as_objects_only(tmp_path, monkeypatch):
+    """Verifier round 3: actions/checkout refuses fork pull requests under pull_request_target, so the
+    gates fetch refs/pull/N/merge with git: no working tree, fsck on, the token only in the fetch's env."""
+    o, ids = merge_ref_repo(tmp_path)
+    m, b1, h = ids["merge"], ids["b1"], ids["h"]
+    assert _git("update-ref", "refs/pull/4/merge", m, cwd=o).returncode == 0
+    url = o.resolve().as_uri()
+    base = clone_at(o, b1, tmp_path / "base")
+    calls = []
+    real_run = merge_ref._run
+
+    def spy(args, env=None):
+        calls.append((list(args), env))
+        return real_run(args, env)
+    monkeypatch.setattr(merge_ref, "_run", spy)
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    assert merge_ref.fetch(url, "4", tmp_path / "pr", token="tok-123") == m
+    monkeypatch.undo()
+    pr = tmp_path / "pr"
+    assert os.listdir(pr) == [".git"] and (pr / ".git" / "shallow").read_text().strip() == m
+    assert _git("symbolic-ref", "-q", "HEAD", cwd=pr).returncode == 1                  # detached at the merge
+    assert merge_ref.verify(pr, h, base)["problems"] == []
+    assert [c[0][0] for c in calls[:1]] == ["init"] and calls[0][1] is None and calls[2][1] is None
+    fetch_args, fetch_env = calls[1]
+    assert "transfer.fsckObjects=true" in fetch_args and "--depth=1" in fetch_args and "--no-tags" in fetch_args
+    assert fetch_args[-1] == "+refs/pull/4/merge:refs/pull/merge" and fetch_args[-2] == url
+    assert not any("tok-123" in a for c in calls for a in c[0])                         # never on a command line
+    assert fetch_env["GIT_TERMINAL_PROMPT"] == "0"
+    # the token travels as an HTTP header scoped to the URL, through git's environment, and git reads it
+    env = merge_ref.fetch_env("https://github.com/o/r", "tok-123")
+    auth = "AUTHORIZATION: basic " + __import__("base64").b64encode(b"x-access-token:tok-123").decode()
+    assert (env["GIT_CONFIG_COUNT"], env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]) == \
+        ("1", "http.https://github.com/o/r.extraheader", auth)
+    got = subprocess.run(["git", "config", "--get-urlmatch", "http.extraheader", "https://github.com/o/r/info/refs"],
+                         env=env, capture_output=True, text=True, timeout=60)
+    assert got.stdout.strip() == auth, got.stderr
+    other = subprocess.run(["git", "config", "--get-urlmatch", "http.extraheader", "https://example.com/o/r"],
+                           env=env, capture_output=True, text=True, timeout=60)
+    assert other.stdout.strip() == ""                                                   # not sent elsewhere
+    monkeypatch.delenv("GIT_CONFIG_COUNT", raising=False)
+    assert "GIT_CONFIG_COUNT" not in merge_ref.fetch_env(url, "") and merge_ref.fetch_env(url, "")["GIT_TERMINAL_PROMPT"] == "0"
+    # main passes GITHUB_TOKEN from the environment, and only with --fetch
+    seen = []
+
+    def fake_fetch(u, n, into, token=""):
+        seen.append((u, n, str(into), token))
+        raise merge_ref.GitError("stop here")
+    monkeypatch.setattr(merge_ref, "fetch", fake_fetch)
+    monkeypatch.setenv("GITHUB_TOKEN", "from-env")
+    assert merge_ref.main(["--fetch", url, "--pr", "4", "--merge", "x", "--head", h, "--base", str(base)]) == 2
+    monkeypatch.delenv("GITHUB_TOKEN")
+    assert merge_ref.main(["--fetch", url, "--pr", "4", "--merge", "x", "--head", h, "--base", str(base)]) == 2
+    assert seen == [(url, "4", "x", "from-env"), (url, "4", "x", "")]
+    monkeypatch.undo()
+    # fsck is on: a malformed merge commit is refused before anything reads it
+    tree = _git("rev-parse", f"{m}^{{tree}}", cwd=o).stdout.strip()
+    raw = f"tree {tree}\nparent {b1}\nparent {h}\nauthor a <a@b> 0 +0000\ncommitter a <a@b> notadate +0000\n\nx\n"
+    bad = subprocess.run(["git", "-C", str(o), "hash-object", "-t", "commit", "--literally", "-w", "--stdin"],
+                         input=raw.encode(), capture_output=True, timeout=60).stdout.decode().strip()
+    assert _git("update-ref", "refs/pull/5/merge", bad, cwd=o).returncode == 0, bad
+    r = tool("merge_ref", "--fetch", url, "--pr", "5", "--merge", tmp_path / "pr5", "--head", h, "--base", base)
+    assert r.returncode == 2 and "git fetch" in r.stderr, (r.stdout, r.stderr)
+    # bad input: exit 2, nothing fetched
+    for args, needle in ((["--fetch", "ssh://host/r", "--pr", "4"], "not an https:// or file:// URL"),
+                         (["--fetch=--upload-pack=x", "--pr", "4"], "not an https:// or file:// URL"),
+                         (["--fetch", "https://", "--pr", "4"], "not an https:// or file:// URL"),
+                         (["--fetch", url, "--pr", "0"], "not a pull request number"),
+                         (["--fetch", url, "--pr", "04"], "not a pull request number"),
+                         (["--fetch", url, "--pr", "4x"], "not a pull request number"),
+                         (["--fetch", url, "--pr", "12345678901"], "not a pull request number"),
+                         (["--fetch", url, "--pr", "6"], "git fetch"),                   # no such pull request
+                         (["--fetch", url], "go together"), (["--pr", "4"], "go together")):
+        into = tmp_path / f"into{len(os.listdir(tmp_path))}"
+        r = tool("merge_ref", *args, "--merge", into, "--head", h, "--base", base)
+        assert r.returncode == 2 and needle in r.stderr, (args, r.stdout, r.stderr)
+    assert merge_ref.main(["--fetch", url, "--pr", "1234567890", "--merge", str(tmp_path / "pr"), "--head", h,
+                           "--base", str(base)]) == 2                                   # pr/ exists already
+    assert sorted(os.listdir(pr)) == [".git"]
+
+
+# ------------------------------------------------------- paths that alias on Windows or macOS
+def commit_files(repo: Path, parents, files: dict, msg: str, base: str = None) -> str:
+    """A commit of base's tree (None: empty) with files (path -> bytes; None removes it), built through
+    a temporary index with core.ignorecase off: no working tree is written, so case twins and short
+    names can be committed on any file system."""
+    index = repo / ".git" / "commit-files-index"
+    env = dict(os.environ, GIT_INDEX_FILE=str(index))
+
+    def g(*args, data=None):
+        r = subprocess.run(["git", "-C", str(repo), "-c", "core.ignorecase=false", "-c", "user.name=t", "-c",
+                            "user.email=t@example.invalid", "-c", "commit.gpgsign=false", *args],
+                           input=data, capture_output=True, env=env, timeout=60)
+        assert r.returncode == 0, (args, r.stderr)
+        return r.stdout.decode("utf-8").strip()
+
+    g("read-tree", *([base] if base else ["--empty"]))
+    for path, data in files.items():
+        if data is None:
+            g("update-index", "--force-remove", "--", path)
+        else:
+            g("update-index", "--add", "--cacheinfo", f"100644,{g('hash-object', '-w', '--stdin', data=data)},{path}")
+    tree = g("write-tree")
+    index.unlink()
+    return g("commit-tree", tree, "-m", msg, *[x for p in parents for x in ("-p", p)])
+
+
+def test_path_aliases_fold_and_short_names():
+    twins = [("governance/INVARIANTS.md", "governance/invariants.md"), ("tests/Golden", "tests/golden"),
+             ("docs/caf\u00e9.md", "docs/cafe\u0301.md"),                       # NFC and NFD (macOS)
+             ("\u03b1\u0345\u0301", "\u03b1\u0301\u0345"),        # canonical order of marks; U+0345 upper-cases to a letter
+             ("a/\u0131nv.md", "a/INV.md"),                                     # dotless i upper-cases to I (NTFS)
+             ("stra\u00dfe", "STRASSE"), ("\u017ftate", "state"), ("\u212a.md", "k.md"),   # sharp s, long s, Kelvin
+             ("INVARIANTS\u200c.md", "INVARIANTS.md"), ("x\ufeff/y", "x/y"),    # code points HFS+ ignores
+             ("INVARIANTS.md.", "INVARIANTS.md"), ("dir /f", "dir/f"), ("a. .", "a")]   # Win32 trailing dots/spaces
+    for a, b in twins:
+        assert path_aliases.fold(a) == path_aliases.fold(b), (a, b)
+        assert path_aliases.find([a, b, "other"]) == {"twins": [sorted([a, b])], "short_names": []}, (a, b)
+    for a, b in (("a.md", "a.mdx"), ("a/b", "a-b"), ("ADR-0001.md", "ADR-0002.md"), (".a", "a"), ("a b", "ab"),
+                 ("e\u0301", "e"), ("a", "a/a"), ("x.", "x/.")):
+        assert path_aliases.fold(a) != path_aliases.fold(b), (a, b)
+    # exactly the code points HFS+ ignores (git's list for .git) vanish, not their neighbours
+    hfs = [0x200C, 0x200D, 0x200E, 0x200F, *range(0x202A, 0x202F), *range(0x206A, 0x2070), 0xFEFF]
+    assert len(hfs) == 16
+    for cp in range(0x2000, 0x2100):
+        assert (path_aliases.fold("a" + chr(cp) + "b") == "ab") is (cp in hfs), hex(cp)
+    for cp in (0xFEFE, 0xFF00):
+        assert path_aliases.fold("a" + chr(cp) + "b") != "ab", hex(cp)
+    # the fold is at least as coarse as macOS's comparison and as upper-casing, for every code point
+    nfd = lambda t: __import__("unicodedata").normalize("NFD", t)   # noqa: E731
+    first = ({}, {})
+    for cp in range(0x110000):
+        if not 0xD800 <= cp <= 0xDFFF:
+            c = chr(cp)
+            k = path_aliases.fold(c)
+            for seen, key in zip(first, (nfd(nfd(c).casefold()), c.upper())):
+                assert seen.setdefault(key, k) == k, (hex(cp), key)
+    short = ("INVARI~1.MD", "decisi~1", "GOVERN~1", "A~1", "~1", "go1a2b~1.py", "TEST_G~1.PY", "abcdef~1",
+             "abcde~12", "a~123456", "INVARI~1.MD.", "x~1.", "NOTES~1.M", "go\u200cvern~1")
+    for c in short:
+        assert path_aliases.is_short_name(c), c
+    for c in ("INVARIANTS.md", "INVARIANTS~1.md", "a~b", "x~1.json", "abcdef~12", "GOVERN~12", "a~1234567", "a.b~1",
+              "file~2023.txt", "abcdefg~1", "~", "a~", "a~1.b.c", "a~1b"):
+        assert not path_aliases.is_short_name(c), c
+    # a short-name directory is reported once, whether the tree lists it or only files below it
+    for paths in (["governance", "governance/decisi~1", "governance/decisi~1/ADR-0004.md", "governance/decisi~1/x/y"],
+                  ["governance/decisi~1/ADR-0004.md", "governance/decisi~1/x/y"]):
+        assert path_aliases.find(paths) == {"twins": [], "short_names": ["governance/decisi~1"]}
+    found = path_aliases.find(["b/X", "a/INV~1.MD", "b/x", "a/Y", "a/y", "a/y"])           # duplicates collapse
+    assert found == {"twins": [["a/Y", "a/y"], ["b/X", "b/x"]], "short_names": ["a/INV~1.MD"]}
+    assert path_aliases.describe(found) == [
+        "TWINS  a/Y = a/y  (one file on Windows and macOS)", "TWINS  b/X = b/x  (one file on Windows and macOS)",
+        "8.3    a/INV~1.MD  (a component shaped like an NTFS short name aliases a longer name there)"]
+    assert path_aliases.find([]) == {"twins": [], "short_names": []} and path_aliases.describe(path_aliases.find([])) == []
+    # reports are ASCII (a Windows console cannot print every name) and show invisible code points
+    hidden = path_aliases.describe(path_aliases.find(["INVARIANTS.md", "INVARIANTS\u200c.md", "x/A\u00e9~1"]))
+    assert hidden == ["TWINS  INVARIANTS.md = INVARIANTS" + chr(92) + "u200c.md  (one file on Windows and macOS)",
+                      "8.3    x/A" + chr(92) + "xe9~1  (a component shaped like an NTFS short name aliases a longer name there)"]
+
+
+@needs_git
+def test_path_aliases_cli_reads_a_commit(tmp_path):
+    repo = tmp_path / "repo"
+    assert _git("init", "-q", str(repo), cwd=tmp_path).returncode == 0
+    base = commit_files(repo, [], {"governance/INVARIANTS.md": b"x\n", "docs/FORMAT.md": b"f\n"}, "base")
+    twin = commit_files(repo, [base], {"governance/invariants.md": b"y\n", "docs/x/NOTES~1.MD": b""}, "twin", base=base)
+    r = tool("path_aliases", "--root", repo, "--rev", base)
+    assert r.returncode == 0 and r.stdout.strip() == f"path aliases OK: 4 path(s) at {base}, none alias on Windows or macOS"
+    r = tool("path_aliases", "--root", repo, "--rev", twin)
+    assert r.returncode == 1 and r.stdout.splitlines() == [
+        "TWINS  governance/INVARIANTS.md = governance/invariants.md  (one file on Windows and macOS)",
+        "8.3    docs/x/NOTES~1.MD  (a component shaped like an NTFS short name aliases a longer name there)",
+        f"path aliases FOUND at {twin}: 2 finding(s). A Windows or macOS checkout would hold different files than "
+        "the gates judge; rename them (no label accepts this)."], r.stdout
+    assert "docs/x" in path_aliases.tree_paths(repo, twin)                            # directories are entries too
+    assert _git("update-ref", "refs/heads/main", twin, cwd=repo).returncode == 0
+    assert _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=repo).returncode == 0
+    assert path_aliases.main(["--root", str(repo)]) == 1                               # default: HEAD
+    assert path_aliases.main(["--root", str(repo), "--rev", base]) == 0
+    assert path_aliases.ROOT == ROOT                                                   # default --root: this checkout
+    (repo / "sub").mkdir()
+    for args, needle in ((["--root", repo, "--rev", "no-such"], "'no-such' is not a commit"),
+                         (["--root", repo, "--rev=-x"], "is not a revision"),
+                         (["--root", repo, "--rev", ""], "is not a revision"),
+                         (["--root", repo / "sub"], "is not the top level of a git checkout"),
+                         (["--root", tmp_path / "nowhere"], "path_aliases: ")):
+        r = tool("path_aliases", *args)
+        assert r.returncode == 2 and needle in r.stderr and r.stdout == "", (args, r.stdout, r.stderr)
+    # a path that is not UTF-8 cannot be folded: exit 2, not a guess
+    oid = subprocess.run(["git", "-C", str(repo), "hash-object", "-w", "--stdin"], input=b"z", capture_output=True,
+                         timeout=60).stdout.decode().strip()
+    env = dict(os.environ, GIT_INDEX_FILE=str(tmp_path / "idx"))
+    for args, data in ((["read-tree", base], None), (["update-index", "-z", "--index-info"],
+                                                     b"100644 blob " + oid.encode() + b"\tdocs/\xff.md\0")):
+        assert subprocess.run(["git", "-C", str(repo), *args], input=data, env=env, capture_output=True,
+                              timeout=60).returncode == 0
+    tree = subprocess.run(["git", "-C", str(repo), "write-tree"], env=env, capture_output=True, text=True,
+                          timeout=60).stdout.strip()
+    latin = subprocess.run(["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e", "commit-tree", tree,
+                            "-m", "x"], capture_output=True, text=True, timeout=60).stdout.strip()
+    r = tool("path_aliases", "--root", repo, "--rev", latin)
+    assert r.returncode == 2 and "is not UTF-8" in r.stderr, (r.stdout, r.stderr)
+
+
+ADR4 = (ROOT / "governance" / "decisions" / "ADR-0004-lfu-default-eviction.md").read_bytes()
+ALIAS_CASES = {   # verifier round 3, and the NTFS short-name variant: one file in Windows and macOS checkouts
+    "invariants twin": {"governance/invariants.md": b"# Invariants\n\nNone. Anything goes.\n"},
+    "ADR twin": {"governance/decisions/adr-0004-lfu-default-eviction.md": ADR4.replace(b"LFU", b"LRU")},
+    "golden directory twin": {"tests/Golden/conftest.py": b"import pytest\n"},
+    "golden manifest twin": {"tests/golden/manifest.sha256": b""},
+    "contract twin": {"docs/format.md": b"# nothing\n"},
+    "NFC and NFD": {"docs/caf\u00e9.md": b"a", "docs/cafe\u0301.md": b"b"},
+    "short name": {"governance/INVARI~1.MD": b"# Invariants\n\nNone.\n"},
+    "short directory": {"governance/decisi~1/ADR-0004-lfu-default-eviction.md": ADR4.replace(b"LFU", b"LRU")},
+    "short golden test": {"tests/golden/TEST_G~1.PY": b"def test_x():\n    pass\n"},
+}
+
+
+def gate_origin(tmp_path) -> tuple:
+    """An origin repository whose main holds this repository's decisions, invariants, golden suite,
+    contracts and governance tools, as GitHub would hold the project."""
+    files = {}
+    for rel in ("governance/decisions", "tests/golden", "governance/tools"):
+        for f in sorted((ROOT / rel).glob("*")):
+            if f.is_file() and f.suffix in (".md", ".py", ".sha256"):
+                files[f.relative_to(ROOT).as_posix()] = f.read_bytes()
+    for rel in ("governance/INVARIANTS.md", "docs/FORMAT.md", "docs/NUMERICS.md"):
+        files[rel] = (ROOT / rel).read_bytes()
+    o = tmp_path / "origin"
+    assert _git("init", "-q", str(o), cwd=tmp_path).returncode == 0
+    base = commit_files(o, [], files, "base")
+    assert _git("update-ref", "refs/heads/main", base, cwd=o).returncode == 0
+    return o, base
+
+
+def open_pull_request(o: Path, base: str, number: int, files: dict) -> str:
+    """A head commit with files on top of base, and GitHub's merge commit for it at
+    refs/pull/<number>/merge. Returns the head commit."""
+    head = commit_files(o, [base], files, f"pull request {number}", base=base)
+    merge = commit_files(o, [base, head], {}, f"Merge {head} into {base}", base=head)
+    assert _git("update-ref", f"refs/pull/{number}/merge", merge, cwd=o).returncode == 0
+    return head
+
+
+@needs_git
+def test_gates_refuse_paths_that_alias_on_windows_or_macos(tmp_path):
+    """Verifier round 3: a twin of governance/INVARIANTS.md, of a decided ADR or of tests/golden passed both
+    gates without a label, while git leaves the twin's text in every Windows and macOS checkout (an NTFS 8.3
+    short name too: reproduced with git for Windows). Each gate runs here as its workflow runs it: the base
+    checked out, the pull request fetched by the workflow's own merge step, then the workflow's judging step."""
+    o, base = gate_origin(tmp_path)
+    url = o.resolve().as_uri()
+    ws = tmp_path / "ws"
+    clone_at(o, base, ws / "base")
+    merge_step = workflow_run("golden.yml", MERGE_STEP)
+    gates = {"golden.yml": (workflow_run("golden.yml", "Golden lock against the base revision"), "ALIAS     ",
+                            "golden lock OK"),
+             "decisions.yml": (workflow_run("decisions.yml", "Decision circuit breaker"),
+                               "that are one file on Windows or macOS", "decision breaker OK")}
+
+    def judge(number, files):
+        head = open_pull_request(o, base, number, files)
+        if (ws / "pr").exists():
+            rmtree_force(ws / "pr")
+        r = run_workflow_command(merge_step, ws, ack=False, head=head, url=url, pr=str(number))
+        assert r.returncode == 0 and "merge ref OK" in r.stdout, r.stdout + r.stderr
+        return {name: [run_workflow_command(cmd, ws, ack=ack) for ack in (False, True)]
+                for name, (cmd, _, _) in gates.items()}
+
+    for number, (case, files) in enumerate(sorted(ALIAS_CASES.items()), 1):
+        for name, runs in judge(number, files).items():
+            _, needle, ok = gates[name]
+            for ack, r in zip((False, True), runs):        # no label makes an alias acceptable
+                assert r.returncode == 1 and needle in r.stdout and ok not in r.stdout, (case, name, ack, r.stdout)
+        assert tool("path_aliases", "--root", ws / "pr").returncode == 1, case
+    # control: a pull request without aliases passes both gates with no label
+    for name, runs in judge(90, {"docs/notes.md": b"notes\n"}).items():
+        assert runs[0].returncode == 0 and gates[name][2] in runs[0].stdout, (name, runs[0].stdout, runs[0].stderr)
+    # a case-only rename is no twin: the breaker sees INVARIANTS.md deleted and wants a decision
+    rename = {"governance/INVARIANTS.md": None, "governance/invariants.md": b"# Invariants\n\nNone.\n"}
+    runs = judge(91, rename)["decisions.yml"]
+    assert runs[0].returncode == 1 and "governance/INVARIANTS.md deleted" in runs[0].stdout, runs[0].stdout
+
+
+@needs_git
+def test_golden_rev_refuses_paths_that_alias(tmp_path):
+    root = git_golden_repo(tmp_path)
+    base = git_rev(root)
+    manifest = root / "tests" / "golden" / "MANIFEST.sha256"
+    for files, needle in (({"tests/Golden/conftest.py": b"import pytest\n"}, "TWINS  tests/Golden = tests/golden"),
+                          ({"docs/a.md": b"", "docs/A.md": b""}, "TWINS  docs/A.md = docs/a.md"),
+                          ({"tests/golden/TEST_G~1.PY": b"x = 1\n"}, "8.3    tests/golden/TEST_G~1.PY")):
+        c = commit_files(root, [base], files, "alias", base=base)
+        res = cg.check(cg.Revision(root, c))
+        assert len(res["aliases"]) == 1 and res["aliases"][0].startswith(needle) and not cg.passed(res), res
+        for ack in ([], ["--acknowledged"]):
+            r = tool("check_golden", "--root", root, "--rev", c, "--base-manifest", manifest, *ack)
+            assert r.returncode == 1 and f"ALIAS     {needle}" in r.stdout and "1 aliasing path(s)" in r.stdout, r.stdout
+            assert "golden lock OK" not in r.stdout and "acknowledged" not in r.stdout
+    res = cg.check(cg.Revision(root, base))
+    assert res["aliases"] == [] and cg.passed(res) and cg.check(root)["aliases"] == []
+    # without its sibling the tool cannot vouch for a commit: exit 2, never a pass
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    shutil.copyfile(TOOLS / "check_golden.py", alone / "check_golden.py")
+    r = subprocess.run([sys.executable, str(alone / "check_golden.py"), "--root", str(root), "--rev", "HEAD"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2 and "cannot load" in r.stderr and "path_aliases.py" in r.stderr, (r.stdout, r.stderr)
+    r = subprocess.run([sys.executable, str(alone / "check_golden.py"), "--root", str(root)], capture_output=True,
+                       text=True, timeout=120)
+    assert r.returncode == 0                                       # the working-tree check does not need it
+
+
+@needs_git
+def test_adr_rev_refuses_paths_that_alias(tmp_path):
+    repo = tmp_path / "repo"
+    write_decisions(repo, adr_files(3))
+    assert _git("init", "-q", cwd=repo).returncode == 0
+    base = git_commit(repo, "base")
+    d2 = adr_files(3)["ADR-0002-d2.md"].encode()
+    for files, needle in (({"governance/invariants.md": b"None.\n"},
+                           "TWINS  governance/INVARIANTS.md = governance/invariants.md"),
+                          ({"governance/decisions/adr-0002-d2.md": d2.replace(b"Decision", b"Reversal")},
+                           "TWINS  governance/decisions/ADR-0002-d2.md = governance/decisions/adr-0002-d2.md"),
+                          ({"governance/INVARI~1.MD": b"None.\n"}, "8.3    governance/INVARI~1.MD"),
+                          ({"governance/decisi~1/ADR-0002-d2.md": d2}, "8.3    governance/decisi~1  ("),
+                          ({"docs/X.md": b"", "docs/x.md": b""}, "TWINS  docs/X.md = docs/x.md")):
+        c = commit_files(repo, [base], files, "alias", base=base)
+        with pytest.raises(adr.AliasError, match=re.escape(needle)):
+            adr.read_rev(repo, c)
+        for args in (["lint", "--rev", c], ["index", "--rev", c],
+                     ["breaker", "--rev", c, "--base-rev", base, "--acknowledged"],
+                     ["breaker", "--rev", base, "--base-rev", c, "--acknowledged"]):   # the base side too
+            r = tool("adr", *args, "--root", repo)
+            assert r.returncode == 1 and needle in r.stdout and "one file on Windows or macOS" in r.stdout, \
+                (args, r.stdout, r.stderr)
+            assert r.stdout.rstrip().endswith("(not even --acknowledged accepts this)") and "plain files" not in r.stdout
+    assert issubclass(adr.AliasError, adr.RecordError)
+    # a case-only rename is no twin: the breaker sees the decided ADR deleted, and lint the misspelt record
+    c = commit_files(repo, [base], {"governance/decisions/ADR-0002-d2.md": None,
+                                    "governance/decisions/adr-0002-d2.md": d2}, "rename", base=base)
+    assert sorted(adr.read_rev(repo, c)[0]) == ["ADR-0001-d1.md", "ADR-0003-d3.md", "adr-0002-d2.md"]
+    r = tool("adr", "breaker", "--root", repo, "--rev", c, "--base-rev", base)
+    assert r.returncode == 1 and "decided ADR(s) ADR-0002 rewritten in place, moved back or deleted" in r.stdout
+    r = tool("adr", "lint", "--root", repo, "--rev", c)
+    assert r.returncode == 1 and "adr-0002-d2.md: file name must be ADR-NNNN-lowercase-slug.md" in r.stdout
+    for name, record in (("ADR-0001-a.md", True), ("adr-0001-a.md", True), ("Adr-0001-a.MD", True),
+                         ("ADR-0001-a.mdx", False), ("ADR-0001-a.m", False), ("TEMPLATE.md", False),
+                         ("ADR0001-a.md", False), ("xADR-0001-a.md", False), ("ADR-.md", True)):
+        assert adr._is_adr_name(name) is record, name
+    # without its sibling the tool cannot vouch for a commit: exit 2
+    alone = tmp_path / "alone"
+    alone.mkdir()
+    shutil.copyfile(TOOLS / "adr.py", alone / "adr.py")
+    r = subprocess.run([sys.executable, str(alone / "adr.py"), "lint", "--root", str(repo), "--rev", "HEAD"],
+                       capture_output=True, text=True, timeout=120)
+    assert r.returncode == 2 and "cannot load" in r.stderr and "path_aliases.py" in r.stderr, (r.stdout, r.stderr)
+
+
+EXTRA_KEYWORDS = {   # verifier round 3: builtin refused these (exit 2) while jsonschema evaluated them (0 or 1)
+    "multipleOf": ("task_id", {"multipleOf": 2}, "'multipleOf' is not supported"),
+    "allOf": (None, {"allOf": [{"required": ["no_such_key"]}]}, "'allOf' is not supported"),
+    "minProperties": (None, {"minProperties": 999}, "'minProperties' is not supported"),
+    "not": (None, {"not": {"required": ["task_id"]}}, "'not' is not supported"),
+    "if/then": ("task_id", {"if": {"const": "x"}, "then": False}, "'if' is not supported"),
+    "uniqueItems": ("procedures", {"uniqueItems": True}, "'uniqueItems' is not supported"),
+    "tuple items (2019-09)": ("procedures", {"items": [{"type": "string"}]}, "subschema must be an object or boolean"),
+}
+
+
+@pytest.mark.parametrize("case", sorted(EXTRA_KEYWORDS))
+def test_handover_engines_refuse_the_same_keywords(case, tmp_path):
+    where, extra, needle = EXTRA_KEYWORDS[case]
+    schema_doc = copy.deepcopy(SCHEMA)
+    target = schema_doc["properties"][where] if where else schema_doc
+    target.update(copy.deepcopy(extra))
+    if case.startswith("tuple"):
+        schema_doc["$schema"] = vh.DIALECTS[1]
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    schema = write_json(tmp_path / "s.json", schema_doc)
+    for engine in ["builtin"] + (["auto", "jsonschema"] if vh.have_jsonschema() else []):
+        r = tool("validate_handover", m, "--schema", schema, "--engine", engine, "--tasks", "")
+        assert r.returncode == 2 and needle in r.stderr and r.stdout == "", (case, engine, r.stdout, r.stderr)
+    with pytest.raises(vh.SchemaError, match=re.escape(needle)):
+        vh.precheck_schema(schema_doc)
+
+
+def test_handover_metaschema_check_runs_for_jsonschema_only(tmp_path, monkeypatch):
+    """The metaschema check (jsonschema) runs only with that engine: builtin, as CI runs it, never depends
+    on an optional package. With every keyword and value rule shared, it should never fire on its own."""
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    schema = write_json(tmp_path / "s.json", SCHEMA)
+    vh.precheck_schema(dict(SCHEMA, **{"$id": "https://example.com/s.json#"}))     # an empty fragment is allowed
+    with pytest.raises(vh.SchemaError, match="without a fragment"):
+        vh.precheck_schema(dict(SCHEMA, **{"$id": "https://example.com/s.json#a"}))
+    calls = []
+
+    def metaschema(s):
+        calls.append(s)
+        raise vh.SchemaError("metaschema says no")
+    monkeypatch.setattr(vh, "jsonschema_check_schema", metaschema)
+    monkeypatch.setattr(vh, "have_jsonschema", lambda: True)
+    args = [str(m), "--schema", str(schema), "--tasks", ""]
+    assert vh.main(args + ["--engine", "builtin"]) == 0 and calls == []
+    for engine in ("auto", "jsonschema"):
+        assert vh.main(args + ["--engine", engine]) == 2 and len(calls) == 1, engine
+        calls.clear()
+    monkeypatch.setattr(vh, "have_jsonschema", lambda: False)
+    assert vh.main(args + ["--engine", "auto"]) == 0 and calls == []
+
+
+def test_handover_annotations_stay_usable_under_every_engine(tmp_path):
+    schema_doc = copy.deepcopy(SCHEMA)
+    schema_doc.update({"$comment": "c", "examples": [{}], "deprecated": False})
+    schema_doc["properties"]["task_id"].update({"description": "d", "readOnly": True, "default": "x"})
+    vh.precheck_schema(schema_doc)
+    m = write_json(tmp_path / "T05-governance-gen-001.json", manifest())
+    schema = write_json(tmp_path / "s.json", schema_doc)
+    for engine in ENGINES:
+        r = tool("validate_handover", m, "--schema", schema, "--engine", engine, "--tasks", "")
+        assert r.returncode == 0, (engine, r.stdout, r.stderr)
 
 
 # ------------------------------------------------------------------ mutate
@@ -1339,6 +2704,84 @@ def test_mutate_c_preprocessor_regions(tmp_path):
     assert lines(muts) == [3] and all(m.cond == "" for m in muts)
 
 
+FRAG_INC = ("#if HX_FAST\n"                                                     # 1
+            "static int frag_fast(int x) { return x + 1; }\n"                    # 2
+            "#else\n"                                                            # 3
+            "static int frag_slow(int x) { return x - 1; }\n"                    # 4
+            "#endif\n"                                                           # 5
+            "static int frag_cast(const int *p, int k) { return (hx_word)*p + k; }\n")   # 6
+
+
+def inc_repo(tmp_path, includer_text='#include "hx_cfg.h"\n#include "frag.inc"\n') -> Path:
+    src = tmp_path / "proj" / "engine" / "src"
+    src.mkdir(parents=True)
+    (src / "hx_cfg.h").write_text("#ifndef HX_CFG_H\n#define HX_CFG_H\n#define HX_FAST 1\ntypedef int hx_word;\n"
+                                  "#endif\n", encoding="utf-8")
+    (src / "frag.inc").write_text(FRAG_INC, encoding="utf-8")
+    (src / "user.c").write_text(includer_text + "int use(int x) { return frag_fast(x); }\n", encoding="utf-8")
+    return tmp_path / "proj"
+
+
+def test_mutate_inc_files_are_c_in_their_includers_context(tmp_path):
+    for name in ("a.inc", "A.INC", "a.c", "a.h"):
+        assert mutate.language_of(Path(name)) == "c"
+    assert mutate.language_of(Path("a.py")) == "python"
+    with pytest.raises(mutate.MutateError, match=r"unsupported file type '\.txt' \(C: \.c/\.h/\.inc"):
+        mutate.language_of(Path("a.txt"))
+    root = inc_repo(tmp_path)
+    frag = root / "engine" / "src" / "frag.inc"
+    (root / "engine" / "src" / "NOTES.md").write_text('#include "frag.inc"\n', encoding="utf-8")   # not C
+    (root / "engine" / "src" / "dir.c").mkdir()
+    st = {}
+    muts, _ = mutate.generate(FRAG_INC, frag, root, {}, st)
+    assert sorted({m.line for m in muts}) == [2, 6] and all(m.cond == "" for m in muts)   # #else never compiled
+    assert st["includers"] == ["engine/src/user.c"] and st["inactive"] > 0
+    ops6 = {(m.op, m.before, m.after) for m in muts if m.line == 6}
+    assert ("arithmetic", "+", "-") in ops6 and not any(m.before == "*" for m in muts)    # (hx_word)*p is a cast
+    alone = mutate.gen_c(FRAG_INC, set(), {}, mutate.header_resolver(root), frag)        # without the context
+    assert any(m.line == 4 and m.cond == "#else of #if HX_FAST" for m in alone)
+    assert any(m.before == "*" for m in alone)
+    defs, types, files = mutate.fragment_context(frag, root, {})
+    assert defs["HX_FAST"] == 1 and "hx_word" in types and files == [root / "engine" / "src" / "user.c"]
+    r = tool("mutate", "--root", root, "--file", "engine/src/frag.inc", "--list", "--max-mutants", "0")
+    assert r.returncode == 0 and "fragment context: included by engine/src/user.c" in r.stdout, r.stdout + r.stderr
+    (root / "check.py").write_text(f"import sys\nsys.exit(open('engine/src/frag.inc').read() != {FRAG_INC!r})\n",
+                                   encoding="utf-8")
+    out = tmp_path / "rep"
+    r = tool("mutate", "--root", root, "--file", "engine/src/frag.inc", "--test", "{python} check.py",
+             "--max-mutants", "3", "--jobs", "1", "--out-dir", out, "--quiet")
+    rep = json.loads((out / "mutation.json").read_text(encoding="utf-8"))
+    assert r.returncode == 0 and rep["language"] == "c" and rep["included_by"] == ["engine/src/user.c"], r.stderr
+    assert rep["counts"]["killed"] == 3 and rep["score"] == 1.0
+
+
+@pytest.mark.parametrize("includers,defs,decided", [
+    ({"user.c": '#define HX_FAST 1\n#include "frag.inc"\n',
+      "other.c": '#define HX_FAST 0\n#include "frag.inc"\n'}, {}, False),                 # disagree: unknown
+    ({"user.c": '#define HX_FAST 1\n#include "frag.inc"\n',
+      "other.c": '#define HX_FAST 0\n#if 0\n#include "frag.inc"\n#endif\n'}, {}, True),     # never included there
+    ({"user.c": '#define HX_FAST 1\n#include "frag.inc"\n',
+      "other.c": '#define HX_FAST 1\n#include "elsewhere/frag.inc"\n'}, {}, True),        # another file
+    ({}, {}, False),                                                                      # no includer: plain C
+    ({}, {"HX_FAST": 1}, True),                                                           # ... with -D HX_FAST
+    ({"user.c": '#include "frag.inc"\n'}, {"HX_FAST": 1}, True),                          # includer keeps -D
+])
+def test_mutate_inc_context_from_several_includers(includers, defs, decided, tmp_path):
+    root = inc_repo(tmp_path)
+    src = root / "engine" / "src"
+    (src / "user.c").unlink()
+    for name, text in includers.items():
+        (src / name).write_text(text, encoding="utf-8")
+    muts, _ = mutate.generate(FRAG_INC, src / "frag.inc", root, defs)
+    slow = [m for m in muts if m.line == 4]
+    assert (slow == []) is decided and all(m.cond for m in slow)
+
+
+def test_mutate_lists_the_real_platform_fragment():
+    r = tool("mutate", "--file", "engine/src/platform_common.inc", "--list", "--max-mutants", "3")
+    assert r.returncode == 0 and "3 selected" in r.stdout and "platform_win.c" in r.stdout, r.stdout + r.stderr
+
+
 def test_mutate_pp_eval_and_macro_args():
     defs = {"ONE": 1, "NO": mutate.UNDEF, "OPAQUE": mutate.DEFINED}
     cases = {"0": 0, "1": 1, "defined(ONE) && !defined NO": 1, "UNKNOWN || 1": 1, "UNKNOWN && 0": 0,
@@ -1701,6 +3144,62 @@ def test_friction_unsigned_failures_are_keyed_by_command(tmp_path):
     assert friction.main(["check", str(log)]) == 0
 
 
+MSVC_PTRS = ("000001F2A3B4C5D6", "00000213B4C5D6E7", "0000024C1D2E3F40")   # printf("%p") with MSVC on x64
+
+
+def test_friction_masks_msvc_pointers_and_run_specific_names(tmp_path):
+    """Council round 1: a repeated crash on the primary platform was never detected as thrashing."""
+    rows = [{"cmd": "c", "exit_code": 1, "error_signature": f"FAIL test_store.c:211: slot 0x7 ptr {p} not aligned"}
+            for p in MSVC_PTRS]
+    res = friction.analyze(recs(*rows), threshold=3)
+    assert len(res["thrashing"]) == 1 and res["thrashing"][0]["signature"] == \
+        "FAIL test_store.c:211: slot 0x? ptr <addr> not aligned"
+    n = friction.normalize
+    same = [("p=0095F031 bad", "p=00A1B2C3 bad"),                                  # x86: 8 digits
+            (r"C:\Users\x\AppData\Local\Temp\tmpab1_xyz9\a.c(3): error", r"C:\Users\x\AppData\Local\Temp\tmp0q2w3e4r\a.c(3): error"),
+            ("/tmp/pytest-of-ci/pytest-17/test_x0/out.txt missing", "/tmp/pytest-of-ci/pytest-18/test_x0/out.txt missing"),
+            ("hearth-golden-k2j4h5g6/run failed", "hearth-golden-a1b2c3d4/run failed"),
+            ("hearth-mutate-mr0011aabb-x1y2z3w4/job0 locked", "hearth-mutate-mr99ff0011-q9w8e7r6/job0 locked"),
+            ("worker pid 4242 died", "worker pid 77 died"), ("PID: 1 exited", "PID: 31337 exited"),
+            ("took 1.5 s", "took 20 ms")]
+    for a, b in same:
+        assert n(a) == n(b) and n(a) != a, (a, b, n(a))
+    different = [("sha 4b825dc642cb6eb9a060e54bf8d69288fbee4904 bad", "sha 5b825dc642cb6eb9a060e54bf8d69288fbee4904 bad"),
+                 ("code 0095F03 x", "code 0095F04 x"),                       # 7 digits: not a pointer
+                 ("v 0095F031FCC01 x", "v 0095F031FCC02 x"),                  # 13 digits: neither width
+                 ("tag DEADBEEF", "tag FEEDFACE"),                            # no digit: a word, not an address
+                 ("error C2065", "error C2066"), ("test_x7", "test_x8"), ("id_00A1B2C3", "id_00A1B2C4"),
+                 ("open tmpfile_a.c", "open tmpfile_b.c")]                  # not tempfile's 8 random characters
+    for a, b in different:
+        assert n(a) != n(b), (a, b)
+    assert n("pid 12 and 0x1f and 00000095F031FCC0", exact=True) == "pid 12 and 0x1f and 00000095F031FCC0"
+    log = tmp_path / "a.jsonl"
+    for p in MSVC_PTRS:
+        assert tool("friction", "record", log, "--cmd", "test_store.exe", "--exit-code", "3",
+                    "--signature", f"ptr {p} not aligned").returncode == 0
+    r = tool("friction", "check", log)
+    assert r.returncode == 1 and "signature: ptr <addr> not aligned" in r.stdout, r.stdout
+
+
+def test_friction_masks_sanitizer_pid_prefixes(tmp_path):
+    """Verifier round 2: AddressSanitizer starts every report with ==<pid>==, so the same crash never repeated."""
+    asan = ["=={0}==ERROR: AddressSanitizer: heap-use-after-free on address 0x6020000000{1} at pc 0x55d4 "
+            "bp 0x7ffc sp 0x7ff8 READ of size 8 at 0x6020000000{1} thread T0 =={0}==ABORTING".format(pid, pid % 97)
+            for pid in (11111, 22222, 33333)]
+    res = friction.analyze(recs(*[{"cmd": "ctest", "exit_code": 1, "error_signature": s} for s in asan]), threshold=3)
+    assert len(res["thrashing"]) == 1 and res["thrashing"][0]["signature"].startswith(
+        "==?==ERROR: AddressSanitizer: heap-use-after-free on address 0x?") and "==?==ABORTING" in \
+        res["thrashing"][0]["signature"]
+    n = friction.normalize
+    assert n("==12== x") == n("==345== x") and n("==1==x") != n("==1==y") and n("a == 12 == b") == "a == 12 == b"
+    assert n("==12==ERROR", exact=True) == "==12==ERROR"
+    log = tmp_path / "asan.jsonl"
+    for s in asan:
+        assert tool("friction", "record", log, "--cmd", "ctest", "--exit-code", "1", "--signature", s).returncode == 0
+    r = tool("friction", "check", log)
+    assert r.returncode == 1 and "EPISTEMIC FRICTION" in r.stdout, r.stdout
+
+
 def test_friction_check_without_a_log_is_ok(tmp_path):
     env = {"HEARTH_DATA": str(tmp_path / "data")}
     r = tool("friction", "check", "--task", "T99-none", env=env)
@@ -1748,7 +3247,8 @@ def test_friction_log_location_and_write_errors(tmp_path):
 
 # --------------------------------------------------------------------- adr
 def test_adr_repository_records_lint_clean():
-    files = adr.load_dir(ROOT / "governance" / "decisions")
+    files, inv = adr.read_checkout(ROOT)
+    assert "INV-VERIFY" in inv
     assert len(files) >= 7
     assert adr.lint(files) == []
     r = tool("adr", "lint")
@@ -1830,8 +3330,8 @@ def test_adr_circuit_breaker(tmp_path):
 
 
 def _git(*args, cwd):
-    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args], cwd=cwd,
-                          capture_output=True, text=True, timeout=60)
+    return subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "core.autocrlf=false",
+                           "-c", "commit.gpgsign=false", *args], cwd=cwd, capture_output=True, text=True, timeout=60)
 
 
 @pytest.mark.skipif(shutil.which("git") is None, reason="needs git")
@@ -1846,10 +3346,8 @@ def test_adr_reads_git_revisions(tmp_path):
     assert _git("init", "-q", cwd=repo).returncode == 0
     _git("add", "-A", cwd=repo)
     assert _git("commit", "-q", "-m", "base", cwd=repo).returncode == 0
-    files = adr.load_rev(repo, "HEAD", "governance/decisions")
-    assert files == adr_files(3)
-    assert adr.show_rev(repo, "HEAD", "governance/INVARIANTS.md").replace("\r\n", "\n") == INV_BASE
-    assert adr.show_rev(repo, "HEAD", "governance/missing.md") is None
+    files, inv = adr.read_rev(repo, "HEAD")
+    assert files == adr_files(3) and inv.replace("\r\n", "\n") == INV_BASE
     (repo / "governance" / "INVARIANTS.md").write_text(INV_BASE.replace("bit-identical", "close"), encoding="utf-8")
     r = tool("adr", "breaker", "--root", repo, "--base-rev", "HEAD")
     assert r.returncode == 1 and "INV-A" in r.stdout
@@ -1876,7 +3374,11 @@ def test_adr_invariants_breaker_needs_a_relevant_decision():
     assert tripped(dict(base, **{"ADR-0009-d9.md": adr_text(9, decision="Unrelated: about INV-B.")}))
     assert tripped(dict(base, **{"ADR-0009-d9.md": adr_text(9, decision="About INV-AB, not INV-A-ish.")}))
     assert not tripped(dict(base, **{"ADR-0009-d9.md": adr_text(9, decision="Relax INV-A to a tolerance.")}))
-    assert not tripped(dict(base, **{"ADR-0003-d3.md": adr_text(3, decision="d. Amends INVARIANTS.md.")}))
+    amended = adr_text(3, decision="d. Amends INVARIANTS.md.")
+    proposed = dict(base, **{"ADR-0003-d3.md": adr_text(3, status="Proposed")})
+    assert adr.breaker(proposed, dict(proposed, **{"ADR-0003-d3.md": amended}), INV_BASE, weakened,
+                       0.15)["tripped"] == []                      # a changed (still open) ADR covers it
+    assert [r for r in tripped(dict(base, **{"ADR-0003-d3.md": amended})) if "rewritten" in r]   # not a decided one
     assert adr.breaker(base, trivial, INV_BASE, INV_BASE.replace("\n", "\r\n"), 0.15)["tripped"] == []   # CRLF only
     preamble = adr.breaker(base, base, INV_BASE, "intro\n" + INV_BASE, 0.15)
     assert preamble["invariant_ids_changed"] == [] and preamble["tripped"]
@@ -1912,6 +3414,229 @@ def test_adr_breaker_limit_is_exclusive():
     assert adr.breaker(base, cur, "inv", "inv", 0.15)["tripped"]
 
 
+def test_adr_breaker_duplicate_ids_cannot_hide_retired_decisions(tmp_path):
+    """Council round 1: Accepted shadow copies under the same ids hid 8 of 8 retired decisions."""
+    base = adr_files(8)
+    cur = {n: adr_text(i, status="Deprecated") for i, n in enumerate(sorted(base), 1)}
+    cur.update({f"ADR-{i:04d}-zz-shadow.md": adr_text(i) for i in range(1, 9)})
+    res = adr.breaker(base, cur, "inv", "inv", 0.15)
+    assert res["duplicates"] == [f"ADR-{i:04d}" for i in range(1, 9)] and len(res["deprecated"]) == 8
+    assert res["tripped"][0].startswith("duplicate ADR id(s) ADR-0001, ADR-0002") and "8 of 8" in res["tripped"][1]
+    one = dict(base, **{"ADR-0002-copy.md": adr_text(2)})               # one identical copy, nothing retired
+    res = adr.breaker(base, one, "inv", "inv", 0.15)
+    assert res["duplicates"] == ["ADR-0002"] and res["deprecated"] == ["ADR-0002"] and len(res["tripped"]) == 1
+    assert res["rewritten"] == []
+    for side, files in (("base", base), ("cur", cur)):
+        d = tmp_path / side / "governance" / "decisions"
+        d.mkdir(parents=True)
+        for n, t in files.items():
+            (d / n).write_text(t, encoding="utf-8")
+    r = tool("adr", "breaker", "--root", tmp_path / "cur", "--base-root", tmp_path / "base")
+    assert r.returncode == 1 and "CIRCUIT BREAKER: duplicate ADR id(s)" in r.stdout, r.stdout
+
+
+def test_adr_breaker_detects_decided_adrs_rewritten_in_place():
+    base = adr_files(8, **{"ADR-0006-d6.md": adr_text(6, status="Deprecated"),
+                           "ADR-0007-d7.md": adr_text(7, status="Proposed")})
+
+    def rewritten(**changes):
+        return adr.breaker(base, dict(base, **changes), "inv", "inv", 0.15)["rewritten"]
+
+    lru = adr_text(4, decision="The default policy is `HEARTH_POLICY_LRU`").replace("Decision 4", "LRU by default")
+    assert rewritten(**{"ADR-0004-d4.md": lru}) == ["ADR-0004"]                  # council probe 2
+    res = adr.breaker(base, dict(base, **{"ADR-0004-d4.md": lru}), "inv", "inv", 0.15)
+    assert res["deprecated"] == [] and any("ADR-0004 rewritten in place" in r for r in res["tripped"])
+    assert rewritten(**{"ADR-0004-d4.md": adr_text(4).replace("Decision 4", "Decision four")}) == ["ADR-0004"]
+    assert rewritten(**{"ADR-0004-d4.md": adr_text(4).replace("\nq\n", "\nq, and more\n")}) == ["ADR-0004"]
+    assert rewritten(**{"ADR-0004-d4.md": adr_text(4).replace("\nc\n", "\nc  \n\n")}) == []      # whitespace
+    assert rewritten(**{"ADR-0004-d4.md": adr_text(4) + "\n## Notes\n\nlater\n"}) == ["ADR-0004"]
+    assert rewritten(**{"ADR-0004-d4.md": adr_text(4, supersedes="ADR-0001")}) == ["ADR-0004"]
+    assert rewritten(**{"ADR-0004-d4.md": adr_text(4, status="Superseded", superseded_by="ADR-0009",
+                                                    day="2026-12-01")}) == []   # how an ADR is retired
+    assert rewritten(**{"ADR-0006-d6.md": adr_text(6, status="Deprecated", decision="other")}) == ["ADR-0006"]
+    assert rewritten(**{"ADR-0007-d7.md": adr_text(7, status="Accepted", decision="settled")}) == []   # was open
+    gone = dict(base)
+    del gone["ADR-0006-d6.md"]
+    assert adr.breaker(base, gone, "inv", "inv", 0.15)["rewritten"] == ["ADR-0006"]          # history deleted
+    renamed = dict(base)
+    renamed["ADR-0005-new-slug.md"] = renamed.pop("ADR-0005-d5.md")
+    assert adr.breaker(base, renamed, "inv", "inv", 0.15)["tripped"] == []
+
+
+def test_adr_breaker_freezes_decided_records_except_retirement():
+    """Verifier round 2: a decided ADR demoted to Proposed could be rewritten in a second change, and
+    free text on the field lines or before the first section was not compared."""
+    base = adr_files(9, **{"ADR-0006-d6.md": adr_text(6, status="Deprecated"),
+                           "ADR-0007-d7.md": adr_text(7, status="Proposed")})
+
+    def rewritten(n, text):
+        return adr.breaker(base, dict(base, **{f"ADR-{n:04d}-d{n}.md": text}), "inv", "inv", 1.0)["rewritten"]
+
+    four = adr_text(4)
+    assert rewritten(4, adr_text(4, status="Proposed")) == ["ADR-0004"]           # step 1 of the two-step rewrite
+    res = adr.breaker(base, dict(base, **{"ADR-0004-d4.md": adr_text(4, status="Proposed")}), "inv", "inv", 0.15)
+    assert res["deprecated"] == ["ADR-0004"] and any("moved back" in r for r in res["tripped"])
+    for edit in (lambda x: x.replace("- Status: Accepted", "- Status: Accepted (void: LRU is the default now)"),
+                 lambda x: x.replace("- Date: 2026-10-04", "- Date: 2026-10-04, void since PR 12"),
+                 lambda x: x.replace("- Date: 2026-10-04", "- Date: soon"),
+                 lambda x: x.replace("- Superseded-by: none", "- Superseded-by: [ADR-0009](void.md)"),
+                 lambda x: x.replace("- Superseded-by: none", "- Superseded-by: ADR-0009 (void)"),
+                 lambda x: x.replace("- Supersedes: none", "- Supersedes: ADR-0001"),
+                 lambda x: x.replace("\n## Context", "\nNOTE: void, LRU is the default.\n\n## Context"),
+                 lambda x: "Preface: void.\n\n" + x,
+                 lambda x: x.replace("- Supersedes: none", "- Supersedes: none\n- Status: Deprecated"),
+                 lambda x: x.replace("- Status: Accepted", "Status: Accepted")):
+        assert rewritten(4, edit(four)) == ["ADR-0004"], edit(four)
+    for same in (four + "\n\n", four.replace("- Status: Accepted", "* **Status**: Accepted"),
+                 four.replace("- Date: 2026-10-04", "- Date: 2026-12-01"),
+                 adr_text(4, status="Superseded", superseded_by="[ADR-0009](ADR-0009-d9.md)"),
+                 adr_text(4, status="Deprecated", superseded_by="ADR-0009, ADR-0008")):
+        assert rewritten(4, same) == [], same
+    assert rewritten(7, adr_text(7, status="Accepted", decision="settled")) == []    # was open: may change
+
+    def rewritten_from(b, text):
+        return adr.breaker(b, dict(b, **{"ADR-0004-d4.md": text}), "inv", "inv", 1.0)["rewritten"]
+
+    noted = four.replace("- Status: Accepted", "- Status: Accepted (as of PR 3)")    # a base that has a note
+    assert rewritten_from(dict(base, **{"ADR-0004-d4.md": noted}), noted.replace("PR 3", "PR 12")) == ["ADR-0004"]
+    assert rewritten_from(dict(base, **{"ADR-0004-d4.md": noted}), noted.replace("Accepted (as", "Deprecated (as")) \
+        == []                                                                       # retired, note kept
+    body = adr_text(4, decision="- Status: Accepted\nis how ADR-0002 put it")      # field-like text in a section
+    assert rewritten_from(dict(base, **{"ADR-0004-d4.md": body}),
+                          body.replace("- Status: Accepted\nis how", "- Status: Rejected\nis how")) == ["ADR-0004"]
+    assert rewritten(9, adr_text(9).replace("\nc\n", "\nNOTE: x\n")) == ["ADR-0009"]
+    transitions = [(a, b) for a in adr.STATUSES[1:] for b in adr.STATUSES + ("Acceptd",)]
+    allowed = {(s, s) for s in adr.STATUSES} | adr.RETIREMENTS
+    assert adr.RETIREMENTS == {("Accepted", "Deprecated"), ("Accepted", "Superseded"), ("Deprecated", "Superseded")}
+    for old, new in transitions:
+        by = "ADR-0002" if "Superseded" in (old, new) else "none"
+        b = adr_files(2, **{"ADR-0001-d1.md": adr_text(1, status=old, superseded_by=by)})
+        c = dict(b, **{"ADR-0001-d1.md": adr_text(1, status=new, superseded_by=by)})
+        assert (adr.breaker(b, c, "inv", "inv", 1.0)["rewritten"] == []) is ((old, new) in allowed), (old, new)
+
+
+def test_adr_lint_takes_exact_status_and_successor_forms():
+    errs = adr.lint(adr_files(**{"ADR-0002-d2.md": adr_text(2, status="Accepted (void)")}))
+    assert errs == ["ADR-0002-d2.md: Status 'Accepted (void)' must be exactly one of "
+                    "Proposed|Accepted|Deprecated|Superseded"]
+    for form in ("ADR-0009", "[ADR-0009](ADR-0009-d9.md)", "[ADR-0009](./ADR-0009-d9.md)"):
+        good = adr_files(**{"ADR-0009-d9.md": adr_text(9, supersedes=form.replace("9", "2")),
+                            "ADR-0002-d2.md": adr_text(2, status="Superseded", superseded_by=form)})
+        assert adr.lint(good) == [], form
+    for form in ("ADR-0009 (void)", "[ADR-0009](void.md)", "[ADR-0009](ADR-0008-d8.md)", "[ADR-0009]", "ADR-9",
+                 "ADR-0009(x)"):
+        errs = adr.lint(adr_files(**{"ADR-0009-d9.md": adr_text(9, supersedes="ADR-0002"),
+                                     "ADR-0002-d2.md": adr_text(2, status="Superseded", superseded_by=form)}))
+        assert any("is not an ADR id (ADR-NNNN), a link" in e for e in errs), (form, errs)
+
+
+def test_adr_records_behind_links_or_not_files_are_refused(tmp_path):
+    root, other = tmp_path / "root", tmp_path / "other"
+    write_decisions(root, adr_files(3))
+    write_decisions(other, adr_files(3))
+    assert adr.read_checkout(root) == (adr_files(3), INV_BASE)
+    assert adr.read_checkout(tmp_path / "empty") == ({}, None)
+    d = root / "governance" / "decisions"
+    (d / "ADR-0004-x.md").mkdir()
+    with pytest.raises(adr.RecordError, match="ADR-0004-x.md is not a plain file"):
+        adr.read_checkout(root)
+    r = tool("adr", "lint", "--root", root)
+    assert r.returncode == 1 and "decision records must be plain files" in r.stdout
+    (d / "ADR-0004-x.md").rmdir()
+    (d / "ADR-0004-x.md").write_bytes(b"# ADR-0004: \xff\n")
+    with pytest.raises(adr.RecordError, match="not UTF-8"):
+        adr.read_checkout(root)
+    (d / "ADR-0004-x.md").unlink()
+    (d / "README.txt").write_bytes(b"\xff")                       # not a record: not read
+    (d / "adr-0005-lower.md").write_text("x", encoding="utf-8")  # a misspelt record is read, and lint reports it
+    assert adr.read_checkout(root)[0] == dict(adr_files(3), **{"adr-0005-lower.md": "x"})
+    assert "adr-0005-lower.md: file name must be ADR-NNNN-lowercase-slug.md" in adr.lint(adr.read_checkout(root)[0])
+    (d / "adr-0005-lower.md").unlink()
+    inv = root / "governance" / "INVARIANTS.md"
+    inv.unlink()
+    inv.mkdir()
+    with pytest.raises(adr.RecordError, match="INVARIANTS.md is not a plain file"):
+        adr.read_checkout(root)
+    inv.rmdir()
+    shutil.rmtree(d)
+    if not make_dir_link(d, other / "governance" / "decisions"):
+        pytest.skip("cannot create a symbolic link or junction here")
+    assert adr.read_checkout(other)[0] == adr_files(3) and (d / "ADR-0001-d1.md").is_file()
+    with pytest.raises(adr.RecordError, match="governance/decisions is a symbolic link or junction"):
+        adr.read_checkout(root)
+    for args in (["lint", "--root", root], ["index", "--root", root],
+                 ["breaker", "--root", root, "--base-root", other, "--acknowledged"],
+                 ["breaker", "--root", other, "--base-root", root, "--acknowledged"]):
+        r = tool("adr", *args)
+        assert r.returncode == 1 and "is a symbolic link or junction" in r.stdout, (args, r.stdout, r.stderr)
+    _rmlink(d)
+    shutil.rmtree(root / "governance")
+    assert make_dir_link(root / "governance", other / "governance")
+    with pytest.raises(adr.RecordError, match="^governance is a symbolic link"):
+        adr.read_checkout(root)
+    _rmlink(root / "governance")
+    try:
+        os.symlink(other / "governance" / "INVARIANTS.md", tmp_path / "inv-link")
+    except (OSError, NotImplementedError):
+        return                                                  # file links need a privilege on Windows
+    write_decisions(root, adr_files(3))
+    (root / "governance" / "INVARIANTS.md").unlink()
+    os.replace(tmp_path / "inv-link", root / "governance" / "INVARIANTS.md")
+    with pytest.raises(adr.RecordError, match="INVARIANTS.md is a symbolic link"):
+        adr.read_checkout(root)
+
+
+@needs_git
+def test_adr_read_rev_takes_only_plain_files(tmp_path):
+    repo = tmp_path / "repo"
+    write_decisions(repo, adr_files(3))
+    (repo / "governance" / "decisions" / "README.txt").write_text("not a record\n", encoding="utf-8")
+    (repo / "governance" / "decisions" / "old").mkdir()
+    (repo / "governance" / "decisions" / "old" / "ADR-0009-nested.md").write_text("ignored\n", encoding="utf-8")
+    assert _git("init", "-q", cwd=repo).returncode == 0
+    git_commit(repo, "base")
+    _git("tag", "base", cwd=repo)
+    write_decisions(repo, adr_files(1), "changed\n")             # the working tree is not read
+    assert adr.read_rev(repo, "HEAD") == (adr_files(3), INV_BASE)
+    _git("checkout", "-q", "-f", "--", ".", cwd=repo)
+    head = git_rev(repo)
+    cases = [("governance", "120000", "governance is not a directory"),
+             ("governance", "160000", "governance is not a directory"),
+             ("governance/decisions", "120000", "governance/decisions is not a directory"),
+             ("governance/decisions", "160000", "governance/decisions is not a directory"),
+             ("governance/decisions/ADR-0002-d2.md", "120000", "ADR-0002-d2.md is not a plain file"),
+             ("governance/decisions/ADR-0002-d2.md", "160000", "ADR-0002-d2.md is not a plain file"),
+             ("governance/INVARIANTS.md", "120000", "INVARIANTS.md is not a plain file"),
+             ("governance/INVARIANTS.md", "160000", "INVARIANTS.md is not a plain file")]
+    for path, mode, needle in cases:
+        _git("checkout", "-q", "-f", "-B", "case", "base", cwd=repo)
+        assert _git("rm", "-rq", "--cached", path, cwd=repo).returncode == 0
+        git_special_entry(repo, path, head if mode == "160000" else "../../elsewhere", mode)
+        assert _git("commit", "-q", "-m", f"{path} {mode}", cwd=repo).returncode == 0
+        with pytest.raises(adr.RecordError, match=needle):
+            adr.read_rev(repo, "HEAD")
+        r = tool("adr", "breaker", "--root", repo, "--rev", "HEAD", "--base-rev", "base", "--acknowledged")
+        assert r.returncode == 1 and needle in r.stdout and "plain files" in r.stdout, (path, mode, r.stdout)
+    _git("checkout", "-q", "-f", "-B", "case", "base", cwd=repo)
+    (repo / "governance" / "decisions" / "ADR-0002-d2.md").write_bytes(b"# ADR-0002: \xff\n")
+    git_commit(repo, "not utf-8")
+    with pytest.raises(adr.RecordError, match="ADR-0002-d2.md at HEAD is not UTF-8"):
+        adr.read_rev(repo, "HEAD")
+    _git("checkout", "-q", "-f", "-B", "case", "base", cwd=repo)
+    _git("rm", "-rq", "governance", cwd=repo)
+    (repo / "keep.txt").write_text("x\n", encoding="utf-8")
+    git_commit(repo, "no governance")
+    assert adr.read_rev(repo, "HEAD") == ({}, None)
+    for rev, needle in (("-x", "is not a revision"), ("", "is not a revision"), ("no-such", "is not a commit")):
+        with pytest.raises(RuntimeError, match=needle):
+            adr.read_rev(repo, rev)
+    (repo / "sub").mkdir()
+    with pytest.raises(RuntimeError, match="is not the top level"):
+        adr.read_rev(repo / "sub", "HEAD")
+    r = tool("adr", "lint", "--root", repo, "--rev", "base")
+    assert r.returncode == 0 and "3 decision record(s)" in r.stdout
+
+
 def _git_ok() -> bool:
     try:
         return subprocess.run(["git", "-C", str(ROOT), "rev-parse", "HEAD"], capture_output=True,
@@ -1922,8 +3647,7 @@ def _git_ok() -> bool:
 
 @pytest.mark.skipif(not _git_ok(), reason="needs a git checkout")
 def test_adr_breaker_against_git_revision():
-    assert "INV-VERIFY" in adr.show_rev(ROOT, "HEAD", "governance/INVARIANTS.md")
-    assert adr.show_rev(ROOT, "HEAD", "governance/no-such-file.md") is None
-    assert isinstance(adr.load_rev(ROOT, "HEAD", "governance/decisions"), dict)
+    files, inv = adr.read_rev(ROOT, "HEAD")
+    assert "INV-VERIFY" in inv and len(files) >= 8
     r = tool("adr", "breaker", "--base-rev", "no-such-revision-xyz")
     assert r.returncode == 2 and "adr:" in r.stderr

@@ -16,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <locale.h>
 #include <pthread.h>
 #include <sched.h>
 #include <time.h>
@@ -29,6 +30,7 @@
 #endif
 #if defined(__APPLE__)
 #  include <mach/mach.h>
+#  include <xlocale.h>
 #endif
 #if defined(__linux__) && defined(HX_ARCH_ARM64)
 #  include <sys/auxv.h>
@@ -131,12 +133,18 @@ uint64_t hx_now_ns(void) {
     return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
 }
 
+/* Sleeps until hx_now_ns has advanced by us; an interrupted sleep continues. */
 void hx_sleep_us(uint32_t us) {
     if (us == 0) { sched_yield(); return; }
-    struct timespec req, rem;
-    req.tv_sec = (time_t)(us / 1000000u);
-    req.tv_nsec = (long)(us % 1000000u) * 1000L;
-    while (nanosleep(&req, &rem) != 0 && errno == EINTR) req = rem;
+    const uint64_t deadline = hx_now_ns() + (uint64_t)us * 1000u;
+    for (;;) {
+        uint64_t now = hx_now_ns();
+        if (now >= deadline) return;
+        struct timespec req;
+        req.tv_sec = (time_t)((deadline - now) / 1000000000u);
+        req.tv_nsec = (long)((deadline - now) % 1000000000u);
+        nanosleep(&req, NULL);
+    }
 }
 
 /* --------------------------------------------------------------- threads */
@@ -181,12 +189,20 @@ int hx_num_cpus(void) {
 }
 
 #if defined(__linux__)
-/* A CPU is the first thread of its core if it is the lowest id in its sibling list. */
+/* Distinct cores among the CPUs this process may run on; a core is named by the lowest CPU id
+ * in its sibling list (whether or not that CPU is in the affinity set). */
 static int hx__linux_cores(void) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    int have_set = sched_getaffinity(0, sizeof set, &set) == 0;
     long ncfg = sysconf(_SC_NPROCESSORS_CONF);
+    if (ncfg > CPU_SETSIZE) ncfg = CPU_SETSIZE;
+    unsigned char seen[CPU_SETSIZE / 8];
+    memset(seen, 0, sizeof seen);
     int cores = 0;
     for (long cpu = 0; cpu < ncfg; cpu++) {
         static const char *const names[2] = {"core_cpus_list", "thread_siblings_list"};
+        if (have_set && !CPU_ISSET((int)cpu, &set)) continue;
         int first = -1;
         for (int k = 0; k < 2 && first < 0; k++) {
             char path[128];
@@ -196,7 +212,11 @@ static int hx__linux_cores(void) {
             if (fscanf(fp, "%d", &first) != 1) first = -1;
             fclose(fp);
         }
-        if (first == (int)cpu) cores++;
+        if (first < 0 || first >= CPU_SETSIZE) first = (int)cpu;   /* no topology: count the CPU */
+        if (!(seen[first / 8] & (1u << (first % 8)))) {
+            seen[first / 8] |= (unsigned char)(1u << (first % 8));
+            cores++;
+        }
     }
     return cores;
 }
@@ -239,22 +259,24 @@ void hx_cond_init(hx_cond *c) {
 void hx_cond_destroy(hx_cond *c) { pthread_cond_destroy(&c->c); }
 void hx_cond_wait(hx_cond *c, hx_mutex *m) { pthread_cond_wait(&c->c, &m->m); }
 
+/* The deadline is on hx_now_ns's clock (CLOCK_MONOTONIC), so a timeout never comes early. */
 int hx_cond_timedwait(hx_cond *c, hx_mutex *m, uint32_t timeout_us) {
-    int rc;
+    const uint64_t deadline = hx_now_ns() + (uint64_t)timeout_us * 1000u;
 #if defined(__APPLE__)
-    struct timespec rel;
-    rel.tv_sec = (time_t)(timeout_us / 1000000u);
-    rel.tv_nsec = (long)(timeout_us % 1000000u) * 1000L;
-    rc = pthread_cond_timedwait_relative_np(&c->c, &m->m, &rel);
+    for (;;) {                                    /* relative waits: re-wait if one ends early */
+        uint64_t now = hx_now_ns(), left = deadline > now ? deadline - now : 0;
+        struct timespec rel;
+        rel.tv_sec = (time_t)(left / 1000000000u);
+        rel.tv_nsec = (long)(left % 1000000000u);
+        if (pthread_cond_timedwait_relative_np(&c->c, &m->m, &rel) != ETIMEDOUT) return 0;
+        if (hx_now_ns() >= deadline) return 1;
+    }
 #else
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    ts.tv_sec += (time_t)(timeout_us / 1000000u);
-    ts.tv_nsec += (long)(timeout_us % 1000000u) * 1000L;
-    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
-    rc = pthread_cond_timedwait(&c->c, &m->m, &ts);
+    ts.tv_sec = (time_t)(deadline / 1000000000u);
+    ts.tv_nsec = (long)(deadline % 1000000000u);
+    return pthread_cond_timedwait(&c->c, &m->m, &ts) == ETIMEDOUT ? 1 : 0;
 #endif
-    return rc == ETIMEDOUT ? 1 : 0;
 }
 
 void hx_cond_signal(hx_cond *c) { pthread_cond_signal(&c->c); }
@@ -365,6 +387,49 @@ int hx_path_exists(const char *path) {
     return path && *path && stat(path, &st) == 0;
 }
 
+/* fsync the directory holding path, so a rename in it survives a crash. Best effort: some
+ * filesystems refuse to fsync directories. */
+static void hx__sync_parent(const char *path) {
+    const char *slash = strrchr(path, '/');
+    size_t len = slash ? (size_t)(slash - path) : 0;
+    char *dir = (char *)malloc(len + 2);
+    if (!dir) return;
+    if (!slash) strcpy(dir, ".");
+    else if (len == 0) strcpy(dir, "/");
+    else { memcpy(dir, path, len); dir[len] = 0; }
+    int oflags = O_RDONLY;
+#if defined(O_DIRECTORY)
+    oflags |= O_DIRECTORY;
+#endif
+#if defined(O_CLOEXEC)
+    oflags |= O_CLOEXEC;
+#endif
+    int fd = hx__open(dir, oflags);
+    if (fd >= 0) {
+        if (fsync(fd) != 0) hx_log(HX_LOG_DEBUG, "fsync of directory %s: %s", dir, strerror(errno));
+        else hx_log(HX_LOG_DEBUG, "hx_file_replace: synced directory %s", dir);
+        close(fd);
+    }
+    free(dir);
+}
+
+/* Files only, as on Windows: rename(2) refuses a file over a directory by itself, but would
+ * move a directory to a new name or over an empty directory. */
+int hx_file_replace(const char *tmp_path, const char *dst_path) {
+    struct stat st;
+    if (!tmp_path || !*tmp_path || !dst_path || !*dst_path) return -1;
+    if (stat(tmp_path, &st) == 0 && S_ISDIR(st.st_mode)) {
+        hx_log(HX_LOG_DEBUG, "hx_file_replace %s -> %s: a directory is not moved", tmp_path, dst_path);
+        return -1;
+    }
+    if (rename(tmp_path, dst_path) != 0) {        /* EXDEV across filesystems: no copy fallback */
+        hx_log(HX_LOG_DEBUG, "hx_file_replace %s -> %s: %s", tmp_path, dst_path, strerror(errno));
+        return -1;
+    }
+    hx__sync_parent(dst_path);
+    return 0;
+}
+
 /* ------------------------------------------------------------ cpu features */
 
 static hx_cpu hx__cpu;
@@ -373,7 +438,15 @@ static pthread_once_t hx__cpu_once = PTHREAD_ONCE_INIT;
 static void hx__cpu_init(void) {
     memset(&hx__cpu, 0, sizeof hx__cpu);
 #if defined(HX_ARCH_X86_64)
-    hx__detect_x86(&hx__cpu);
+    int zmm_lazy = 0;
+#  if defined(__APPLE__)
+    /* Darwin enables AVX-512 state on a thread's first AVX-512 instruction, so XCR0 does not
+     * show it yet; the kernel reports support here instead. (Never compiled or run on macOS.) */
+    int v512 = 0;
+    size_t len512 = sizeof v512;
+    if (sysctlbyname("hw.optional.avx512f", &v512, &len512, NULL, 0) == 0 && v512) zmm_lazy = 1;
+#  endif
+    hx__detect_x86(&hx__cpu, zmm_lazy);
 #elif defined(HX_ARCH_ARM64)
     hx__cpu.neon = 1;                             /* mandatory in AArch64 */
 #  if defined(__linux__)
@@ -407,4 +480,22 @@ const hx_cpu *hx_cpu_features(void) {
 const char *hx_env_str(const char *name) {
     if (!name || !*name) return NULL;
     return getenv(name);
+}
+
+/* strtod in the "C" locale, whatever LC_NUMERIC the host process has set. */
+static locale_t hx__c_locale;
+static pthread_once_t hx__c_locale_once = PTHREAD_ONCE_INIT;
+
+static void hx__c_locale_init(void) { hx__c_locale = newlocale(LC_ALL_MASK, "C", (locale_t)0); }
+
+static double hx__strtod_c(const char *s, char **end) {
+    pthread_once(&hx__c_locale_once, hx__c_locale_init);
+    if (!hx__c_locale) return strtod(s, end);
+    locale_t old = uselocale(hx__c_locale);
+    errno = 0;
+    double v = strtod(s, end);
+    int e = errno;
+    uselocale(old);
+    errno = e;
+    return v;
 }

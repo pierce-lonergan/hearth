@@ -1,0 +1,139 @@
+{
+  "generation_id": "gen-001-governance",
+  "parent_generation": null,
+  "timestamp": "2026-10-05T05:50:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H05-governance",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified: .github/workflows/{ci,decisions}.yml, CONTRIBUTING.md, governance/README.md, governance/tools/{check_golden,adr,validate_handover,friction,mutate}.py, tests/py/test_governance.py; new: .github/CODEOWNERS, .github/workflows/golden.yml, governance/decisions/ADR-0009-golden-gate-against-base-revision.md, governance/handovers/H05-governance-gen-001.json. Nothing outside H05 ownership touched (pool.c and python/hearth/sim/ changes in the tree belong to H02/H04)."
+  },
+  "constraints_touched": [
+    "INV-VERIFY",
+    "INV-HONEST",
+    "INV-DATA"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Council major finding (T05, ci.yml): a change could gut a golden test, re-lock it and pass both CI golden steps. Real, and fixed: the golden gate now compares the change with the BASE revision's lock",
+        "evidence": "Reproduced as a test with a temporary git repository (test_golden_change_that_relocks_itself_fails_against_the_base): base commit tagged 'base' with the demo golden suite, lock and governance/tools/check_golden.py; branch 'pr' replaces the test with a stub, re-locks with HEARTH_MAINTAINER=1 --update and replaces its own check_golden.py with one that exits 0. Head-only check: rc 0, and --run: 'golden suite OK: 1 passed' (the hole). New: check_golden.py --base-rev base (git cat-file of the base manifest) or --base-manifest FILE fails with RELOCKED / MODIFIED, rc 1, before anything runs; --acknowledged continues with the change's own lock. The golden.yml step command is extracted from the workflow file and run in a workspace laid out as the workflow lays it out (base/ and pr/ from git archive): rc 1 without the label, rc 0 with it, rc 0 for a change that leaves tests/golden alone; the change's own weakened tool would have exited 0. golden.yml and decisions.yml run on pull_request_target (workflow and tool from the base branch, PR merge ref checked out as data, read-only token, no secrets, nothing from the PR executed; a test asserts no pip/pytest/--run/cmake/secrets/cache/PYTHONPATH in them). ci.yml runs check_golden, waves, validate_handover and adr lint from the base checkout (.trusted, deleted first in case the change brings one); a test runs those four ci.yml step commands against this repository (rc 0). .github/CODEOWNERS added. README 'CI' section lists 7 residual trust assumptions (branch protection, code-owner review, ci.yml being the PR's own copy, labels are switches, etc.). ADR-0009 (Proposed) records the decision.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Council minor finding (adr.py breaker): duplicate-id shadow files hid retired ADRs and in-place rewrites of Accepted ADRs were not detected. Real, and fixed",
+        "evidence": "Reproduced before the fix: 8 ADRs set Deprecated plus 8 Accepted shadow copies gave tripped == []; rewriting ADR-0004's title and Decision gave tripped == []. breaker() now groups files by id: duplicate ids trip; an id counts as still Accepted only if exactly one file carries it; an ADR decided at the base (any status but Proposed) trips when deleted or when its title, Supersedes line or any section changes in substance (Status, Date, Superseded-by may change; whitespace ignored; a renamed file with the same text does not trip). decisions.yml compares with --base-root (base checkout) instead of git history. Tests: test_adr_breaker_duplicate_ids_cannot_hide_retired_decisions, test_adr_breaker_detects_decided_adrs_rewritten_in_place, test_decisions_gate_as_the_workflow_runs_it; test_adr_invariants_breaker_needs_a_relevant_decision updated (an in-place amendment of an Accepted ADR now trips; a Proposed one still covers an INVARIANTS.md change).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Council minor findings (validate_handover.py): backreferences and quantified assertions translated inexactly; OverflowError traceback; malformed keyword values crashed or failed per file. Real, and fixed",
+        "evidence": "Reproduced before the fix: '^(?:(z)|gen)\\1-x$' did not match 'gen-x' (ECMA does); '(?=a)*', '\\b{2}', '(?<!b)+' were accepted; 'a{3,4294967296}' raised OverflowError; required: 'abc' reported 3 missing properties; minLength: '5' raised TypeError. Fixes: backreferences (\\N, \\k) rejected as having no exact translation; the translator tracks what a quantifier would repeat and rejects quantifiers on lookarounds, \\b, \\B, ^, $, at the start, after '(' or '|', and repeated quantifiers; unbalanced ')' rejected; OverflowError/RecursionError from re.compile become re.error (exit 2); MiniValidator checks keyword value kinds (type, required, enum, properties, $defs, pattern, format, $ref, min/max*); with jsonschema the schema is checked against its metaschema with the 'regex' format left out (jsonschema would compile patterns with Python's re, which crashes on huge repeats and rejects ECMA syntax such as (?<name>...)); ECMA patterns are checked first. 18 malformed schemas exit 2 under builtin, auto and jsonschema (test_handover_cli_rejects_malformed_schemas); ECMA-only patterns are accepted under every engine (test_builtin_engine_accepts_well_formed_keyword_values). No node.js differential test was added (node not checked here).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Council minor finding (friction.py): MSVC's bare %p values were not masked, so a repeated crash on Windows never tripped. Real, and fixed",
+        "evidence": "Reproduced: the council's three signatures with 000001F2A3B4C5D6 / 00000213B4C5D6E7 / 0000024C1D2E3F40 gave thrashing == []. normalize() now masks bare hex runs of exactly 16 or 8 digits containing a digit and not adjacent to [0-9A-Za-z_], tempfile names (tmp + 8), pytest-N, this directory's hearth-golden-/hearth-mutate- temp dirs and 'pid N'. test_friction_masks_msvc_pointers_and_run_specific_names: the council case trips (in-process and via CLI), 8 'same' pairs, 8 'different' pairs (sha1, 7 and 13 digits, DEADBEEF, C2065, identifiers, tmpfile_a). mutate.py makes no mutants of regex literals, so an ad-hoc check removed or loosened each mask: 11/11 variants fail the tests (was 10/11 before the tmpfile_a pair).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "mutate.py treats .inc files as C and reads them in their includers' context",
+        "evidence": "language_of accepts .c/.h/.inc. For an .inc, includers() finds C files next to it or in engine/src that #include it (resolved like any quoted include); fragment_context() runs the preprocessor model over each includer's text before the #include (skipping includers where that point is inactive), merges macro models (disagreement = unknown) and collects typedef names from the prefix and its headers. On engine/src/platform_common.inc: 446 candidates, 0 marked undecidable, 'fragment context: included by engine/src/platform_posix.c, engine/src/platform_win.c'; standalone it would be 449 candidates with 149 marked undecidable (HX_ARCH_X86_64 unknown). The report JSON has 'included_by'. Tests: test_mutate_inc_files_are_c_in_their_includers_context (incl. a full 3-mutant run on an .inc), test_mutate_inc_context_from_several_includers (6 cases), test_mutate_lists_the_real_platform_fragment.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The new tests fail against the base revision's tools",
+        "evidence": "git archive 4a6cb80 into a scratch dir, overlaid with only the new tests/py/test_governance.py and .github/: 36 of the 39 new or changed tests fail; the 3 that pass check the overlaid workflow files and CODEOWNERS. Scratch dir deleted.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "All handover manifests in governance/handovers/ are valid",
+        "evidence": "python governance/tools/validate_handover.py governance/handovers --strict: 22/22 valid with the default engine (jsonschema) and with --engine builtin (the 20 earlier manifests, H04-sim-gen-001.json written meanwhile by H04, and this one). No invalid manifest to report.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "jsonschema's check_schema can be used as-is to reject malformed schemas",
+        "evidence": "It validates 'pattern' with the metaschema's 'regex' format, i.e. Python's re: 'a{3,4294967296}' escaped as an OverflowError traceback, and ECMA-valid '(?<task>...)' would be rejected as 'not a regex'. Replaced by a metaschema validator whose FormatChecker excludes 'regex', after the ECMA pattern check.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The golden comparison could take the base manifest from the merge commit's first parent (git) in golden.yml",
+        "evidence": "Not adopted: if GitHub ever produced a fast-forward merge ref, HEAD^1 would be the PR head itself and the check would compare the change with itself. golden.yml checks out the base branch (github.sha under pull_request_target) as the trusted source instead.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "None of the workflows has run on GitHub. In particular unverified: that pull_request_target check runs ('golden lock vs base', 'decision circuit breaker') can be made required status checks and are reported on the PR head; that actions/checkout fetches refs/pull/N/merge under pull_request_target; how often the merge ref and the base branch head drift (that drift fails closed). The bootstrap PR that introduces golden.yml and the pull_request_target decisions.yml will run neither gate, because pull_request_target uses the base branch's workflow files.",
+      "Python 3.9 compatibility is checked only with ast.parse(feature_version=(3, 9)); no 3.9 interpreter here.",
+      "The CODEOWNERS owner is @pierce-lonergan (the only commit author). GitHub silently ignores owners without write access; a maintainer must confirm the handle or replace it with a team."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_governance.py -q -p no:cacheprovider",
+    "python governance/tools/check_golden.py --base-rev HEAD",
+    "python governance/tools/validate_handover.py governance/handovers --strict",
+    "python governance/tools/adr.py lint",
+    "python governance/tools/adr.py breaker --base-rev HEAD",
+    "python governance/tools/mutate.py --file engine/src/platform_common.inc --list --max-mutants 8",
+    "python governance/tools/mutate.py --file governance/tools/check_golden.py --lines 192,217,226-277,384-388,392-398,422-435,456-476 --max-mutants 0 --jobs 4 --seed 1 -q --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"golden_base or compare_base or relocks_itself or base_rev_edge or golden_update_requires or never_execute or from_the_base_revision\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/adr.py --lines 230-282 --max-mutants 0 --jobs 4 --seed 1 -q --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"adr or decisions_gate\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/validate_handover.py --lines 167-170,204-252,266-270 --max-mutants 0 --jobs 4 --seed 1 -q --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"ecma_pattern or well_formed\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/validate_handover.py --lines 370-416,497-509,740-743 --max-mutants 0 --jobs 4 --seed 1 -q --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"builtin or malformed_schemas or well_formed or untranslatable or handover_cli\\\"\"",
+    "python governance/tools/mutate.py --file governance/tools/mutate.py --lines 1072-1131,1139-1143,1686-1687,1786 --max-mutants 0 --jobs 4 --seed 1 -q --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k \\\"inc_ or platform_fragment or preprocessor_regions or lexical_structure\\\"\""
+  ],
+  "measurements": [
+    {
+      "metric": "mutation score, check_golden.py changed lines (62 of 62 in range, seed 1)",
+      "value": 0.968,
+      "unit": "fraction",
+      "conditions": "60 killed, 2 survivors equivalent (git subprocess timeout 120 -> 119/121); 4 jobs; Windows 11, Ryzen 9 9950X, other engineers' jobs running",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, adr.py breaker lines 230-282 (36 of 36, seed 1)",
+      "value": 1.0,
+      "unit": "fraction",
+      "conditions": "36 killed; 4 jobs; concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, validate_handover.py changed lines (84 translator + 52 schema/main mutants, seed 1)",
+      "value": 1.0,
+      "unit": "fraction",
+      "conditions": "final runs after test additions: translator lines 167-170,204-252,266-270 with -k 'ecma_pattern or well_formed': 70 killed + 14 timeouts (all 'i + 1' index mutants, infinite loops that persisted on the solo retry; baseline 2.8 s, timeout 13.4 s); schema/main lines 370-416,497-509,740-743: 52/52 killed. Before the additions: 0.930 (6 survivors: message-only backreference branch, a redundant startswith guard, since simplified) and 0.942 (3 survivors: items/additionalProperties subschema check untested, .get(k, 0) default equivalent, since restructured, and auto-engine selection untested). A first single run of all 138 mutants with a slower test selection was killed at the 1-hour background limit before reporting (its leftover temp dir was removed). 4 jobs; concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score, mutate.py changed lines (45 of 45, seed 1)",
+      "value": 0.956,
+      "unit": "fraction",
+      "conditions": "was 0.844 (7 survivors) before adding .py/.txt, non-C includer and -D-context tests; 2 equivalent survivors: the self/directory skip on line 1095 (a directory read raises OSError, which is caught; a fragment never includes itself) and models[1:] -> models[0:] (compares the first model with itself); 4 jobs; concurrent load",
+      "kind": "measured"
+    },
+    {
+      "metric": "ad-hoc mask variants of friction._VOLATILE killed (each mask dropped or loosened)",
+      "value": 11,
+      "unit": "of 11",
+      "conditions": "mutate.py makes no mutants of regex literals (0 candidates on the changed lines); scratch script, in-process friction tests",
+      "kind": "measured"
+    },
+    {
+      "metric": "tests/py/test_governance.py",
+      "value": 212,
+      "unit": "passed",
+      "conditions": "Windows 11, Python 3.13 + jsonschema 4.26: 212 passed, 1 skipped (t-strings need 3.14) in 163.6 s under concurrent load (baseline before this generation: 172 passed, 1 skipped). WSL2 Ubuntu 24.04, Python 3.12.3 venv with pytest copied in, no jsonschema, no .git: 179 passed, 2 skipped in 64.5 s",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Maintainer, outside the repository: enable branch protection on main (required checks 'golden lock vs base', 'decision circuit breaker' and the ci.yml build jobs; require review from Code Owners; dismiss stale approvals; include administrators), create the labels 'golden-reviewed' and 'decisions-reviewed', and confirm the CODEOWNERS handle. Without these the gate is advisory (governance/README.md, CI).",
+    "Maintainer: accept or reject ADR-0009 (left Proposed).",
+    "Proposed contract change (not made, INVARIANTS.md is maintainer-owned): INV-VERIFY 'enforced by' should name the base comparison; see the report's contract_issues.",
+    "Run the workflows on GitHub once and check the open questions about pull_request_target required checks."
+  ]
+}

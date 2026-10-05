@@ -10,8 +10,8 @@ import numpy as np
 
 from .. import presets
 from . import feasibility as feas_mod
-from .cache import (ONLINE_POLICIES, POLICIES, CacheCounts, Prefetch, Schedule, build_schedule,
-                    engine_min_slots, profile_order, run_cache)
+from .cache import (MAX_IO_THREADS, ONLINE_POLICIES, POLICIES, CacheCounts, Prefetch, Schedule, as_count,
+                    build_schedule, engine_min_slots, is_real, profile_order, run_cache)
 from .hardware import Hardware, get_hardware
 from .timing import COMPONENTS, GPU_MODES, Calibration, ModelCosts, Timing, evaluate, model_costs
 from .trace import Trace, load_usage, synthetic_for
@@ -36,11 +36,9 @@ class Spec:
     alpha: float = 0.6
 
     def __post_init__(self):
-        if int(self.k) != self.k or self.k < 0:
-            raise ValueError(f"speculative k must be an integer >= 0, got {self.k}")
-        if not 0.0 <= self.alpha <= 1.0:
-            raise ValueError(f"speculative alpha must be in [0, 1], got {self.alpha}")
-        object.__setattr__(self, "k", int(self.k))          # 4.0 -> 4: k is used as a slice bound
+        object.__setattr__(self, "k", as_count("speculative k", self.k))   # 4.0 -> 4: k is a slice bound
+        if not (is_real(self.alpha) and 0.0 <= self.alpha <= 1.0):
+            raise ValueError(f"speculative alpha must be in [0, 1], got {self.alpha!r}")
         object.__setattr__(self, "alpha", float(self.alpha))
 
     def expected_tokens(self) -> float:
@@ -58,6 +56,17 @@ class Lossy:
     skip_miss_rank: int | None = None
     cold_bits: float | None = None
     cold_frac: float = 0.5
+
+    def __post_init__(self):
+        # ranges that depend on the model (top-k, bits) are checked by simulate()
+        for name in ("topk", "skip_miss_rank"):
+            v = getattr(self, name)
+            if v is not None:
+                object.__setattr__(self, name, as_count(f"lossy {name}", v, 1))
+        if self.cold_bits is not None and not is_real(self.cold_bits):
+            raise ValueError(f"lossy cold_bits must be a number, got {self.cold_bits!r}")
+        if not is_real(self.cold_frac):
+            raise ValueError(f"lossy cold_frac must be a number, got {self.cold_frac!r}")
 
     def labels(self) -> list:
         out = []
@@ -171,12 +180,14 @@ def resolve_trace(shape, trace=None, *, tokens=2000, zipf=1.1, reuse=0.25, seed=
     return tr
 
 
-def _resolve_profile(profile, shape, ids: np.ndarray, warmup: int, warnings: list) -> np.ndarray:
+def _resolve_profile(profile, shape, ids: np.ndarray, warmup: int, warnings: list) -> tuple[np.ndarray, int]:
+    """(activation counts per key, tokens they were counted over; 0 = unknown, e.g. an array profile)."""
     L, E = shape.n_moe_layers, shape.n_experts
     offs = (np.arange(L, dtype=np.int64) * E)[None, :, None]
 
     def heat_of(sl):
-        return np.bincount((ids[sl].astype(np.int64) + offs).ravel(), minlength=L * E).astype(np.float64)
+        part = ids[sl]
+        return np.bincount((part.astype(np.int64) + offs).ravel(), minlength=L * E).astype(np.float64), len(part)
 
     if profile is None or (isinstance(profile, str) and profile == "warmup"):
         if warmup > 0:
@@ -187,16 +198,26 @@ def _resolve_profile(profile, shape, ids: np.ndarray, warmup: int, warnings: lis
         warnings.append("oracle profile: pinned/VRAM/cold choices see the whole trace (upper bound)")
         return heat_of(slice(None))
     if isinstance(profile, (str, Path)):
-        heat, _ = load_usage(profile)
+        heat, tokens = load_usage(profile)
         if heat.shape == (shape.n_layers, E):
             heat = heat[shape.n_dense_layers:]
         if heat.shape != (L, E):
             raise ValueError(f"usage profile shape {heat.shape} does not match {shape.name} ({L}, {E})")
-        return heat.ravel().astype(np.float64)
-    arr = np.asarray(profile, dtype=np.float64)
-    if arr.size != L * E:
-        raise ValueError(f"profile must have {L}*{E} entries, got {arr.size}")
-    return arr.ravel()
+        arr, what = heat.ravel().astype(np.float64), f"usage profile {profile}"
+    else:
+        arr, tokens, what = np.asarray(profile, dtype=np.float64).ravel(), 0, "profile"
+        if arr.size != L * E:
+            raise ValueError(f"profile must have {L}*{E} entries, got {arr.size}")
+    bad = np.flatnonzero(~(np.isfinite(arr) & (arr >= 0)))
+    if bad.size:                                         # store.c rejects such a usage_in profile too
+        raise ValueError(f"{what}: heat entry {int(bad[0])} is not a finite non-negative number ({arr[bad[0]]})")
+    return arr, tokens
+
+
+def lfu_seed_scale(tokens: int, decay: float) -> float:
+    """store.c seeds LFU heat from a profile as count / tokens / (1 - decay), the steady state of the decayed
+    counter for that per-token rate; raw counts when the token count is unknown (0) or decay is 1."""
+    return 1.0 / tokens / (1.0 - decay) if tokens > 0 and decay < 1.0 else 1.0
 
 
 def _as_prefetch(p) -> Prefetch | None:
@@ -258,17 +279,14 @@ def simulate(model="kimi-k2", hardware="this-pc", trace=None, *, policy: str = "
         raise ValueError(f"gpu must be one of {GPU_MODES}")
     if cache_gb is not None and not 0.0 <= cache_gb < float("inf"):
         raise ValueError(f"cache_gb must be >= 0 (or None for all free RAM), got {cache_gb}")
-    if int(io_threads) != io_threads or io_threads < 1:
-        raise ValueError(f"io_threads must be an integer >= 1, got {io_threads}")
+    io_threads = as_count("io_threads", io_threads, 1)
     if not 0.0 < lfu_decay <= 1.0:
         raise ValueError(f"lfu_decay must be in (0, 1], got {lfu_decay}")
-    if int(lfu_samples) != lfu_samples or lfu_samples < 0:
-        raise ValueError(f"lfu_samples must be an integer >= 0, got {lfu_samples}")
+    lfu_samples = as_count("lfu_samples", lfu_samples)
     if not 0.0 <= pin_fraction <= 0.9:
         raise ValueError(f"pin_fraction must be in [0, 0.9] (hx_store_opts), got {pin_fraction}")
-    if warmup is not None and (int(warmup) != warmup or warmup < 0):
-        raise ValueError(f"warmup must be an integer >= 0, got {warmup}")
-    io_threads, lfu_samples = int(io_threads), int(lfu_samples)
+    if warmup is not None:
+        warmup = as_count("warmup", warmup)
     shape = presets.get(model)
     hw = get_hardware(hardware, **(hw_overrides or {}))
     if gpu != "off" and not hw.has_gpu:
@@ -278,11 +296,14 @@ def simulate(model="kimi-k2", hardware="this-pc", trace=None, *, policy: str = "
     sp = _as_spec(spec)
     lo = _as_lossy(lossy)
     warnings: list = []
+    if io_threads > MAX_IO_THREADS:
+        warnings.append(f"io_threads {io_threads} > {MAX_IO_THREADS}: the engine clamps it to {MAX_IO_THREADS} "
+                        f"(hx_store_opts), and so does the minimum slot count here")
     tr = resolve_trace(shape, trace, tokens=tokens, zipf=zipf, reuse=reuse, seed=seed)
     T = tr.n_tokens
     if T < 2:
         raise ValueError("trace needs at least 2 tokens")
-    W = T // 10 if warmup is None else int(warmup)
+    W = T // 10 if warmup is None else warmup
     if not 0 <= W < T:
         raise ValueError(f"warmup must be in [0, {T})")
     ids = tr.ids
@@ -299,7 +320,7 @@ def simulate(model="kimi-k2", hardware="this-pc", trace=None, *, policy: str = "
 
     costs = model_costs(shape, expert_bits=expert_bits, dense_bits=dense_bits, embed_bits=embed_bits,
                         cold_bits=lo.cold_bits, context=context, max_seq=max_seq, kv_elem_bytes=kv_elem_bytes)
-    fz = feas_mod.check(costs, hw, gpu_mode=gpu, io_threads=io_threads, shape=shape)
+    fz = feas_mod.check(costs, hw, gpu_mode=gpu, io_threads=io_threads)
     if not fz.fits:
         warnings.extend("INFEASIBLE: " + r for r in fz.reasons)
     min_slots = engine_min_slots(shape.top_k, io_threads)
@@ -319,7 +340,7 @@ def simulate(model="kimi-k2", hardware="this-pc", trace=None, *, policy: str = "
 
     needs_profile = policy in ("pinned", "lfu-pinned") or lo.cold_bits is not None or \
         (gpu == "dense+experts" and fz.vram_expert_slots > 0)
-    heat = _resolve_profile(profile, shape, ids, W, warnings) if needs_profile else None
+    heat, heat_tokens = _resolve_profile(profile, shape, ids, W, warnings) if needs_profile else (None, 0)
     vram_keys = None
     if gpu == "dense+experts" and fz.vram_expert_slots > 0:
         vram_keys = profile_order(heat)[:fz.vram_expert_slots]
@@ -338,7 +359,7 @@ def simulate(model="kimi-k2", hardware="this-pc", trace=None, *, policy: str = "
     counts = run_cache(sched, policy, slots, profile=heat, vram_keys=vram_keys, cold_keys=cold_keys,
                        prefetch=pf, skip_rank=lo.skip_miss_rank, popularity=popularity, lfu_decay=lfu_decay,
                        lfu_samples=lfu_samples, pin_fraction=pin_fraction, io_threads=io_threads, seed=seed,
-                       measure_step=measure_step)
+                       measure_step=measure_step, heat_scale=lfu_seed_scale(heat_tokens, lfu_decay))
     if policy == "belady":
         warnings.append("belady is an offline upper bound (knows the future, may bypass the cache and evict "
                         "in-use slabs, starts with the best possible cache contents)")
@@ -347,7 +368,7 @@ def simulate(model="kimi-k2", hardware="this-pc", trace=None, *, policy: str = "
                             "caching of the same request stream")
     settings = dict(model=shape.name, hardware=hw.name, policy=policy, cache_gb=cache_gb, gpu=gpu,
                     prefetch=asdict(pf) if pf else None, spec=asdict(sp) if sp else None, lossy=asdict(lo),
-                    warmup=W, profile=profile if isinstance(profile, str) else "array",
+                    warmup=W, profile=str(profile) if isinstance(profile, (str, Path)) else "array",
                     expert_bits=expert_bits, dense_bits=dense_bits, embed_bits=embed_bits, context=context,
                     max_seq=max_seq, kv_elem_bytes=kv_elem_bytes, io_threads=io_threads, lfu_decay=lfu_decay,
                     lfu_samples=lfu_samples, pin_fraction=pin_fraction, seed=seed, trace_tokens=T,

@@ -4,9 +4,20 @@ name: decisions
 # adding or removing the 'decisions-reviewed' label starts a fresh run that sees the new labels:
 # re-running an old job replays its original event payload, and the label events must not cancel
 # or repeat the build matrix in ci.yml.
+#
+# pull_request_target runs this file and the tools as they are on the default branch, main (since
+# 2025-12-08 GitHub takes both from the default branch whatever the pull request's base, and
+# github.sha is that branch's head), so a pull request cannot weaken the check that judges it. The
+# gate runs for pull requests into main only. Nothing from the pull request is executed or checked
+# out: merge_ref.py fetches its merge commit as git objects into an empty repository, and its ADRs
+# and INVARIANTS.md are read from those objects. A merge commit with paths that are one file on
+# Windows or macOS (governance/invariants.md beside INVARIANTS.md, an NTFS 8.3 short name) fails
+# whatever the label says. actions/checkout is not used for the pull request (golden.yml says why).
+# Keep it that way (no install, test or build steps here).
 
 on:
-  pull_request:
+  pull_request_target:
+    branches: [main]
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
 permissions:
@@ -21,25 +32,27 @@ jobs:
     name: decision circuit breaker
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Base revision (the tools, its decisions and invariants)
+        uses: actions/checkout@v4
         with:
-          fetch-depth: 0          # compares against the PR base
+          ref: ${{ github.sha }}            # pull_request_target: the head of main, the default branch
+          path: base
+          fetch-depth: 0                    # history: merge_ref.py checks the merge's first parent against it
+          sparse-checkout: governance
+          persist-credentials: false
       - uses: actions/setup-python@v5
         with:
           python-version: "3.13"
-      - name: Breaker tool from the base revision (a change cannot weaken its own check)
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          path: .trusted
-          sparse-checkout: governance/tools
-          persist-credentials: false
-      - name: Decision circuit breaker
-        shell: bash
+      - name: Merge commit of this event's head into this base (git objects only)
         env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -I -S base/governance/tools/merge_ref.py --fetch "$REPO_URL" --pr "$PR_NUMBER"
+          --merge pr --head "$HEAD_SHA" --base base
+      - name: Decision circuit breaker
+        env:
           ACK: ${{ contains(github.event.pull_request.labels.*.name, 'decisions-reviewed') && '--acknowledged' || '' }}
-        run: |
-          t=.trusted/governance/tools
-          [ -f "$t/adr.py" ] || t=governance/tools   # the base predates the tools
-          python "$t/adr.py" breaker --root . --base-rev "$BASE_SHA" $ACK
+        run: python -I -S base/governance/tools/adr.py breaker --root pr --rev HEAD --base-root base $ACK

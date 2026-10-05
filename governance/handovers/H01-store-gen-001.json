@@ -1,0 +1,183 @@
+{
+  "generation_id": "gen-001-h01-store-hardening",
+  "parent_generation": null,
+  "timestamp": "2026-10-05T17:35:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H01-store",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified, uncommitted: engine/src/store.c, engine/src/modelfile.c, engine/tests/test_store.c, engine/tests/test_modelfile.c (982 insertions, 117 deletions in total); new: governance/handovers/H01-store-gen-001.json. HEAD is e9d1bfd through other engineers' commits, none touching these four files or the contract headers since 8ea46c0. Built and tested together with H02's uncommitted platform_*.c (hx_file_replace) in the working tree."
+  },
+  "constraints_touched": [
+    "INV-FMT",
+    "INV-SAFE",
+    "INV-DET-1",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "MAJOR (a) fixed: one hx_store_prefetch call wakes one idle reader per added hint, up to the prefetch in-flight limit (pf_inflight_max - pf_inflight), so a batch of next-layer hints is read in parallel.",
+        "evidence": "New test prefetch_overlap (readers held in the read hook; one call with n_io + 1 hints to idle readers; three rounds on fresh layers): 2, 4, 7 reads in flight for 3, 5, 8 readers (= n_io - 1), never more. The gen-003 wake-up (one hx_cond_signal per call) applied alone to the final store.c: '1 reads in flight, want 2/4/7' -> KILLED. On the NVMe (test_store --bench, new 'prefetch' row: one call per batch of 8 experts of a layer to idle readers, used once resident, never demanded), 2.39 MiB slabs, readers 1/2/4/8/16: fixed 5.02/4.96/6.62/6.57/6.56 and 4.89/4.88/6.72/6.67/6.66 GB/s (two runs) vs gen-003 wake-up 4.24/4.27/4.26/4.27/4.20 (flat at one reader); 22.3 MiB: 5.64/5.59/6.20/6.54/6.14 and 5.47/5.51/6.21/6.30/6.12 vs 5.68/5.78/5.74/5.80/5.73. Shared machine, noisy (the old binary's own demand row was ~10% lower at 1 reader in its run).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "MAJOR (b) fixed: the overcommit precondition is deterministic. It waits (up to 30 s, polling is_resident, which keeps the holds) for exactly the n_slots demanded slabs the free slots can take, then checks after 20 ms that the resident prefix is n_slots and stats.reads == n_slots (the starved readers read nothing more). A short window without progress is no longer taken for starvation.",
+        "evidence": "Reproduced first with the verifier's load (32 busy-loop processes + 6 parallel test_store --quick): gen-003 test_store failed 3 of 6 (seeds 61-66, output via pipes) and 2 of 6 (same seeds, output to files) with 'overcommit: 0 of 80 served before starving'. New test_store under the same load: 0 failures in 36 runs with output to files (61-66, 81-86, 71-80+87+88, final binary 111-122) and 0 in 24 with output via pipes. My first pipe-based harness serialized the new runs (each child blocked writing >4 KB to a pipe the parent drained in turn); in true parallel they take ~5 s each like gen-003's.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Amended hx_store.h implemented: hx_store_count_uses (n more hits and heat/count for an expert the caller holds; ignored with a warning otherwise; no-op for n = 0); hx_store_stats.read_errors (every slab read that failed on all attempts: demand, prefetch and open-time); acquire returns NULL only after every attempt on every copy failed (attempts = max(3, number of files), each retry on the next file; before, 3 attempts left a 4th copy untried); wait_any semantics as amended (already gen-003); n_io_threads clamp (gen-003); the pin cap n_slots - min_slots now also applies when every expert has a slot.",
+        "evidence": "New tests, each killed by reverting its fix alone (scratch driver, test_store --quick --seed 3): count_uses (hits/heat from 2 + 1, n = 0 ignored, not-held / never-acquired / invalid ids ignored, usage file heat 4, LFU: 50 counted uses keep an expert through churn of experts used 3 times, 0 or 1 do not) kills 'no hits', 'heat increment clamped to 1', 'no refs check'; read_errors checks in read_failures (1 after a failed demand, 2 after a failed prefetch, 0 after reset) and unreadable (2) kill 'not counted' and 'demand only'; all_copies_tried (3 mirrors, slab unreadable on 3 of 4 files, primary or mirror 3 the good one, 8 acquires with the starting file rotating) kills 'attempts = 3' (17 failures); pin_cap 'every expert fits (80 slots): 72 pinned, want 68' kills the conditional cap.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "usage_out is written atomically: a uniquely named temporary file next to it (<usage_out>.<16 hex>.tmp), then hx_file_replace; on failure the temporary file is removed (ISO C remove(), see contract_issues).",
+        "evidence": "Test usage_replace: a handle opened on the old profile before close still reads the old bytes (tokens 5, heat 7) while a fresh read sees the new profile (tokens 1); the old in-place rewrite, as a mutant, fails it ('a reader of the old profile saw it rewritten in place (tokens 1, heat 1)'). A usage_out in a missing directory writes nothing and close succeeds. The replace-failure cleanup branch is not tested (open questions).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (T06) fixed: a demanded slab never collected no longer leaves a stale miss_pending flag. The pending miss ends when the slab is evicted and at the tick after it became resident (reads still in flight or queued keep theirs): a re-read is a new miss, a later use of a still-resident slab a hit. Its completion stays news for wait_any, as the amended header words it.",
+        "evidence": "Test abandoned_demands: (1) n_slots + 1 demands at the minimum cache; the starved one evicts the oldest uncollected slab once wait_any drops the holds; its re-read counts misses 1, hits 0, reads 1 (verifier's harness on gen-003: misses 0). (2) A demand abandoned two ticks earlier, then two uses of the still-resident slab: hits 2, misses 0 (verifier: hits 1). Removing the eviction clear or the tick clear alone fails (1) or (2). Also: a failed demand's re-read after the tick is a new miss (read_failures). A first version also cleared the wait_any 'fresh' flag at eviction and tick; mutate.py showed no test could tell, and hx_store.h ('returns at once if a demand read the caller asked for completed ... since the caller last looked at that expert') contradicts it, so it was removed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (T06) fixed: modelfile.c passes a const uint64_t sec[4][2] (no C11 pointer-to-array qualifier conversion).",
+        "evidence": "gcc 13.3 -std=c11 -pedantic -Wall -Wextra -fsyntax-only on store.c, modelfile.c, test_store.c, test_modelfile.c: 0 warnings (gen-003: -Wpedantic warning at modelfile.c:718).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "modelfile.c validates every FORMAT.md 4.1 tensor of the declared config before loading dense data: presence, exact shape (ndim and dims), F32 for norms, biases, rope_inv_freq, moe_router and moe_router_bias, F32/F16/BF16/Q8/Q4 for other matrices; GQA vs MLA (q_lora 0 or > 0), qk_norm 1/2, qkv_bias (GQA only), dense vs MoE layers, score_bias, shared experts and shexp_gate_inp (MoE layers), tied embeddings, rope_inv_freq present iff rope_dim > 0. Other tensors are ignored. Messages name the tensor and the shapes/dtype.",
+        "evidence": "test_modelfile's generator now emits the canonical set (written independently of hearth.format.canonical_tensors). New test_canonical breaks canonical tensors one at a time (missing; one row or element too many; 64 columns too many; a leading dimension of 1 with the same bytes; a forbidden dtype; a matrix in another allowed dtype must be accepted) until all 34 rules (suffix x shape variant) were broken, plus rope_inv_freq with rope_dim 0, q_lora_rank 1 and shared_ffn_dim 1; each rejection must name the tensor and quote both shapes. 300-600 variants per --quick run. Parity with Python: all 10 make_tiny containers (5 archs x F32/Q4) accepted by the C reader; each tensor hearth.format.canonical_tensors lists, dropped or given one more row, rejected naming it; rope_dim 0 with / without rope_inv_freq rejected / accepted: 728 agree, 0 disagree. 18 targeted mutants of the new checks all KILLED. test_model.c's negative cases (I32 attn_o, short blk.1.attn_norm, short blk.0.attn_q) still find their tensor names in the now earlier error.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "No regressions; sanitizers clean.",
+        "evidence": "MSVC /O2 /W3 (no compiler output): test_store full seeds 1-6 and quick 2, 3, 5, 7, 9: 0 failed; test_modelfile full 1-3, quick 1-4: 0 failed. CMake (VS 2022) build + ctest: 6/6 passed. DLL from my sources via HEARTH_LIB: tests/golden 21 passed, tests/py 777 passed, 2 skipped (twice, the second on the final sources). MSVC ASan /Od: test_store full seed 5, quick 8; test_modelfile full 9, quick 11: 0 failed, no report. WSL2 gcc 13.3 -O1 ASan+UBSan+float-cast-overflow (no recover, LSan on): test_modelfile 5, 6q; test_store 2, 3q, 12q: 0 failed, no report. gcc TSan (setarch -R): test_store quick 4, full 7: 0 failed, no warnings. Policy check unchanged: LRU 0.000, LFU 0.256 (quick).",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "A pipelined prefetch benchmark (hint batch b+1 while batch b is acquired) measures the wake-up fix.",
+        "evidence": "With the gen-003 wake-up it gave the same GB/s as the fix (2.39 MiB, 4 readers: 6.55 vs 6.78): acquire promotes not-yet-read prefetches to demands, each demand wakes a reader, and busy readers flow from batch b onto b+1 without being woken. The bug bites when readers are idle at the hint (compute outlasted the reads), which the final 'prefetch' row reproduces (4.2 flat vs 6.6 GB/s).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The wait_any 'fresh' flag of an evicted or abandoned demand must be cleared.",
+        "evidence": "No test could tell (mutate.py M0169 and M0597 survived) and the amended header requires wait_any to return at once for any demand read that completed since the caller last looked at that expert; removed.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "save_usage's failure branch (hx_file_replace fails after the temporary file was written; the temp is removed with ISO C remove()) is not covered: a portable test needs a replace that fails after a successful temp write inside the scratch dir, and a way to list or predict the temp name. 9 mutate.py survivors are in that branch.",
+      "hearth.format.ContainerReader and hearth.reference accept rope_inv_freq with rope_dim 0 (tests assert it); the C reader now rejects it per FORMAT 'present iff rope_dim > 0' (contract_issues).",
+      "On file systems without POSIX renames (FAT, SMB/9P shares) hx_file_replace fails while another process holds the profile open, and a usage_out in a directory without create permission can no longer be written; both log a warning and keep the old profile.",
+      "With several caller threads one thread's wait_any can report another's completion (carried; hx_store.h says one compute thread drives the store).",
+      "Forward-pass integration (not my files): model.c should call hx_store_count_uses where one acquire serves n (token, rank) activations, and copy hx_store_stats.read_errors into hearth_stats.read_errors; hx_store_acquire NULL means an I/O error for this token.",
+      "hearth.sim caps pins at slots - max(engine_min_slots, max_union + top_k) (python/hearth/sim/cache.py make_policy), stricter than hx_store.h's rule when a batch union exceeds the minimum slot count.",
+      "POSIX build verified on WSL2 gcc 13.3 only; benchmark only on the 990 PRO under Windows, on a shared machine."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o test_store.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c   # add -- --quick (~5 s), --seed N, --dir D; full ~15 s. 'giving up after 3 read attempts' errors in the output are expected (injected / truncated-file cases)",
+    "python scripts/hxcc.py --platform --run -o test_modelfile.exe engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_modelfile.c   # add -- --quick, --seed N, --iters N; --dump file.hearth prints what the reader parsed (or the error) as JSON",
+    "python scripts/hxcc.py --asan --debug --platform -o test_store_asan.exe <same sources>; run with C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 on PATH; same for test_modelfile",
+    "<hxcc build dir>/test_store.exe --bench [--gib 6] [--dir D]   # ~6 GiB per slab size written into the data dir in turn and deleted, ~40 s; rows: direct demands, prefetch batches to idle readers (direct), buffered demands",
+    "WSL2: copy engine/src/*.c *.h *.inc, engine/include/*.h and both tests to a WSL-local dir; F='-std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -O1 -g -fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=undefined,float-cast-overflow -Iinclude -Isrc'; compile quant_avx2.c (-mavx2 -mfma -mf16c) and quant_avx512.c (-mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma -mf16c) as objects and link with store.c modelfile.c quant.c platform_posix.c and the test; TSan: -fsanitize=thread, run under 'setarch $(uname -m) -R' (else 'unexpected memory mapping'); run from an empty dir with TMPDIR=/tmp",
+    "python governance/tools/mutate.py --file engine/src/store.c --since HEAD --max-mutants 0 --jobs 4 --seed 1 --timeout 240 --test \"python scripts/hxcc.py --platform --run -o {tmp}/m.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c -- --quick\"   # ~9 min; same for modelfile.c with the test_modelfile sources (~3 min). --since HEAD selects the lines changed in this generation while the files are uncommitted",
+    "python scripts/hxcc.py --shared --platform -o h01dll/hearth.dll engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c; set HEARTH_LIB to it; python -m pytest tests/golden tests/py -q"
+  ],
+  "measurements": [
+    {
+      "metric": "prefetch reads in flight after one hx_store_prefetch call with n_io + 1 hints to idle readers",
+      "value": 7,
+      "unit": "reads with 8 readers (2 and 4 with 3 and 5 readers, = n_io - 1; gen-003 wake-up: 1)",
+      "conditions": "test_store prefetch_overlap, readers held in the read hook; every run (MSVC, ASan, gcc ASan/TSan)",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefetch batch throughput from idle readers, direct I/O, 2.39 MiB Q4 slabs, readers 1/2/4/8/16",
+      "value": 6.72,
+      "unit": "GB/s (peak; runs 5.02/4.96/6.62/6.57/6.56 and 4.89/4.88/6.72/6.67/6.66; gen-003 wake-up 4.24/4.27/4.26/4.27/4.20)",
+      "conditions": "test_store --bench 'prefetch' row: one call per batch of 8 experts of a layer, used once resident, then the next; 6.0 GiB synthetic container, Samsung 990 PRO, Ryzen 9 9950X, Windows 11; shared machine (other engineers' builds and tests running), noisy. Synthetic weights",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefetch batch throughput from idle readers, direct I/O, 22.3 MiB Q4 slabs, readers 1/2/4/8/16",
+      "value": 6.54,
+      "unit": "GB/s (peak; 5.64/5.59/6.20/6.54/6.14 and 5.47/5.51/6.21/6.30/6.12; gen-003 wake-up 5.68/5.78/5.74/5.80/5.73)",
+      "conditions": "same runs; 5.59 GiB container; one reader already reaches ~5.6 GB/s with 22 MiB direct reads, so the gain is smaller",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, direct I/O, 2.39 MiB Q4 slabs, readers 1/2/4/8/16",
+      "value": 7.16,
+      "unit": "GB/s (peak, 2 readers; 4.90/7.16/5.93/5.88/5.95 and 4.80/6.99/5.99/5.91/6.15)",
+      "conditions": "test_store --bench 'direct' row (read path unchanged since gen-002), random order, demand window 2 x readers; same caveats",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, direct I/O, 22.3 MiB Q4 slabs, readers 1/2/4/8/16",
+      "value": 6.77,
+      "unit": "GB/s (peak; 5.71/5.83/6.77/5.91/6.53 and 5.60/5.78/5.91/6.50/6.39)",
+      "conditions": "same runs",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, buffered I/O, readers 1/2/4/8/16 (2.39 MiB; 22.3 MiB)",
+      "value": 6.6,
+      "unit": "GB/s (peak; 2.59/4.88/6.07/5.87/6.60 and 2.90/5.29/5.67/6.45/4.87 in the first run)",
+      "conditions": "each point reads a disjoint never-read fifth of a file written unbuffered; same caveats",
+      "kind": "measured"
+    },
+    {
+      "metric": "overcommit test failures under 32 busy loops + parallel test_store --quick",
+      "value": 0,
+      "unit": "failed runs of 60 (gen-003 test_store: 3 of 6 and 2 of 6)",
+      "conditions": "Windows, MSVC /O2; 36 runs with output to files, 24 via pipes",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score store.c, all lines changed in this generation",
+      "value": 70.9,
+      "unit": "percent",
+      "conditions": "mutate.py --since HEAD --max-mutants 0 --seed 1: 110 mutants, test_store --quick, MSVC /O2: 78 killed, 32 survived: 12 equivalent (5 extra prefetch wake-ups, boundary equalities, flag/guard constants, temp-name buffer size), 4 log-only, 3 memory-only (2 confirmed KILLED under MSVC ASan, 1 leak), 4 temp-name/nonce arithmetic, 9 in the untested replace-failure branch. The first run (66.4%, 75 of 113) led to 4 new checks and to removing the 'fresh' clearing",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score modelfile.c, all lines changed in this generation",
+      "value": 92.9,
+      "unit": "percent",
+      "conditions": "mutate.py --since HEAD --max-mutants 0 --seed 1: 141 scored (1 build error), test_modelfile --quick: 131 killed, 10 survived, all equivalent (layer -1 vs -2 for global names, return 1 vs 2, rope_dim > 0 vs > 1 for an even rope_dim, message-buffer bounds never reached). The first run (78.7%) led to message checks, q_lora 1 / shared_ffn 1 cases and a tensor-inside-the-expert-directory case",
+      "kind": "measured"
+    },
+    {
+      "metric": "C reader vs hearth.format.canonical_tensors on make_tiny containers",
+      "value": 728,
+      "unit": "agreeing cases (0 disagreeing)",
+      "conditions": "5 archs x F32/Q4 accepted; each canonical tensor dropped, and given one more row, rejected naming it; rope_dim 0 with / without rope_inv_freq",
+      "kind": "measured"
+    },
+    {
+      "metric": "test runtime test_store full",
+      "value": 14.3,
+      "unit": "s (--quick ~5 s; test_modelfile full ~5 s, --quick ~1 s)",
+      "conditions": "MSVC /O2, shared machine",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "The replace-failure cleanup of the temporary usage file is implemented but not tested (no portable way to force hx_file_replace to fail after the temp write and observe the temp name); it uses ISO C remove(), which on Windows takes an ANSI path (contract_issues: hx_file_remove).",
+    "rope_inv_freq with rope_dim 0 is rejected by the C reader but accepted by the Python reader (FORMAT owner to decide, contract_issues).",
+    "shexp_gate_inp: accepted by the C reader in any matrix dtype per FORMAT, but model.c binds it as F32 only (contract_issues).",
+    "POSIX verified on Linux (WSL2 gcc 13.3) only."
+  ]
+}

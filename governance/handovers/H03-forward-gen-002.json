@@ -1,0 +1,167 @@
+{
+  "generation_id": "gen-002-h03-forward-failure-paths",
+  "parent_generation": "gen-001-h03-forward-hardening",
+  "timestamp": "2026-10-05T21:52:46Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H03-forward",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified, uncommitted (H03-owned files only; HEAD is e9d1bfd through other engineers' commits): vs HEAD (gen-001 + gen-002) engine/src/model.c +248/-87, engine/src/hx_model.h +40/-7, engine/tests/test_model.c +1172/-42, engine/src/api.c +55/-8, engine/tools/hearth_bench.c +16/-5, python/hearth/engine.py +20/-3. This generation on top of gen-001: model.c +60/-2, hx_model.h +16/-9, test_model.c +502/-21 (api.c, hearth_bench.c, engine.py unchanged). New: governance/handovers/H03-forward-gen-002.json. Build product python/hearth/lib/hearth.dll (gitignored) rebuilt with hxcc --shared from the final sources (md5 bb0fdb9b82f11fbd1a3936f37f78c5e1). Built and tested against the working tree's store.c/pool.c/platform_*.c/modelfile.c (H01/H02, uncommitted)."
+  },
+  "constraints_touched": [
+    "INV-DET-1",
+    "INV-DET-2",
+    "INV-DET-3",
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "MAJOR finding reproduced and fixed: with prefetch on, a failed hearth_eval left prefetch reads outstanding (issued/read/timed after it returned), and hints it had prefetched (hidden issue) were later used by the retry (prefetch_used > prefetch_issued). Now model.c records every (layer, expert) key handed to hx_store_prefetch with a state (HINT_NOW this call, HINT_PREV previous call, HINT_USED once a layer's union routes to it, which its own acquire settles); at the start of each call NOW becomes PREV and older/used entries are dropped; on failure drain_hints() does hx_store_acquire + hx_store_release on every NOW/PREV key before the store tick and before s1 is read, so no read the call (or the previous call) caused lands after it returns and its counts fall inside the hidden delta.",
+        "evidence": "New test_prefetch_failures part 1 (fresh engine, SHARED, extra INT_MAX, layer-2 reads 30 ms, failure at layer 1): unfixed code 'before: issued 0 ... after: issued 0 ... +300ms: issued 5, bytes 290816, read_s 0.244' (FAIL); fixed: counters equal at return and after 300 ms, store shows issued > 0 and used > 0 inside the call, retry bit-identical, used <= issued, hits + misses = uses. Part 2 (previous call's prefetch of an expert u it predicted but did not route to, u's read 200 ms; next call fails at layer 1 without predicting u): unfixed 'after B: issued 1 ... +300ms: issued 2, bytes 143360' (FAIL); fixed equal. Hand mutants killed: no drain, no previous-call coverage, drain release removed (watchdog).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The hide_store_delta prefetch lines (issued/used/wasted; verifier's surviving M1713-M1718) are now pinned exactly: test_failure_leaks accumulates the store's own deltas around every failed call and checks hearth_stats == store counts - those amounts for hits, misses, evictions, prefetch issued/used/wasted, bytes and read time after 24 failing rounds plus 32 good tokens, with visible prefetch used and wasted > 0 (a reported value clamped at 0 had let mutants survive).",
+        "evidence": "mutate.py final pass: all 16 mutants of hide_store_delta killed (M1748-M1761). Hand mutants: used/wasted/issued '+=' -> '-=' and '-' -> '+' all fail the identity ('prefetch used 0 vs 140 - 104', 'wasted 0 vs 74 - 45').",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "MINOR finding (drain release untested) fixed by test_failure_leaks: make_mla on the minimum cache (10 slots), layer-1 experts 0/4/8/12 fail instantly while failing, every other read 1 ms, 24 rounds of [good token, failing 8-token batch], after each round the caller holds 10 distinct layer-0 experts at once with blocking acquires (a leaked reference makes the last acquire wait forever; a watchdog thread turns that into FAIL + exit after 30 s), then a 16-token batch and 16 decode steps bit-identical to a clean run, counters settle-checked 20 ms after each failed call.",
+        "evidence": "Killed: failing-layer drain release removed (verifier's hand mutant; mutate M1560), drain condition negated (verifier's M1532; mutate M1557 - this one also releases experts it never acquired, which repaired earlier leaks, so only the hold-every-slot check catches it), drain_hints release removed, drain skipped (counters change 20 ms after return). The first GQA version of this test missed the failing-layer leak (GQA has only 4 readable experts per layer, fewer than its 8 slots); recorded as falsified below.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "MINOR finding (trace_start truncates a writable-but-unreadable file) reproduced and fixed: when the READ open fails and hx_path_exists(path) is true, hx_model_trace_start refuses with HX_E_ARG (logs the open error) instead of creating/truncating.",
+        "evidence": "test_trace_guard new case: Windows holds a handle that denies read sharing (_sopen_s _SH_DENYRD), POSIX chmod 0200 (skipped with a note when running as root). Unfixed: 'trace_start on a file it cannot read returned 0 and left 24 bytes' on MSVC and on WSL gcc; fixed: HX_E_ARG, 20 bytes unchanged. mutate: the guard condition, its negation and its return are killed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "What a failed call waits for is exactly the unresolved hints of this call and the previous one (test seam hx_model_hints_drained, cumulative): not keys a layer routed to (also when the previous call hinted them), not hints from two calls back.",
+        "evidence": "test_drain_scope searches two token triples (A1, A2 succeed, B fails at layer 2 on an expert nothing read before) from clean runs' prediction logs and traces so that each rule changes the expected count (found after ~10-50 attempts); hand mutants killed: no used-marking (4 vs 2), PREV kept forever (3 vs 2), PREV encoded as NONE (2 vs 1), no previous-call coverage (1 vs 2), wrong marking index (crash).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "No hot-path regression from the hint bookkeeping (a pass over the call's hints in prefetch_next, moe_layer and at call start).",
+        "evidence": "Interleaved A/B gen-001 vs gen-002 hearth-bench on a synthetic Qwen3-30B-A3B Q4 container, 16 threads, shared machine (load 16-47%): fully cached decode 21.87 vs 21.88 tok/s (4 reps each), 512-token prefill 386.6 vs 383.7 tok/s (ranges 381-390 vs 377-385, overlapping), 4 GiB direct-I/O decode 9.64 vs 9.64 tok/s (3 reps).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The failure path's extra cost is small: one blocking read per unresolved hint, sequential.",
+        "evidence": "Scratch harness (q30-shaped container, 4 GiB cache, direct I/O, 16 threads, read hook failing every read of one layer after 48 good tokens, 8 reps, medians): failure at layer 47: 119.1-121.1 ms and 622-629 MiB read during the failed call vs 105.5-107.7 ms / 590-605 MiB with gen-001 (+~14 ms, +~25 MiB); failure at layer 1: 5.8 vs 3.4 ms, 26.3 vs 12.0 MiB. Retry latency unchanged (~50 / ~106 ms).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "A latent flaky test was fixed: test_prefetch_gate failed deterministically for some seeds (e.g. 121, also with the gen-001 code and test: '3 imprecise predictions still issued') because its 64-row random replay used only rows 0-23 every pass, and those 24 rows can match the router's predictions ~50% of the time, keeping the gate open. The layer-2 prediction does not depend on routing (it is taken before layer 1's routed experts are added), so the test now takes it from a clean run and replays rows that hit exactly one of the two predicted experts at even positions and none at odd ones (precision 25%).",
+        "evidence": "Seeds 100-135 (12-way concurrent) all pass; seed 121 passes. A gate threshold scaled to 1/4 and a gate that always prefetches are both killed ('19 imprecise predictions still issued').",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Everything still holds on the final sources.",
+        "evidence": "test_model: 2189-2197 checks, 0 failed (count varies by seed: rounds whose batch happened to hit only resident experts add no checks) - MSVC /O2 seeds 1-11 and 100-135 (up to 12 concurrent), MSVC ASan /Od seeds 1 and 9, WSL gcc 13 -O2 seeds 1-3, -fsanitize=address,undefined, -fsanitize=thread (0 reports); gcc -Wall -Wextra -Wpedantic -Wshadow and MSVC /W3 (hxcc, CMake VS2022) warning-free; CMake Release build + ctest 6/6; python -m pytest tests/golden tests/py against the final DLL: 798 passed, 2 skipped; check_golden.py --run: 21 passed. Package DLL python/hearth/lib/hearth.dll = the final build (md5 bb0fdb9b82f11fbd1a3936f37f78c5e1); tests/py/test_runtime.py against it without HEARTH_LIB: 144 passed.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "A GQA leak test (8 slots, even layer-1 experts failing) catches a missing release in the failing-layer drain.",
+        "evidence": "It did not (mutant passed 2111 checks): GQA has 8 experts per MoE layer, so at most its 4 readable layer-1 experts can leak and the 4 remaining slots still let every call progress. Moved to make_mla (16 experts, 10 slots) plus the explicit hold-every-slot check.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Draining each unresolved hint in two phases (try_acquire all, then wait) is needed to keep the failure path fast.",
+        "evidence": "Not needed at measured costs (+2.4 ms at layer 1, +14 ms at layer 47 on the q30-shaped container); kept the simpler sequential acquire/release. Not measured on DeepSeek-class slabs (44 MB): estimated ~0.5-1 s extra per failed call there with a small cache (open question).",
+        "verdict": "INCONCLUSIVE"
+      }
+    ],
+    "open_questions": [
+      "Attention value pass (T08 finding / verifier minor 4) is still portable-C speed: needs the hx_kernels value_acc entry proposed in contract_issues (kernels owner), then value_sum calls it. Not changed this generation.",
+      "Prefetch hints from two or more calls back that are still queued when a call fails are not waited for (the store's prefetch queue holds at most max(2*top_k, 2*n_io) keys and is FIFO, so this needs prefetch reads starved by demand reads for a whole call). An hx_store quiesce/cancel API (contract_issues) would remove this and the extra reads.",
+      "Every expert a failed call waits for counts one use in the store (LFU heat, usage_out counts) because hx_store_acquire always counts a use; hints the store had dropped are read once. Caching only; output unaffected (INV-DET-1).",
+      "The failure path ticks the store once (from gen-001): usage_out's tokens_observed and LFU decay count a failed call as one token.",
+      "Failure-path cost on DeepSeek/Kimi-sized slabs (44 MB) with a small cache is estimated, not measured.",
+      "hearth.h says a failed call leaves 'all counters' unchanged; read_errors deliberately stays visible (gen-001); wording fix proposed in contract_issues.",
+      "From gen-001, still open: macOS arm64 sincos hypothesis untested; engine.py HearthError text only checked by a scratch script (tests/py/test_runtime.py is T07's)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o h03g2/test_model.exe engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c engine/tests/test_model.c   # ~8 s, ~2197 checks; -- --seed N, --dir D. Expected stderr noise: injected/truncation I/O failures, refused trace_starts, malformed traces, hearth-bench smoke output, INFO/DEBUG lines of the log-level cases",
+    "python scripts/hxcc.py --asan --debug --platform -o h03g2/test_model_asan.exe <same sources>; run with VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 on PATH (~35 s)",
+    "python scripts/hxcc.py --shared --platform -o h03g2final/hearth.dll engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c ; copy to python/hearth/lib/hearth.dll ; python -m pytest tests/golden tests/py -q ; python governance/tools/check_golden.py --run",
+    "cmake -S . -B %LOCALAPPDATA%\\hearth\\build\\cmake_h03g2 -G \"Visual Studio 17 2022\" -A x64 && cmake --build <dir> --config Release && ctest --test-dir <dir> -C Release --output-on-failure",
+    "WSL: copy engine/ to ~/h03g2w; gcc -std=c11 -ffp-contract=off -Wall -Wextra -Wpedantic -Wshadow -Wno-unused-parameter -pthread -Isrc -Iinclude on pool.c quant.c modelfile.c store.c model.c api.c platform_posix.c tests/test_model.c (+ quant_avx2.c -mavx2 -mfma -mf16c, quant_avx512.c -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma -mf16c), -lm; -O2, -O1 -g -fsanitize=address,undefined, -O1 -g -fsanitize=thread (run under setarch $(uname -m) -R); run as a non-root user so the write-only trace_start case runs",
+    "python governance/tools/mutate.py --file engine/src/model.c --lines \"80-82,965-972,1041-1043,1065-1126,1236-1332,1605-1606,1782,1835-1858\" --test \"{python} scripts/hxcc.py --platform --run -o {tmp}/h03m.exe <the 9 sources above>\" --max-mutants 0 --jobs 8 --seed 3   # ~45 min incl. timeout retries (deadlocking mutants end via the 30 s watchdog)",
+    "PERF (synthetic container 17 GB, delete afterwards, INV-DATA): PYTHONPATH=python python -c \"from hearth import synth, _native; synth.make_shaped(_native.data_dir()/'models'/'q30.hearth', preset='qwen3-30b-a3b')\"; hearth-bench q30.hearth --threads 16 --cache-gb 20 --prompt 512 --tokens 0 --usage-out q30.usage; hearth-bench q30.hearth --threads 16 --cache-gb 20 --usage-in q30.usage --warm 1 --prompt 512 --warmup 8 --tokens 64; hearth-bench q30.hearth --threads 16 --cache-gb 4 --direct 1 --prompt 32 --warmup 64 --tokens 128",
+    "Failure-cost harness (scratch, not committed): open with cache 4 GiB direct I/O, 16 threads, 32-token prompt + 16 decode steps, then per rep: one good step, hx_store_set_read_hook failing every read of layer L, hearth_eval(1 token) timed with the store's bytes_read delta, hook off, retry"
+  ],
+  "measurements": [
+    {
+      "metric": "decode, fully cached (warm start from a usage profile), ~520-584 context, 16 threads",
+      "value": 21.88,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped preset qwen3-30b-a3b, Q4 experts, Q8 dense, 17.0 GB), Ryzen 9 9950X, Windows 11, MSVC /O2 AVX-512; machine shared with other engineers' jobs (CPU load 16-33% sampled before runs); median of 4 interleaved runs; gen-001 sources in the same session 21.87 (ranges 21.77-22.02 vs 21.65-21.94)",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 512 tokens, fully cached, 16 threads",
+      "value": 383.7,
+      "unit": "tok/s",
+      "conditions": "same container/machine/load; median of 4 interleaved runs (377.4-384.8); gen-001 sources 386.6 (381.3-389.7): within noise",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode, 4 GiB expert cache, direct I/O, synthetic greedy routing, 16 threads",
+      "value": 9.64,
+      "unit": "tok/s",
+      "conditions": "same container/machine, load 18-47%; --prompt 32 --warmup 64 --tokens 128; median of 3 (9.62-9.69); gen-001 sources 9.64 (9.63-9.66)",
+      "kind": "measured"
+    },
+    {
+      "metric": "failed hearth_eval latency, failure at the last MoE layer (47), 4 GiB direct I/O",
+      "value": 120.1,
+      "unit": "ms",
+      "conditions": "scratch harness, synthetic q30 container, 16 threads, every read of layer 47 failing, medians of 8 reps in two sessions (121.1, 119.1); gen-001 106.6 (107.7, 105.5); MiB read during the failed call 622-629 vs 590-605; retry ~50 ms either way; shared machine",
+      "kind": "measured"
+    },
+    {
+      "metric": "failed hearth_eval latency, failure at the first MoE layer after it",
+      "value": 5.8,
+      "unit": "ms",
+      "conditions": "as above, every read of layer 1 failing; gen-001 3.4 ms; 26.3 vs 12.0 MiB read during the failed call",
+      "kind": "measured"
+    },
+    {
+      "metric": "test_model checks",
+      "value": 2197,
+      "unit": "checks, 0 failed",
+      "conditions": "seed 1 (2189-2197 by seed); was 2064 after gen-001; MSVC /O2 ~8 s, MSVC ASan ~35 s, gcc -O2 / ASan+UBSan / TSan on WSL",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score model.c (this generation's changed lines + the verifier's ranges, all candidates)",
+      "value": 86.8,
+      "unit": "percent",
+      "conditions": "governance/tools/mutate.py seed 3, every candidate on lines 80-82,965-972,1041-1043,1065-1126,1236-1332,1605-1606,1782,1835-1858 (this generation's changes plus the verifier's ranges 1048-1110/1220-1281 in gen-001 numbering): 157 killed + 27 timeouts (deadlocks ended by the watchdog or the 36 s limit), 28 survived of 212. A first pass with the tests before the identity/hold-slot/scope/gate changes scored 77.9% (135 + 31 of 213). Survivors: equivalent - M0011 (HINT_USED encoding), M1288/M1536/M1774 (>= vs > boundaries never hit exactly), M1493/M1519 (1 ns idle), M1511/M1512 (count_uses(0) is a no-op), M1542/M1553/M1555 (drain/blocking loop bounds: the blocking loop acquires in ulist order and stops at the first pending expert, so u = 0 pending at drain time is the failed one, and u = nu is never reached / reads one stale state), M1771 (trace buffer over-allocated), M1794 (mode 3 acts as mode 2), M1807 (tpend_len is also reset at the start of every call), M1816 (rc is HX_OK there), M2499 (seam NULL guard), M2549 (a 3-byte file still fails the 4-byte read); scheduling-only - M1494/M1533/M1535 (blocking mode entered early), M1539 (wait_any removed: busy polling), M1550 (STUCK timer); log-only - M1548, M1777, M2563; leak-only - M2560 (READ handle not closed); untestable here - M1778 (realloc failure); rarely observable - M1735 (age_hints reads one stale slot past the list: only a stale copy of a re-hinted key there changes anything)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score model.c, first pass (tests before the exact-identity, hold-every-slot, drain-scope and gate fixes)",
+      "value": 77.9,
+      "unit": "percent",
+      "conditions": "same lines and seed; 135 killed + 31 timeouts, 47 survived of 213; the run was stopped during timeout retries once the survivors had shown the gaps (prefetch_used/wasted hide lines, marking loop, PREV encoding, drain condition M1557, wall_ns)",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Verifier minor 4 (value pass at portable-C speed) is not fixed: it needs the hx_kernels value_acc contract change (proposed) and the kernels owner.",
+    "Performance numbers are on synthetic weights on a shared machine; differences under ~3% are within noise."
+  ]
+}

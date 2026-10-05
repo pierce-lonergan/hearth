@@ -27,11 +27,20 @@
  * Two more flavours duplicate router rows so that routing ties exactly (ties go to
  * the lower expert / group index), and the naive reference's routing is compared
  * with the engine's trace. Further: option defaults, caps and environment
- * overrides, log level rules, LFU heat / usage counts independent of batching, a
- * multi-chunk eval that fails in its second chunk (no trace rows, counters or
- * position kept), a trace_start that fails while a trace is active, regions of
- * tiny work staying on the caller (thread-count overhead smoke check), and a
- * hearth-bench smoke run (engine/tools/hearth_bench.c is compiled in).
+ * overrides, log level rules (verbose raises the level only while its engine is
+ * open), LFU heat / usage counts independent of batching, a multi-chunk eval that
+ * fails in its second chunk (no trace rows, no counter but read_errors changed, the
+ * hidden amount equal to the store's delta), real I/O errors from a container
+ * truncated after open (and a truncated mirror the other copy covers), failures with
+ * prefetch on (no read of the failed or the previous call lands after it returns,
+ * prefetch counters stay consistent, no cache slot leaks: a watchdog turns the
+ * deadlock a leak causes into a failure), a trace_start that fails while a trace is
+ * active or would overwrite a non-trace or unreadable file, exact
+ * expert_loads_unique / store ticks / stall time, next-layer
+ * predictions against the naive reference, trace ids above 255 (272 experts),
+ * value passes with partial 32-dim chunks, regions of tiny work staying on the
+ * caller and region thread counts in proportion to work, and a hearth-bench smoke
+ * run (engine/tools/hearth_bench.c is compiled in).
  * Agreement with the Python ground truth (hearth.reference) is the golden suite's
  * job (tests/golden).
  */
@@ -44,10 +53,17 @@
 #include "hx_quant.h"
 #include "hx_store.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#if defined(_WIN32)
+#  include <fcntl.h>
+#  include <io.h>
+#  include <share.h>
+#endif
 
 #define HEARTH_BENCH_NO_MAIN
 #include "../tools/hearth_bench.c"
@@ -295,6 +311,10 @@ static int g_bad_dtype = 0;          /* make_gqa: 1 = attn_o as I32 (no kernel),
                                         3 = attn_q with too few rows */
 static int g_no_shared = 0;          /* make_gqa: no shared expert (prefetch shared falls back to next) */
 static int g_mla_heads = 4;          /* make_mla: > 16 reaches the second MLA score head chunk */
+static int g_mla_experts = 16;       /* make_mla: routed experts per MoE layer (a multiple of 4) */
+static int g_high_bias = 0;          /* make_mla: router bias +10 for experts >= 256 (trace ids above one byte) */
+static int g_gqa_hd = 64;            /* make_gqa head_dim; 48 leaves a partial attention value chunk (32 dims) */
+static int g_mla_c = 64;             /* make_mla kv_lora_rank; 80 leaves a partial chunk (needs q_lora 0: BF16 kv_b) */
 static int g_tie = 0;                /* duplicate router rows: GQA triples, MLA groups 0, 1, 2 (of 4) */
 static double g_par_min = 0.0;       /* hx_model_set_parallel_min for engines opened by open_with */
 
@@ -319,7 +339,7 @@ static int dt_q4(int l, int e) { (void)l; (void)e; return HEARTH_Q4; }
 /* GQA flavour; qk_norm 1 or 2. */
 static int make_gqa(const char *path, int qk_norm) {
     writer *w = (writer *)calloc(1, sizeof *w);
-    const int H = 4, Hkv = 2, hd = 64, rope = 48, Fd = 128, Fs = g_no_shared ? 0 : 64;
+    const int H = 4, Hkv = 2, hd = g_gqa_hd, rope = 48, Fd = 128, Fs = g_no_shared ? 0 : 64;
     const uint8_t lk[L_] = {0, 1, 1};
     meta_str(w, "arch", "qwen2_moe");
     meta_u32(w, "n_layers", L_);
@@ -389,7 +409,7 @@ static int make_gqa(const char *path, int qk_norm) {
 /* MLA flavour; q_lora 0 or 64. */
 static int make_mla(const char *path, int q_lora) {
     writer *w = (writer *)calloc(1, sizeof *w);
-    const int H = g_mla_heads, nope = 32, rope = 16, vd = 32, C = 64, Fs = 64, E = 16, K = 3, L = 4;
+    const int H = g_mla_heads, nope = 32, rope = 16, vd = 32, C = g_mla_c, Fs = 64, E = g_mla_experts, K = 3, L = 4;
     const uint8_t lk[4] = {1, 1, 0, 1};
     meta_str(w, "arch", "deepseek_v3");
     meta_u32(w, "n_layers", L);
@@ -453,6 +473,12 @@ static int make_mla(const char *path, int q_lora) {
             if (g_tie) tie_rows(&w->t[w->nt - 1], E, 1);
             add_layer_tensor(w, l, "moe_router_bias", HEARTH_F32, 0, E, 1.0f, 0.0f);
             if (g_tie) tie_rows(&w->t[w->nt - 1], E, 1);
+            for (int e = 256; g_high_bias && e < E; e++) {
+                float b;
+                memcpy(&b, w->t[w->nt - 1].data + 4 * e, 4);
+                b = b + 10.0f;
+                memcpy(w->t[w->nt - 1].data + 4 * e, &b, 4);
+            }
             add_layer_tensor(w, l, "shexp_gate", HEARTH_Q8, Fs, D_, 1.0f, 0.0f);
             add_layer_tensor(w, l, "shexp_up", HEARTH_Q8, Fs, D_, 1.0f, 0.0f);
             add_layer_tensor(w, l, "shexp_down", HEARTH_Q8, D_, Fs, 1.0f, 0.0f);
@@ -778,6 +804,10 @@ typedef struct nref {
     int cap, pos;
     int *routes;             /* [token][MoE layer][rank] selected ids, as in a trace */
     size_t n_routes;
+    float *hmid, *shout;     /* the last MoE layer's input residual h and its shared-expert output */
+    int pf_mode, pf_kk;      /* next-layer predictions (HEARTH_PREFETCH_NEXT/SHARED, top_k + extra) */
+    int *pred;               /* per prediction: [layer, kk, ids[kk]] */
+    int pred_len, pred_cap;
 } nref;
 
 static float n_dot16(const float *a, const float *b, int64_t n) {
@@ -872,10 +902,16 @@ static const float *n_vec(const nref *r, int l, const char *name) {
     return t ? (const float *)t->data : NULL;
 }
 
+/* Separate calls, as model.c makes them: a compiler may fuse sinf and cosf of one
+ * argument in one function into a sincos routine whose results can differ by an ulp
+ * (the suspected cause of the first macOS arm64 CI failure; not verified there). */
+static HX_NOINLINE float n_cosf(float x) { return cosf(x); }
+static HX_NOINLINE float n_sinf(float x) { return sinf(x); }
+
 static void n_rope(float *x, int rope_dim, int style, int pos, const float *inv, float f) {
     const int half = rope_dim / 2;
     for (int j = 0; j < half; j++) {
-        const float th = (float)pos * inv[j], c = cosf(th) * f, s = sinf(th) * f;
+        const float th = (float)pos * inv[j], c = n_cosf(th) * f, s = n_sinf(th) * f;
         const int ia = style ? 2 * j : j, ib = style ? 2 * j + 1 : j + half;
         const float a = x[ia], b = x[ib];
         x[ia] = a * c - b * s;
@@ -896,13 +932,18 @@ static int nref_open(nref *r, const char *path, int cap) {
     r->cache = (float *)calloc(r->per_layer * (size_t)r->c->n_layers, sizeof(float));
     r->routes = (int *)calloc((size_t)cap * (size_t)(r->c->n_moe_layers ? r->c->n_moe_layers : 1) *
                                   (size_t)(r->c->top_k ? r->c->top_k : 1), sizeof(int));
-    return r->f && r->cache && r->routes;
+    r->hmid = (float *)calloc((size_t)r->c->d_model, sizeof(float));
+    r->shout = (float *)calloc((size_t)r->c->d_model, sizeof(float));
+    return r->f && r->cache && r->routes && r->hmid && r->shout;
 }
 
 static void nref_close(nref *r) {
     if (r->f) fclose(r->f);
     free(r->cache);
     free(r->routes);
+    free(r->hmid);
+    free(r->shout);
+    free(r->pred);
     hx_modelfile_close(r->mf);
 }
 
@@ -1024,12 +1065,13 @@ static void n_expert(nref *r, int l, int e, const float *x, float *out) {
 
 static int n_better(float va, int ia, float vb, int ib) { return va > vb || (va == vb && ia < ib); }
 
-static void n_moe(nref *r, int l, const float *x, float *out) {
+/* NUMERICS §5.3 selection for layer l's router on x: the kk best experts into ids
+ * (descending sel, ties to the lower index); lg gets the scores. */
+static void n_select(nref *r, int l, const float *x, int kk, int *ids, float *lg) {
     const hx_config *c = r->c;
-    const int E = c->n_experts, K = c->top_k, D = c->d_model;
-    float *lg = (float *)malloc(sizeof(float) * (size_t)E), *sel = (float *)malloc(sizeof(float) * (size_t)E);
-    float *y = (float *)malloc(sizeof(float) * (size_t)D), w[64], gs[64];
-    int ids[64], used[1024] = {0}, keep[64] = {0};
+    const int E = c->n_experts;
+    float *sel = (float *)malloc(sizeof(float) * (size_t)E), gs[64];
+    int used[1024] = {0}, keep[64] = {0};
     n_lin(r, l, "moe_router", x, lg);
     if (c->score_fn == 0) n_softmax(lg, E);
     else for (int e = 0; e < E; e++) lg[e] = n_sigmoid(lg[e]);
@@ -1053,14 +1095,50 @@ static void n_moe(nref *r, int l, const float *x, float *out) {
         for (int i = 0; i < E; i++)
             if (!keep[i / sz]) sel[i] = 0.0f;
     }
-    for (int j = 0; j < K; j++) {
+    for (int j = 0; j < kk; j++) {
         int best = -1;
         for (int e = 0; e < E; e++)
             if (!used[e] && (best < 0 || n_better(sel[e], e, sel[best], best))) best = e;
         used[best] = 1;
         ids[j] = best;
-        w[j] = lg[best];
-        r->routes[r->n_routes++] = best;
+    }
+    free(sel);
+}
+
+/* The prediction for MoE layer nl made while layer nl-1 runs: nl's router on
+ * rmsnorm(h, ffn_norm[nl]) with h the residual entering layer nl-1's FFN, plus
+ * residual_scale * that layer's shared-expert output in SHARED mode. */
+static void n_predict(nref *r, int nl) {
+    const hx_config *c = r->c;
+    const int D = c->d_model, kk = r->pf_kk;
+    float *x = (float *)malloc(sizeof(float) * (size_t)D), *lg = (float *)malloc(sizeof(float) * (size_t)c->n_experts);
+    int *d;
+    const int shared = r->pf_mode == HEARTH_PREFETCH_SHARED && c->shared_ffn_dim > 0;   /* else NEXT */
+    for (int i = 0; i < D; i++) x[i] = shared ? r->hmid[i] + c->residual_scale * r->shout[i] : r->hmid[i];
+    n_rmsnorm(x, x, n_vec(r, nl, "ffn_norm"), D, c->norm_eps);
+    if (r->pred_len + 2 + kk > r->pred_cap) {
+        r->pred_cap = 2 * (r->pred_cap + 2 + kk);
+        r->pred = (int *)realloc(r->pred, sizeof(int) * (size_t)r->pred_cap);
+    }
+    d = r->pred + r->pred_len;
+    d[0] = nl;
+    d[1] = kk;
+    n_select(r, nl, x, kk, d + 2, lg);
+    r->pred_len += 2 + kk;
+    free(x);
+    free(lg);
+}
+
+static void n_moe(nref *r, int l, const float *x, float *out) {
+    const hx_config *c = r->c;
+    const int E = c->n_experts, K = c->top_k, D = c->d_model;
+    float *lg = (float *)malloc(sizeof(float) * (size_t)E);
+    float *y = (float *)malloc(sizeof(float) * (size_t)D), w[64];
+    int ids[64];
+    n_select(r, l, x, K, ids, lg);
+    for (int j = 0; j < K; j++) {
+        w[j] = lg[ids[j]];
+        r->routes[r->n_routes++] = ids[j];
     }
     if (c->norm_topk_prob) {
         float s = 0.0f;
@@ -1080,9 +1158,9 @@ static void n_moe(nref *r, int l, const float *x, float *out) {
             for (int i = 0; i < D; i++) y[i] = y[i] * g;
         }
         for (int i = 0; i < D; i++) out[i] = out[i] + y[i];
+        memcpy(r->shout, y, sizeof(float) * (size_t)D);
     }
     free(lg);
-    free(sel);
     free(y);
 }
 
@@ -1100,8 +1178,13 @@ static void nref_forward(nref *r, int tok, float *logits) {
         else n_attn_gqa(r, l, x, a);
         for (int i = 0; i < D; i++) h[i] = h[i] + c->residual_scale * a[i];
         n_rmsnorm(x, h, n_vec(r, l, "ffn_norm"), D, c->norm_eps);
-        if (c->layer_kind[l]) n_moe(r, l, x, a);
-        else n_ffn(r, l, "ffn_gate", "ffn_up", "ffn_down", x, a);
+        if (c->layer_kind[l]) {
+            memcpy(r->hmid, h, sizeof(float) * (size_t)D);
+            n_moe(r, l, x, a);
+            if (r->pf_mode && l + 1 < c->n_layers && c->layer_kind[l + 1]) n_predict(r, l + 1);
+        } else {
+            n_ffn(r, l, "ffn_gate", "ffn_up", "ffn_down", x, a);
+        }
         for (int i = 0; i < D; i++) h[i] = h[i] + c->residual_scale * a[i];
     }
     n_rmsnorm(x, h, n_vec(r, -1, "out_norm"), D, c->norm_eps);
@@ -1228,6 +1311,11 @@ static void test_invariants(const char *path, const char *label, int n) {
         CHECK(e && hearth_rewind(e, n / 2) == 0 && hearth_eval(e, tok + n / 2, n - n / 2 - 1, NULL, 0) == 0 &&
                   hearth_eval(e, tok + n - 1, 1, last, 0) == 0 && same(last, base + (size_t)(n - 1) * V_, V_),
               "%s: rewind, NULL-logits eval, then the last token again", label);
+        /* scratch rows a batch at later positions filled must not leak into one at earlier positions */
+        memset(got, 0, sizeof(float) * (size_t)n * V_);
+        CHECK(e && hearth_rewind(e, n / 2) == 0 && hearth_eval(e, tok + n / 2, n - n / 2, NULL, 0) == 0 && hearth_rewind(e, 0) == 0 &&
+                  hearth_eval(e, tok, n, got, 1) == 0 && same(got, base, (size_t)n * V_),
+              "%s: a batch after a batch at later positions differs", label);
         hearth_close(e);
     }
 
@@ -1337,7 +1425,7 @@ static void test_invariants(const char *path, const char *label, int n) {
                     case 3: cp[20] ^= 1; break;                         /* n_moe_layers */
                     case 4: len = sz - 1; break;                        /* partial row */
                     case 5: len = 24; break;                            /* no rows */
-                    case 6: cp[24] = (uint8_t)info.n_experts; cp[25] = 0; break;   /* id out of range */
+                    case 6: put16(cp + 24, (uint32_t)info.n_experts); break;   /* id out of range */
                     }
                     CHECK(write_bytes(bad, cp, len), "write bad trace");
                     CHECK(hearth_route_replay(e, bad) < 0, "%s: malformed trace %d accepted", label, k);
@@ -1422,7 +1510,14 @@ static void test_long(const char *path, const char *label) {
         if (!e) continue;
         if (tb[c]) hx_model_set_attention_batch(hx_engine_model(e), tb[c]);
         memset(got, 0, sizeof(float) * (size_t)n * V_);
+        hx_model_region_max(hx_engine_model(e));
         CHECK(hearth_eval(e, tok, n, got, 1) == 0, "%s: batched eval", label);
+        {   /* a batch of >= 256 tokens may use every thread, never more */
+            hearth_model_info info;
+            const int mx = hx_model_region_max(hx_engine_model(e));
+            CHECK(hearth_info(e, &info) == 0 && mx <= info.n_threads && (c != 4 || mx == info.n_threads),
+                  "%s: the %d-token batch used %d threads at most (engine %d)", label, n, mx, info.n_threads);
+        }
         CHECK(same(got, seq, (size_t)n * V_), "%s: batched (attention sub-batch %d, max_batch %d, %d threads) differs", label,
               tb[c], mb[c], o.n_threads);
         if (c == 4) {   /* then decode-sized calls on the same engine */
@@ -1451,26 +1546,166 @@ static int fail_all_reads(void *ctx, int layer, int expert, int file, int direct
     return atomic_load((atomic_int *)ctx);
 }
 
+/* Every counter of hearth_stats (not the cache gauges, not read_errors) is equal. */
+static int same_counters(const hearth_stats *a, const hearth_stats *b) {
+    return a->tokens == b->tokens && a->forward_calls == b->forward_calls && a->wall_s == b->wall_s &&
+           a->attn_s == b->attn_s && a->moe_s == b->moe_s && a->dense_s == b->dense_s && a->stall_s == b->stall_s &&
+           a->expert_uses == b->expert_uses && a->expert_loads_unique == b->expert_loads_unique &&
+           a->cache_hits == b->cache_hits && a->cache_misses == b->cache_misses && a->prefetch_issued == b->prefetch_issued &&
+           a->prefetch_used == b->prefetch_used && a->prefetch_wasted == b->prefetch_wasted && a->bytes_read == b->bytes_read &&
+           a->read_s == b->read_s && a->evictions == b->evictions;
+}
+
 static void test_io_failure(const char *path) {
     hearth_options o = defaults();
     char err[512];
-    int32_t tok[4] = {5, 6, 7, 8};
-    float a[V_ * 4], b[V_ * 4];
+    int32_t tok[6] = {5, 6, 7, 8, 9, 10};
+    float a[V_ * 4], b[V_ * 6];
     atomic_int failing;
+    hearth_stats s0, s1;
     hearth_engine *e;
-    atomic_init(&failing, 1);
+    atomic_init(&failing, 0);
     o.cache_gb = 0.0;
+    o.prefetch = HEARTH_PREFETCH_OFF;   /* no reads may complete after a call returns */
     e = open_with(path, &o, err, sizeof err);
     CHECK(e != NULL, "open: %s", err);
     if (!e) return;
     hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), fail_all_reads, (void *)&failing);
-    CHECK(hearth_eval(e, tok, 4, a, 1) < 0, "eval with unreadable experts must fail");
-    CHECK(hearth_pos(e) == 0, "failed eval leaves pos at 0 (got %d)", hearth_pos(e));
+    CHECK(hearth_eval(e, tok, 2, NULL, 0) == 0, "eval before the failure");
+    hearth_get_stats(e, &s0);
+    atomic_store(&failing, 1);
+    {
+        const uint64_t t0 = hx_now_ns();
+        CHECK(hearth_eval(e, tok + 2, 4, a, 1) == HX_E_IO, "eval with unreadable experts must fail with HX_E_IO");
+        /* the failed read is noticed at once, not after STUCK_NS (1 s) without progress */
+        CHECK((double)(hx_now_ns() - t0) * 1e-9 < 0.9, "the failure took %.3f s", (double)(hx_now_ns() - t0) * 1e-9);
+    }
+    hearth_get_stats(e, &s1);
+    CHECK(hearth_pos(e) == 2, "failed eval leaves pos at 2 (got %d)", hearth_pos(e));
+    CHECK(same_counters(&s0, &s1), "a failed eval changed the counters: tokens %llu, hits %llu -> %llu, misses %llu -> %llu",
+          (unsigned long long)s1.tokens, (unsigned long long)s0.cache_hits, (unsigned long long)s1.cache_hits,
+          (unsigned long long)s0.cache_misses, (unsigned long long)s1.cache_misses);
+    CHECK(s0.read_errors == 0 && s1.read_errors > 0, "read_errors %llu -> %llu", (unsigned long long)s0.read_errors,
+          (unsigned long long)s1.read_errors);
     atomic_store(&failing, 0);
-    CHECK(hearth_eval(e, tok, 4, a, 1) == 0 && hearth_pos(e) == 4, "eval works once reads succeed again");
+    CHECK(hearth_eval(e, tok + 2, 4, a, 1) == 0 && hearth_pos(e) == 6, "eval works once reads succeed again");
+    hearth_get_stats(e, &s1);
+    CHECK(s1.tokens == 6 && s1.cache_hits + s1.cache_misses == s1.expert_uses, "counters after the retry: tokens %llu",
+          (unsigned long long)s1.tokens);
+    {   /* reset_stats forgets the failed call: afterwards hearth_stats are the store's own counts */
+        hx_store_stats ss;
+        hearth_reset_stats(e);
+        CHECK(hearth_eval(e, tok, 4, NULL, 0) == 0, "eval after reset_stats");
+        hx_store_get_stats(hx_model_store(hx_engine_model(e)), &ss);
+        hearth_get_stats(e, &s1);
+        CHECK(s1.cache_hits == ss.hits && s1.cache_misses == ss.misses && s1.bytes_read == ss.bytes_read &&
+                  s1.evictions == ss.evictions && s1.bytes_read > 0,
+              "after reset_stats: hits %llu vs %llu, bytes %llu vs %llu", (unsigned long long)s1.cache_hits,
+              (unsigned long long)ss.hits, (unsigned long long)s1.bytes_read, (unsigned long long)ss.bytes_read);
+    }
     hearth_close(e);
     o = defaults();
-    CHECK(run_cfg(path, o, tok, 4, 1, b, NULL) && same(a, b, 4 * V_), "output after a failed eval is unaffected");
+    CHECK(run_cfg(path, o, tok, 6, 1, b, NULL) && same(a, b + 2 * V_, 4 * V_), "output after a failed eval is unaffected");
+}
+
+/* ------------------------------------------------------------ real I/O errors
+ *
+ * Slabs cut off after hearth_open (Windows and POSIX both let a file another handle
+ * has open be truncated and rewritten): a call that needs an unreadable expert fails
+ * with HX_E_IO and leaves pos, the trace and every counter but read_errors as they
+ * were; a mirror covers for a damaged copy; restoring the file heals the engine. */
+
+static uint64_t first_slab(const char *path) {
+    char err[512];
+    uint64_t lo = UINT64_MAX;
+    hx_modelfile *mf = hx_modelfile_open(path, 0, err, sizeof err);
+    if (!mf) return 0;
+    for (int l = 0; l < mf->cfg.n_layers; l++)
+        for (int x = 0; mf->experts && x < mf->cfg.n_experts; x++) {
+            const hx_expert_entry *ent = hx_mf_expert(mf, l, x);
+            if (ent && ent->nbytes && ent->offset < lo) lo = ent->offset;
+        }
+    hx_modelfile_close(mf);
+    return lo == UINT64_MAX ? 0 : lo;
+}
+
+static void test_truncated(const char *path) {
+    char pa[700], pb[700], tr[700], err[512];
+    size_t sz;
+    uint8_t *orig = read_all(path, &sz);
+    const uint64_t cut = first_slab(path);
+    int32_t tok[18];
+    float *want = (float *)malloc(sizeof(float) * 18 * V_), *got = (float *)malloc(sizeof(float) * 8 * V_);
+    hearth_stats s0, s1;
+    hearth_options o;
+    hearth_engine *e;
+    int rc;
+    path_in(pa, sizeof pa, "trunc_a.hearth");
+    path_in(pb, sizeof pb, "trunc_b.hearth");
+    path_in(tr, sizeof tr, "trunc.hrtr");
+    CHECK(orig && cut > 0 && cut < sz && want && got, "truncation test setup (slabs from %llu of %zu bytes)",
+          (unsigned long long)cut, sz);
+    if (!orig || !cut || cut >= sz || !want || !got) goto out;
+    for (int i = 0; i < 18; i++) tok[i] = (int32_t)(splitmix(&g_rng) % V_);
+    o = defaults();
+    CHECK(run_cfg(path, o, tok, 18, 1, want, NULL), "truncation: clean run");
+
+    /* one copy */
+    CHECK(write_bytes(pa, orig, sz), "write copy");
+    o = defaults();
+    o.cache_gb = 0.0;
+    o.prefetch = HEARTH_PREFETCH_OFF;
+    e = open_with(pa, &o, err, sizeof err);
+    CHECK(e != NULL, "truncation: open: %s", err);
+    if (!e) goto out;
+    CHECK(hearth_eval(e, tok, 2, NULL, 0) == 0 && hearth_trace_start(e, tr) == 0, "truncation: first tokens");
+    hearth_get_stats(e, &s0);
+    CHECK(write_bytes(pa, orig, (size_t)cut) && file_size(pa) == (size_t)cut, "truncate the open container (%zu bytes)",
+          file_size(pa));
+    rc = hearth_eval(e, tok + 2, 8, got, 1);
+    hearth_get_stats(e, &s1);
+    CHECK(rc == HX_E_IO, "eval on a truncated container returned %d, want %d", rc, HX_E_IO);
+    CHECK(hearth_pos(e) == 2 && file_size(tr) == 24, "the failed call moved pos (%d) or wrote trace rows (%zu bytes)",
+          hearth_pos(e), file_size(tr));
+    CHECK(same_counters(&s0, &s1), "the failed call changed counters: tokens %llu -> %llu, uses %llu -> %llu, bytes %llu -> %llu",
+          (unsigned long long)s0.tokens, (unsigned long long)s1.tokens, (unsigned long long)s0.expert_uses,
+          (unsigned long long)s1.expert_uses, (unsigned long long)s0.bytes_read, (unsigned long long)s1.bytes_read);
+    CHECK(s0.read_errors == 0 && s1.read_errors > 0, "read_errors %llu -> %llu", (unsigned long long)s0.read_errors,
+          (unsigned long long)s1.read_errors);
+    CHECK(write_bytes(pa, orig, sz), "restore the container");
+    CHECK(hearth_eval(e, tok + 2, 8, got, 1) == 0 && hearth_pos(e) == 10 && same(got, want + 2 * V_, 8 * V_),
+          "after the file is restored the same call succeeds with the clean logits");
+    CHECK(hearth_trace_stop(e) == 0 && file_size(tr) == 24 + 8 * 2 * (size_t)3 * 3, "trace after the retry: %zu bytes",
+          file_size(tr));
+    hearth_close(e);
+
+    /* a damaged mirror is covered by the other copy; both damaged fail */
+    CHECK(write_bytes(pb, orig, sz), "write mirror");
+    o = defaults();
+    o.cache_gb = 0.0;
+    o.prefetch = HEARTH_PREFETCH_OFF;
+    o.n_mirrors = 1;
+    o.mirror_paths[0] = pb;
+    e = open_with(pa, &o, err, sizeof err);
+    CHECK(e != NULL, "mirror: open: %s", err);
+    if (!e) goto out;
+    CHECK(write_bytes(pb, orig, (size_t)cut), "truncate the mirror");
+    CHECK(hearth_eval(e, tok, 10, got, 0) == 0 && same(got, want + 9 * V_, V_), "eval with a truncated mirror");
+    hearth_get_stats(e, &s1);
+    CHECK(s1.read_errors == 0 && s1.bytes_read > 0, "a read the other copy served is no read error (%llu)",
+          (unsigned long long)s1.read_errors);
+    CHECK(write_bytes(pa, orig, (size_t)cut), "truncate the primary too");
+    CHECK(hearth_eval(e, tok + 10, 8, got, 1) == HX_E_IO && hearth_pos(e) == 10, "both copies truncated: eval fails");
+    hearth_get_stats(e, &s1);
+    CHECK(s1.read_errors > 0, "both copies truncated: read_errors %llu", (unsigned long long)s1.read_errors);
+    hearth_close(e);
+out:
+    remove(pa);
+    remove(pb);
+    remove(tr);
+    free(orig);
+    free(want);
+    free(got);
 }
 
 /* ------------------------------------------------------------ option resolution */
@@ -1574,22 +1809,90 @@ static void test_resolution(const char *path) {
         set_env("HEARTH_LOG", NULL);
         hx_set_log_level(HX_LOG_ERROR);
     }
+    {   /* verbose raises the level only while its engine is open; the host's level comes back */
+        hearth_options od = defaults(), oi = defaults(), oq = defaults();
+        char missing[700];
+        hearth_engine *ed, *ei;
+        int l1, l2, l3, l4;
+        od.verbose = 2;
+        oi.verbose = 1;
+        ed = open_with(path, &od, err, sizeof err);
+        l1 = hx_get_log_level();
+        ei = open_with(path, &oi, err, sizeof err);
+        l2 = hx_get_log_level();
+        hearth_close(ed);
+        l3 = hx_get_log_level();
+        hearth_close(ei);
+        l4 = hx_get_log_level();
+        CHECK(ed && ei && l1 == HX_LOG_DEBUG && l2 == HX_LOG_DEBUG && l3 == HX_LOG_INFO && l4 == HX_LOG_ERROR,
+              "nested verbose engines: levels %d %d %d %d, want 3 3 2 0", l1, l2, l3, l4);
+        ei = open_with(path, &oi, err, sizeof err);   /* two engines asking for the same level */
+        e = open_with(path, &oi, err, sizeof err);
+        hearth_close(ei);
+        l1 = hx_get_log_level();
+        hearth_close(e);
+        CHECK(ei && e && l1 == HX_LOG_INFO && hx_get_log_level() == HX_LOG_ERROR, "two info engines: %d then %d", l1,
+              hx_get_log_level());
+        ed = open_with(path, &od, err, sizeof err);
+        hearth_close(ed);
+        e = open_with(path, &oq, err, sizeof err);
+        CHECK(e && hx_get_log_level() == HX_LOG_ERROR, "a quiet engine after a verbose one: level %d", hx_get_log_level());
+        hearth_close(e);
+        hx_set_log_level(HX_LOG_WARN);
+        ei = open_with(path, &oi, err, sizeof err);
+        l1 = hx_get_log_level();
+        hx_set_log_level(HX_LOG_ERROR);   /* the host takes over */
+        hearth_close(ei);
+        CHECK(ei && l1 == HX_LOG_INFO && hx_get_log_level() == HX_LOG_ERROR, "the host's own level is kept: %d",
+              hx_get_log_level());
+        ei = open_with(path, &oi, err, sizeof err);
+        hx_set_log_level(HX_LOG_WARN);    /* the host changes it while an engine is open... */
+        ed = open_with(path, &od, err, sizeof err);
+        hearth_close(ed);
+        l1 = hx_get_log_level();
+        hearth_close(ei);
+        CHECK(ei && ed && l1 == HX_LOG_INFO && hx_get_log_level() == HX_LOG_WARN,
+              "...so the level to come back to is the host's new one: %d then %d", l1, hx_get_log_level());
+        hx_set_log_level(HX_LOG_ERROR);
+        path_in(missing, sizeof missing, "no_such_model.hearth");
+        hx_set_log_level(HX_LOG_WARN);
+        CHECK(open_with(missing, &od, err, sizeof err) == NULL && hx_get_log_level() == HX_LOG_WARN,
+              "a failed verbose open leaves the level: %d", hx_get_log_level());
+        hx_set_log_level(HX_LOG_ERROR);
+    }
 }
 
 /* ------------------------------------------------------------ prefetch gate */
 
-/* Predictions are handed to the store only while they have been precise: under a
- * replayed random routing the router's predictions hit ~top_k/E = 25% of the time,
- * below the gate (50%), so after a few dozen tokens nothing more is prefetched.
- * Reads only: the output is unaffected either way. */
+/* Predictions are handed to the store only while they have been precise: a replayed
+ * routing that uses one of the two predicted layer-2 experts at even positions and
+ * neither at odd ones has a precision of 25%, below the gate (50%), so after the
+ * first pass nothing more is prefetched. The layer-2 prediction comes from the
+ * residual before layer 1's routed experts are added, so it does not depend on the
+ * routing and a clean run gives it (a random replay averages top_k/E = 25% too, but
+ * 24 rows can happen to hit ~50% and keep the gate open). Reads only: the output is
+ * unaffected either way. */
 static void test_prefetch_gate(const char *path) {
-    const int K = 2, n_moe = 2, rows = 64;
+    enum { K = 2, n_moe = 2, rows = 24 };
     char tr[700], err[512];
     uint8_t *buf = (uint8_t *)malloc(24 + 2 * (size_t)rows * n_moe * K);
     hearth_options o = defaults();
     hearth_stats st;
     hearth_engine *e;
-    int32_t tok[24];
+    int32_t tok[rows];
+    int pred[4 * rows] = {0}, plen = 0;
+    float lg[V_];
+    for (int i = 0; i < rows; i++) tok[i] = (int32_t)(splitmix(&g_rng) % V_);
+    o.cache_gb = 0.0;
+    o.prefetch = HEARTH_PREFETCH_NEXT;
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e != NULL, "prefetch gate: open: %s", err);
+    if (!e) { free(buf); return; }
+    hx_model_set_prediction_log(hx_engine_model(e), pred, 4 * rows);
+    for (int i = 0; i < rows; i++) CHECK(hearth_eval(e, tok + i, 1, lg, 0) == 0, "prefetch gate: clean eval");
+    plen = hx_model_prediction_log_len(hx_engine_model(e));
+    hearth_close(e);
+    CHECK(plen == 4 * rows, "prefetch gate: %d prediction ints, want %d", plen, 4 * rows);
     path_in(tr, sizeof tr, "random.hrtr");
     put32(buf, 0x52545248u);
     put32(buf + 4, 1);
@@ -1597,24 +1900,23 @@ static void test_prefetch_gate(const char *path) {
     put32(buf + 12, E_);
     put32(buf + 16, (uint32_t)K);
     put32(buf + 20, (uint32_t)n_moe);
-    for (int r = 0; r < rows * n_moe; r++) {
-        const int a = (int)(splitmix(&g_rng) % E_);
-        const int b = (a + 1 + (int)(splitmix(&g_rng) % (E_ - 1))) % E_;
+    for (int r = 0; r < rows * n_moe; r++) {   /* r = 2 * position + MoE ordinal */
+        const int *p = pred + 4 * (r / 2) + 2, l2 = r % 2, hit = l2 && (r / 2) % 2 == 0;
+        int a, b;
+        do a = hit ? p[0] : (int)(splitmix(&g_rng) % E_); while (l2 && !hit && (a == p[0] || a == p[1]));
+        do b = (int)(splitmix(&g_rng) % E_); while (b == a || (l2 && (b == p[0] || b == p[1])));
         put16(buf + 24 + 4 * r, (uint32_t)a);
         put16(buf + 26 + 4 * r, (uint32_t)b);
     }
     CHECK(write_bytes(tr, buf, 24 + 2 * (size_t)rows * n_moe * K), "write random trace");
     free(buf);
-    for (int i = 0; i < 24; i++) tok[i] = (int32_t)(splitmix(&g_rng) % V_);
-    o.cache_gb = 0.0;
-    o.prefetch = HEARTH_PREFETCH_NEXT;
     e = open_with(path, &o, err, sizeof err);
     CHECK(e && hearth_route_replay(e, tr) == 0, "prefetch gate: open and replay: %s", err);
     if (e) {
         for (int pass = 0; pass < 3; pass++) {
             if (pass == 2) hearth_reset_stats(e);
             hearth_reset(e);
-            for (int i = 0; i < 24; i++) CHECK(hearth_eval(e, tok + i, 1, NULL, 0) == 0, "prefetch gate: eval");
+            for (int i = 0; i < rows; i++) CHECK(hearth_eval(e, tok + i, 1, NULL, 0) == 0, "prefetch gate: eval");
             hearth_get_stats(e, &st);
             if (pass == 0) CHECK(st.prefetch_issued > 0, "prefetch gate: predictions are issued at first");
         }
@@ -1705,6 +2007,7 @@ static void test_trace_failures(const char *path) {
     char err[512], ta[700], tb[700], bad[700];
     hearth_model_info info;
     hearth_stats st;
+    hx_store_stats ss0, ss1;
     int32_t tok[8];
     float want[8 * V_], got[8 * V_];
     int ids[8 * 2 * 2];
@@ -1766,16 +2069,33 @@ static void test_trace_failures(const char *path) {
     hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), fail_one_expert, &f);
     CHECK(hearth_trace_start(e, tb) == 0, "trace_start");
     atomic_store(&f.on, 1);
+    hx_store_get_stats(hx_model_store(hx_engine_model(e)), &ss0);
     CHECK(hearth_eval(e, tok, 8, got, 1) < 0 && hearth_pos(e) == 0, "eval that fails in its second chunk: pos %d", hearth_pos(e));
+    hx_store_get_stats(hx_model_store(hx_engine_model(e)), &ss1);
     hearth_get_stats(e, &st);
     CHECK(file_size(tb) == 24, "the failed call left trace rows (%zu bytes)", file_size(tb));
     CHECK(st.tokens == 0 && st.forward_calls == 0 && st.expert_uses == 0 && st.expert_loads_unique == 0,
           "the failed call left counters: tokens %llu, calls %llu, uses %llu", (unsigned long long)st.tokens,
           (unsigned long long)st.forward_calls, (unsigned long long)st.expert_uses);
-    CHECK(st.wall_s > 0.0, "the failed attempt's time is counted");
+    CHECK(st.wall_s == 0.0 && st.attn_s == 0.0 && st.moe_s == 0.0 && st.cache_hits == 0 && st.cache_misses == 0 &&
+              st.bytes_read == 0 && st.read_s == 0.0 && st.read_errors > 0,
+          "the failed call left time or store counters (wall %g, hits %llu, misses %llu, bytes %llu) or no read error",
+          st.wall_s, (unsigned long long)st.cache_hits, (unsigned long long)st.cache_misses, (unsigned long long)st.bytes_read);
     atomic_store(&f.on, 0);
     CHECK(hearth_eval(e, tok, 8, got, 1) == 0 && hearth_pos(e) == 8, "the retry succeeds");
     hearth_get_stats(e, &st);
+    {   /* what hearth_stats leaves out is exactly the failed call's store counts */
+        hx_store_stats now;
+        hx_store_get_stats(hx_model_store(hx_engine_model(e)), &now);
+        CHECK(ss1.bytes_read > ss0.bytes_read && ss1.hits + ss1.misses > ss0.hits + ss0.misses,
+              "the failed call read slabs before it failed (%llu bytes)", (unsigned long long)(ss1.bytes_read - ss0.bytes_read));
+        CHECK(st.cache_hits == now.hits - (ss1.hits - ss0.hits) && st.cache_misses == now.misses - (ss1.misses - ss0.misses) &&
+                  st.evictions == now.evictions - (ss1.evictions - ss0.evictions) &&
+                  st.bytes_read == now.bytes_read - (ss1.bytes_read - ss0.bytes_read) &&
+                  st.read_s == (double)(now.read_ns - (ss1.read_ns - ss0.read_ns)) * 1e-9 && st.read_errors == now.read_errors,
+              "retry: hits %llu (store %llu), bytes %llu (store %llu)", (unsigned long long)st.cache_hits,
+              (unsigned long long)now.hits, (unsigned long long)st.bytes_read, (unsigned long long)now.bytes_read);
+    }
     CHECK(file_size(tb) == 24 + 8 * row && st.tokens == 8 && st.forward_calls == 2 && st.expert_uses == 8 * 2 * 2,
           "retry: trace %zu bytes, tokens %llu, calls %llu", file_size(tb), (unsigned long long)st.tokens,
           (unsigned long long)st.forward_calls);
@@ -1791,6 +2111,718 @@ static void test_trace_failures(const char *path) {
         free(raw);
     }
     remove(tb);
+}
+
+/* ------------------------------------------------------------ failures with prefetch on
+ *
+ * A failed call returns only once the prefetches it and the call before it asked for
+ * (and did not use) have been read or have failed, so no read lands after it returns:
+ * the counters stay as they were through a later sleep, the hidden amount covers the
+ * prefetch counters, and a retry that uses those experts cannot show more prefetches
+ * used than issued. Every acquire on these paths is released, so failures cannot leak
+ * cache slots (a leak ends in a deadlock, which a watchdog turns into a failure). */
+
+typedef struct pf_hook {
+    atomic_int fail;                 /* (fail_layer, fail_expert) cannot be read while set */
+    atomic_int slow_us;              /* reads of slow_layer (only slow_expert if >= 0) take this long */
+    int fail_layer, fail_expert, slow_layer, slow_expert;
+} pf_hook;
+
+static int pf_hook_read(void *ctx, int layer, int expert, int file, int direct) {
+    pf_hook *h = (pf_hook *)ctx;
+    const int us = atomic_load(&h->slow_us);
+    (void)file; (void)direct;
+    if (atomic_load(&h->fail) && layer == h->fail_layer && expert == h->fail_expert) return 1;
+    if (us > 0 && layer == h->slow_layer && (h->slow_expert < 0 || expert == h->slow_expert)) hx_sleep_us((uint32_t)us);
+    return 0;
+}
+
+static void pf_hook_init(pf_hook *h, int fail_layer, int fail_expert, int slow_layer, int slow_expert, int slow_us) {
+    atomic_init(&h->fail, 0);
+    atomic_init(&h->slow_us, slow_us);
+    h->fail_layer = fail_layer;
+    h->fail_expert = fail_expert;
+    h->slow_layer = slow_layer;
+    h->slow_expert = slow_expert;
+}
+
+/* Clean token-by-token run of tok[0..n) with options o: logits [n][V], routing ids
+ * [n][n_moe * top_k] from a trace, and the prediction log. */
+static int clean_steps(const char *path, hearth_options o, const int32_t *tok, int n, float *logits, int *ids, int *plog,
+                       int pcap, int *plen) {
+    char err[512], tr[700];
+    hearth_model_info info;
+    size_t sz;
+    uint8_t *raw;
+    int ok, per;
+    hearth_engine *e = open_with(path, &o, err, sizeof err);
+    if (!e) return 0;
+    path_in(tr, sizeof tr, "steps.hrtr");
+    hx_model_set_prediction_log(hx_engine_model(e), plog, pcap);
+    ok = hearth_info(e, &info) == 0 && hearth_trace_start(e, tr) == 0;
+    for (int i = 0; ok && i < n; i++) ok = hearth_eval(e, tok + i, 1, logits + (size_t)i * V_, 0) == 0;
+    ok = ok && hearth_trace_stop(e) == 0;
+    *plen = hx_model_prediction_log_len(hx_engine_model(e));
+    hearth_close(e);
+    per = info.n_moe_layers * info.top_k;
+    raw = read_all(tr, &sz);
+    ok = ok && raw && sz == 24 + 2 * (size_t)per * (size_t)n;
+    for (int i = 0; ok && i < n * per; i++) ids[i] = raw[24 + 2 * i] | (raw[25 + 2 * i] << 8);
+    free(raw);
+    remove(tr);
+    return ok;
+}
+
+static void print_pf(const char *what, const hearth_stats *s) {
+    printf("    %s: issued %llu used %llu wasted %llu, hits %llu misses %llu, bytes %llu, read_s %.9f\n", what,
+           (unsigned long long)s->prefetch_issued, (unsigned long long)s->prefetch_used,
+           (unsigned long long)s->prefetch_wasted, (unsigned long long)s->cache_hits, (unsigned long long)s->cache_misses,
+           (unsigned long long)s->bytes_read, s->read_s);
+}
+
+/* make_gqa: MoE layers 1 and 2 (ordinals 0, 1), 8 experts, top-2; one prediction per
+ * token, for layer 2, made in layer 1 before it waits for its own experts. */
+static void test_prefetch_failures(const char *path) {
+    enum { PER = 2 * 2, PCAP = 64 };
+    hearth_options o;
+    char err[512];
+    int32_t tok[2];
+    float want[2 * V_], got[V_];
+    int ids[2 * PER], plog[PCAP], plen = 0, rc, u = -1, x = -1;
+    hearth_stats s0, s1, s2;
+    hx_store_stats r1;
+    hearth_engine *e;
+    pf_hook h;
+
+    /* 1: the first call of a fresh engine fails at layer 1 after hinting every layer-2
+     * expert, whose reads take 30 ms */
+    tok[0] = (int32_t)(splitmix(&g_rng) % V_);
+    o = defaults();
+    o.n_io_threads = 4;
+    o.prefetch = HEARTH_PREFETCH_SHARED;
+    o.prefetch_extra = INT_MAX;
+    CHECK(clean_steps(path, o, tok, 1, want, ids, plog, PCAP, &plen), "prefetch failures: clean run");
+    pf_hook_init(&h, 1, ids[0], 2, -1, 30000);
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e != NULL, "prefetch failures: open: %s", err);
+    if (!e) return;
+    hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), pf_hook_read, &h);
+    atomic_store(&h.fail, 1);
+    hearth_get_stats(e, &s0);
+    rc = hearth_eval(e, tok, 1, got, 0);
+    hearth_get_stats(e, &s1);
+    hx_store_get_stats(hx_model_store(hx_engine_model(e)), &r1);
+    hx_sleep_us(300000);
+    hearth_get_stats(e, &s2);
+    CHECK(rc == HX_E_IO && hearth_pos(e) == 0, "prefetch failures: eval returned %d, pos %d", rc, hearth_pos(e));
+    CHECK(same_counters(&s0, &s1) && same_counters(&s1, &s2), "the failed call's prefetches moved the counters (during or after it)");
+    if (!same_counters(&s0, &s1) || !same_counters(&s1, &s2)) {
+        print_pf("before", &s0);
+        print_pf("after ", &s1);
+        print_pf("+300ms", &s2);
+    }
+    CHECK(r1.prefetch_issued > 0 && r1.prefetch_used > 0 && r1.read_errors > 0,
+          "the failed call did not prefetch and use slabs before it returned (store: issued %llu, used %llu)",
+          (unsigned long long)r1.prefetch_issued, (unsigned long long)r1.prefetch_used);
+    atomic_store(&h.fail, 0);
+    atomic_store(&h.slow_us, 0);
+    CHECK(hearth_eval(e, tok, 1, got, 0) == 0 && same(got, want, V_), "prefetch failures: the retry differs from a clean run");
+    hearth_get_stats(e, &s1);
+    CHECK(s1.prefetch_used <= s1.prefetch_issued && s1.prefetch_wasted <= s1.prefetch_issued &&
+              s1.cache_hits + s1.cache_misses == s1.expert_uses,
+          "after the retry: prefetch issued %llu, used %llu, wasted %llu; hits %llu + misses %llu, uses %llu",
+          (unsigned long long)s1.prefetch_issued, (unsigned long long)s1.prefetch_used, (unsigned long long)s1.prefetch_wasted,
+          (unsigned long long)s1.cache_hits, (unsigned long long)s1.cache_misses, (unsigned long long)s1.expert_uses);
+    hearth_close(e);
+
+    /* 2: the previous call's prefetch. Call A predicts expert u for layer 2 but does not
+     * route there; u's read takes 200 ms. Call B does not predict u and fails at layer 1
+     * on expert x, which A did not use: B must still wait for u. */
+    o = defaults();
+    o.prefetch = HEARTH_PREFETCH_SHARED;
+    for (int attempt = 0; attempt < 64 && x < 0; attempt++) {
+        tok[0] = (int32_t)(splitmix(&g_rng) % V_);
+        tok[1] = (int32_t)(splitmix(&g_rng) % V_);
+        if (!clean_steps(path, o, tok, 2, want, ids, plog, PCAP, &plen) || plen != 8) continue;
+        for (int j = 0; j < 2 && x < 0; j++) {   /* plog: [2, 2, a0, a1, 2, 2, b0, b1] */
+            u = plog[2 + j];
+            if (u == ids[2] || u == ids[3] || u == plog[6] || u == plog[7]) continue;
+            for (int k = 0; k < 2 && x < 0; k++)
+                if (ids[PER + k] != ids[0] && ids[PER + k] != ids[1]) x = ids[PER + k];
+        }
+    }
+    CHECK(x >= 0, "prefetch failures: found no token pair for the previous-call case");
+    if (x < 0) return;
+    pf_hook_init(&h, 1, x, 2, u, 200000);
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e != NULL, "prefetch failures: open: %s", err);
+    if (!e) return;
+    hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), pf_hook_read, &h);
+    CHECK(hearth_eval(e, tok, 1, got, 0) == 0 && same(got, want, V_), "previous call: call A");
+    atomic_store(&h.fail, 1);
+    rc = hearth_eval(e, tok + 1, 1, got, 0);
+    hearth_get_stats(e, &s1);
+    hx_sleep_us(300000);
+    hearth_get_stats(e, &s2);
+    CHECK(rc == HX_E_IO && hearth_pos(e) == 1, "previous call: call B returned %d, pos %d", rc, hearth_pos(e));
+    CHECK(same_counters(&s1, &s2), "previous call: a prefetch call A asked for landed after the failed call B returned");
+    if (!same_counters(&s1, &s2)) {
+        print_pf("after B", &s1);
+        print_pf("+300ms ", &s2);
+    }
+    atomic_store(&h.fail, 0);
+    atomic_store(&h.slow_us, 0);
+    CHECK(hearth_eval(e, tok + 1, 1, got, 0) == 0 && same(got, want + V_, V_), "previous call: the retry differs from a clean run");
+    hearth_get_stats(e, &s1);
+    CHECK(s1.prefetch_used <= s1.prefetch_issued && s1.cache_hits + s1.cache_misses == s1.expert_uses,
+          "previous call: after the retry prefetch issued %llu, used %llu", (unsigned long long)s1.prefetch_issued,
+          (unsigned long long)s1.prefetch_used);
+    hearth_close(e);
+}
+
+typedef struct watchdog {
+    atomic_int done;
+    double limit_s;
+    const char *what;
+} watchdog;
+
+/* A deadlock would hang the test binary: report it and exit instead. */
+static void *watchdog_main(void *arg) {
+    watchdog *w = (watchdog *)arg;
+    const uint64_t t0 = hx_now_ns();
+    while (!atomic_load(&w->done)) {
+        if ((double)(hx_now_ns() - t0) * 1e-9 > w->limit_s) {
+            printf("  FAIL %s:%d: %s did not finish within %.0f s (deadlock: a leaked cache slot?)\n", __FILE__, __LINE__,
+                   w->what, w->limit_s);
+            printf("test_model: aborted by the watchdog\n");
+            fflush(stdout);
+            _Exit(1);
+        }
+        hx_sleep_us(20000);
+    }
+    return NULL;
+}
+
+static int leak_hook_read(void *ctx, int layer, int expert, int file, int direct) {
+    (void)file; (void)direct;
+    if (atomic_load((atomic_int *)ctx) && layer == 1 && expert % 4 == 0) return 1;
+    hx_sleep_us(1000);
+    return 0;
+}
+
+/* With nothing leaked, the caller can hold n distinct experts of layer 0 at once (n
+ * <= cache slots, all unpinned); a slot leaked by a failure path stays referenced, so
+ * the last acquire would wait forever (the watchdog reports it). */
+static void hold_slots(hearth_engine *e, int n) {
+    hx_store *s = hx_model_store(hx_engine_model(e));
+    int held = 0;
+    for (int x = 0; x < n; x++) held += hx_store_acquire(s, 0, x) != NULL;
+    CHECK(held == n, "failure leaks: held %d of %d experts", held, n);
+    for (int x = 0; x < n; x++) hx_store_release(s, 0, x);
+}
+
+/* make_mla (MoE layers 0, 1, 3; 16 experts, top-3) on the minimum cache (10 slots);
+ * while failing, experts 0, 4, 8, 12 of layer 1 cannot be read (at once), and every
+ * other read takes 1 ms: a failing 8-token call leaves readable experts of layer 1
+ * pending and layer-1 prefetches outstanding, which the failure path acquires and must
+ * release; 12 readable experts can leak more slots than there are. Each round runs a
+ * successful token (its unused prefetches, evicted by the failing call, are prefetch
+ * wasted inside the hidden window) and a failing batch, then holds every cache slot;
+ * afterwards a 16-token batch and 16 decode steps must run and match a clean run, and
+ * hearth_stats must be the store's counts less exactly those of the failed calls. */
+static void test_failure_leaks(const char *path) {
+    enum { R = 24, NB = 16, ND = 16, N = NB + ND };
+    hearth_options o = defaults();
+    char err[512];
+    int32_t seq[N], bad[8];
+    float *want = (float *)malloc(sizeof(float) * (size_t)N * V_), *got = (float *)malloc(sizeof(float) * (size_t)N * V_);
+    atomic_int failing;
+    watchdog wd;
+    hx_thread *th = NULL;
+    hearth_engine *e;
+    hearth_stats st;
+    hx_store_stats hid;
+    int failed = 0, ok = 1;
+
+    for (int i = 0; i < N; i++) seq[i] = (int32_t)(splitmix(&g_rng) % V_);
+    CHECK(want && got && run_cfg(path, o, seq, N, 0, want, NULL), "failure leaks: clean run");
+    if (!want || !got) goto out;
+    atomic_init(&failing, 0);
+    atomic_init(&wd.done, 0);
+    wd.limit_s = 30.0;
+    wd.what = "failing calls on a minimum cache";
+    CHECK(hx_thread_create(&th, watchdog_main, &wd) == 0, "failure leaks: watchdog thread");
+    o.cache_gb = 0.0;
+    o.prefetch = HEARTH_PREFETCH_SHARED;
+    o.prefetch_extra = 2;
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e != NULL, "failure leaks: open: %s", err);
+    if (!e) goto stop;
+    hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), leak_hook_read, (void *)&failing);
+    memset(&hid, 0, sizeof hid);
+    hearth_get_stats(e, &st);
+    CHECK(st.cache_slots == 10 && st.cache_pinned == 0, "failure leaks: %d cache slots (%d pinned), want 10", st.cache_slots,
+          st.cache_pinned);
+    for (int r = 0; r < R && ok; r++) {
+        hearth_stats h0, h1, h2;
+        hx_store_stats r0, r1;
+        int rc;
+        atomic_store(&failing, 0);
+        ok = hearth_rewind(e, 0) == 0 && hearth_eval(e, seq, 1, got, 0) == 0 && same(got, want, V_);
+        CHECK(ok, "failure leaks: round %d: the successful token failed or differs", r);
+        for (int i = 0; i < 8; i++) bad[i] = (int32_t)(splitmix(&g_rng) % V_);
+        hx_sleep_us(20000);   /* the token's prefetches land before r0 */
+        atomic_store(&failing, 1);
+        hearth_get_stats(e, &h0);
+        hx_store_get_stats(hx_model_store(hx_engine_model(e)), &r0);
+        rc = hearth_eval(e, bad, 8, NULL, 0);
+        hx_store_get_stats(hx_model_store(hx_engine_model(e)), &r1);
+        hearth_get_stats(e, &h1);
+        if (rc != 0) {   /* else no token routed to an unreadable expert */
+            failed++;
+            hx_sleep_us(20000);   /* reads it left pending would land now */
+            hearth_get_stats(e, &h2);
+            CHECK(rc == HX_E_IO && hearth_pos(e) == 1 && same_counters(&h0, &h1) && same_counters(&h1, &h2),
+                  "failure leaks: round %d: rc %d, pos %d, counters changed by the failed call (during: %d, after: %d)", r,
+                  rc, hearth_pos(e), !same_counters(&h0, &h1), !same_counters(&h1, &h2));
+            hid.hits += r1.hits - r0.hits;
+            hid.misses += r1.misses - r0.misses;
+            hid.evictions += r1.evictions - r0.evictions;
+            hid.prefetch_issued += r1.prefetch_issued - r0.prefetch_issued;
+            hid.prefetch_used += r1.prefetch_used - r0.prefetch_used;
+            hid.prefetch_wasted += r1.prefetch_wasted - r0.prefetch_wasted;
+            hid.bytes_read += r1.bytes_read - r0.bytes_read;
+            hid.read_ns += r1.read_ns - r0.read_ns;
+        }
+        hold_slots(e, st.cache_slots);
+    }
+    atomic_store(&failing, 0);
+    CHECK(failed >= R / 2, "failure leaks: only %d of %d batches failed", failed, R);
+    CHECK(hid.prefetch_issued > 0 && hid.prefetch_used > 0 && hid.prefetch_wasted > 0,
+          "failure leaks: failed calls hid no prefetch issued (%llu), used (%llu) or wasted (%llu)",
+          (unsigned long long)hid.prefetch_issued, (unsigned long long)hid.prefetch_used,
+          (unsigned long long)hid.prefetch_wasted);
+    if (ok) {
+        const uint64_t t0 = hx_now_ns();
+        ok = hearth_rewind(e, 0) == 0 && hearth_eval(e, seq, NB, got, 1) == 0;
+        for (int i = NB; ok && i < N; i++) ok = hearth_eval(e, seq + i, 1, got + (size_t)i * V_, 0) == 0;
+        CHECK(ok && same(got, want, (size_t)N * V_), "failure leaks: evals after the failures fail or differ from a clean run "
+              "(%d tokens took %.3f s)", N, (double)(hx_now_ns() - t0) * 1e-9);
+    }
+    {   /* what hearth_stats leaves out is exactly what the store counted during the failed calls
+         * (read at a moment when no prefetch of the last calls lands in between) */
+        hx_store_stats now, again;
+        for (int k = 0; k < 100; k++) {
+            hx_store_get_stats(hx_model_store(hx_engine_model(e)), &now);
+            hearth_get_stats(e, &st);
+            hx_store_get_stats(hx_model_store(hx_engine_model(e)), &again);
+            if (now.reads == again.reads && now.read_errors == again.read_errors && now.read_ns == again.read_ns &&
+                now.prefetch_issued == again.prefetch_issued && now.evictions == again.evictions)
+                break;
+            hx_sleep_us(10000);
+        }
+        CHECK(st.cache_hits == now.hits - hid.hits && st.cache_misses == now.misses - hid.misses &&
+                  st.evictions == now.evictions - hid.evictions && st.prefetch_issued == now.prefetch_issued - hid.prefetch_issued &&
+                  st.prefetch_used == now.prefetch_used - hid.prefetch_used &&
+                  st.prefetch_wasted == now.prefetch_wasted - hid.prefetch_wasted && st.bytes_read == now.bytes_read - hid.bytes_read &&
+                  st.read_s == (double)(now.read_ns - hid.read_ns) * 1e-9 && st.read_errors == now.read_errors,
+              "failure leaks: hearth_stats differ from the store's counts less the failed calls' "
+              "(prefetch used %llu vs %llu - %llu, wasted %llu vs %llu - %llu)", (unsigned long long)st.prefetch_used,
+              (unsigned long long)now.prefetch_used, (unsigned long long)hid.prefetch_used, (unsigned long long)st.prefetch_wasted,
+              (unsigned long long)now.prefetch_wasted, (unsigned long long)hid.prefetch_wasted);
+        CHECK(st.prefetch_used > 0 && st.prefetch_wasted > 0, "failure leaks: no visible prefetch use (%llu) or waste (%llu)",
+              (unsigned long long)st.prefetch_used, (unsigned long long)st.prefetch_wasted);
+    }
+    hearth_close(e);
+stop:
+    atomic_store(&wd.done, 1);
+    if (th) hx_thread_join(th);
+out:
+    free(want);
+    free(got);
+}
+
+/* Which hints a failed call waits for (seam hx_model_hints_drained): those it and the
+ * previous call handed to the store and that no layer acquired since; not the experts
+ * a layer routed to (resolved by its own acquire, also when the previous call hinted
+ * them), not hints from two calls back. Calls A1, A2 succeed, B fails at layer 2 on
+ * expert x, which nothing read before; all sets are of layer-2 experts (make_gqa: one
+ * prediction per token, for layer 2). Two token triples make each rule change the
+ * count: in the first B routes to one of its own hints, A2 left a hint B does not
+ * touch and A1 one nobody touched later; in the second B routes to a hint of A2's. */
+static void test_drain_scope(const char *path) {
+    enum { PER = 2 * 2, PCAP = 64 };
+    for (int kase = 0; kase < 2; kase++) {
+        hearth_options o = defaults();
+        char err[512];
+        int32_t tok[3];
+        float lg[3 * V_];
+        int ids[3 * PER], plog[PCAP], plen = 0, x = -1, want = 0, attempt, rc;
+        uint64_t d0;
+        hearth_engine *e;
+        pf_hook hk;
+        o.prefetch = HEARTH_PREFETCH_SHARED;
+        for (attempt = 0; attempt < 2000 && x < 0; attempt++) {
+            uint8_t pred[3][E_] = {{0}}, route[3][E_] = {{0}};
+            int overlap = 0, prev = 0, stale = 0, prev_routed = 0;
+            for (int i = 0; i < 3; i++) tok[i] = (int32_t)(splitmix(&g_rng) % V_);
+            if (!clean_steps(path, o, tok, 3, lg, ids, plog, PCAP, &plen) || plen != 12) continue;
+            for (int t = 0; t < 3; t++)
+                for (int j = 0; j < 2; j++) {
+                    pred[t][plog[4 * t + 2 + j]] = 1;
+                    route[t][ids[PER * t + 2 + j]] = 1;
+                }
+            for (int j = 0; j < 2; j++) {
+                const int c = ids[PER * 2 + 2 + j];
+                if (!pred[0][c] && !route[0][c] && !pred[1][c] && !route[1][c]) x = c;
+            }
+            want = 0;
+            for (int c = 0; c < E_; c++) {
+                const int late = pred[2][c] || route[2][c];
+                want += (pred[2][c] || (pred[1][c] && !route[1][c])) && !route[2][c];
+                overlap += pred[2][c] && route[2][c];
+                prev += pred[1][c] && !route[1][c] && !late;
+                stale += pred[0][c] && !route[0][c] && !pred[1][c] && !route[1][c] && !late;
+                prev_routed += pred[1][c] && !route[1][c] && !pred[2][c] && route[2][c];
+            }
+            if (kase == 0 ? !overlap || !prev || !stale : !prev_routed) x = -1;
+        }
+        CHECK(x >= 0, "drain scope %d: no suitable token triple in %d attempts", kase, attempt);
+        if (x < 0) continue;
+        pf_hook_init(&hk, 2, x, -1, -1, 0);
+        e = open_with(path, &o, err, sizeof err);
+        CHECK(e != NULL, "drain scope: open: %s", err);
+        if (!e) continue;
+        hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), pf_hook_read, &hk);
+        CHECK(hearth_eval(e, tok, 1, NULL, 0) == 0 && hearth_eval(e, tok + 1, 1, NULL, 0) == 0, "drain scope: calls A1, A2");
+        atomic_store(&hk.fail, 1);
+        d0 = hx_model_hints_drained(hx_engine_model(e));
+        rc = hearth_eval(e, tok + 2, 1, NULL, 0);
+        CHECK(rc == HX_E_IO && hx_model_hints_drained(hx_engine_model(e)) - d0 == (uint64_t)want,
+              "drain scope %d: the failed call (rc %d) waited for %llu hints, want %d (triple found after %d attempts)", kase, rc,
+              (unsigned long long)(hx_model_hints_drained(hx_engine_model(e)) - d0), want, attempt);
+        hearth_close(e);
+    }
+}
+
+/* ------------------------------------------------------------ next-layer predictions */
+
+/* What the store is asked to prefetch follows model.c's rule: NEXT routes layer L+1
+ * on rmsnorm(h, ffn_norm[L+1]) with h the residual entering layer L's FFN; SHARED
+ * first adds residual_scale * layer L's shared-expert output; top_k + extra experts
+ * per token (never more than n_experts), the union over a batch in first-mention
+ * order. Checked against the naive reference, token by token and as one batch. */
+static void test_predictions(const char *path, const char *label) {
+    static const struct { int mode, extra; } cfg[] = {
+        {HEARTH_PREFETCH_NEXT, 0}, {HEARTH_PREFETCH_SHARED, 0}, {HEARTH_PREFETCH_SHARED, 2}, {HEARTH_PREFETCH_NEXT, INT_MAX},
+        {HEARTH_PREFETCH_NEXT, 1},
+    };
+    enum { N = 8, CAP = 4096 };
+    int32_t tok[N];
+    int *log = (int *)malloc(sizeof(int) * CAP), tok_end[N];
+    char err[512];
+    float lg[V_];
+    for (int i = 0; i < N; i++) tok[i] = (int32_t)(splitmix(&g_rng) % V_);
+    for (size_t c = 0; c < sizeof cfg / sizeof cfg[0]; c++)
+        for (int batched = 0; batched < 2; batched++) {
+            hearth_options o = defaults();
+            hearth_model_info info;
+            hearth_engine *e;
+            nref r;
+            int len = 0, kk, ok;
+            o.prefetch = cfg[c].mode;
+            o.prefetch_extra = cfg[c].extra;
+            e = open_with(path, &o, err, sizeof err);
+            CHECK(e && hearth_info(e, &info) == 0, "%s: predictions: open: %s", label, err);
+            if (!e) continue;
+            hx_model_set_prediction_log(hx_engine_model(e), log, CAP);
+            if (batched) CHECK(hearth_eval(e, tok, N, NULL, 0) == 0, "%s: predictions: batched eval", label);
+            else for (int i = 0; i < N; i++) CHECK(hearth_eval(e, tok + i, 1, NULL, 0) == 0, "%s: predictions: eval", label);
+            len = hx_model_prediction_log_len(hx_engine_model(e));
+            hearth_close(e);
+            kk = cfg[c].extra > info.n_experts - info.top_k ? info.n_experts : info.top_k + cfg[c].extra;
+            ok = nref_open(&r, path, MAXSEQ_);
+            r.pf_mode = cfg[c].mode;
+            r.pf_kk = kk;
+            for (int i = 0; ok && i < N; i++) {
+                nref_forward(&r, tok[i], lg);
+                tok_end[i] = r.pred_len;
+            }
+            CHECK(ok && r.pred_len > 0, "%s: the naive reference made no predictions", label);
+            if (ok && !batched) {
+                CHECK(len == r.pred_len && !memcmp(log, r.pred, sizeof(int) * (size_t)len),
+                      "%s: predictions (mode %d, extra %d) differ from the naive reference (%d vs %d ints)", label,
+                      cfg[c].mode, cfg[c].extra, len, r.pred_len);
+            } else if (ok) {   /* one prediction per predicting layer: the union over the tokens */
+                int pos = 0, good = 1;
+                for (int k = 0; good && k < tok_end[0]; k += 2 + r.pred[k + 1]) {
+                    const int nl = r.pred[k];
+                    int n = 0, seen[1024] = {0}, u[1024];
+                    for (int t = 0; t < N; t++)
+                        for (int q = t ? tok_end[t - 1] : 0; q < tok_end[t]; q += 2 + r.pred[q + 1])
+                            for (int j = 0; r.pred[q] == nl && j < r.pred[q + 1]; j++)
+                                if (!seen[r.pred[q + 2 + j]]) {
+                                    seen[r.pred[q + 2 + j]] = 1;
+                                    u[n++] = r.pred[q + 2 + j];
+                                }
+                    good = pos + 2 + n <= len && log[pos] == nl && log[pos + 1] == n && !memcmp(log + pos + 2, u, sizeof(int) * (size_t)n);
+                    pos += 2 + n;
+                }
+                CHECK(good && pos == len, "%s: batched predictions (mode %d, extra %d) are not the union of the tokens'", label,
+                      cfg[c].mode, cfg[c].extra);
+            }
+            nref_close(&r);
+        }
+    for (int room = 0; room < 2; room++) {   /* the log keeps what fits (room for 1 or 2 - 1/K entries); cap 0: nothing */
+        hearth_options o = defaults();
+        hearth_engine *e = open_with(path, &o, err, sizeof err);
+        hearth_model_info info;
+        CHECK(e && hearth_info(e, &info) == 0, "%s: predictions: open: %s", label, err);
+        if (e) {
+            const int one = 2 + info.top_k, cap = room ? 2 * one - 1 : one;
+            hx_model_set_prediction_log(hx_engine_model(e), log, cap);
+            for (int i = 0; i < 4; i++) CHECK(hearth_eval(e, tok + i, 1, NULL, 0) == 0, "%s: predictions: eval", label);
+            CHECK(hx_model_prediction_log_len(hx_engine_model(e)) == one, "%s: a full log grew to %d ints (room for %d)", label,
+                  hx_model_prediction_log_len(hx_engine_model(e)), cap);
+            hx_model_set_prediction_log(hx_engine_model(e), log, 0);
+            CHECK(hearth_eval(e, tok + 4, 1, NULL, 0) == 0 && hx_model_prediction_log_len(hx_engine_model(e)) == 0,
+                  "%s: a log of capacity 0 recorded something", label);
+            hearth_close(e);
+        }
+    }
+    free(log);
+}
+
+/* ------------------------------------------------------------ exact counters */
+
+static int slow_reads(void *ctx, int layer, int expert, int file, int direct) {
+    (void)ctx; (void)layer; (void)expert; (void)file; (void)direct;
+    hx_sleep_us(2000);
+    return 0;
+}
+
+/* expert_loads_unique is the number of distinct (layer, expert) per forward call;
+ * the store's clock ticks once per token (usage_out's tokens_observed); compute that
+ * waits for slow reads is counted as stall time. */
+static void test_counters(const char *path) {
+    char err[512], tr[700], usage[700];
+    int32_t tok[7];
+    hearth_options o = defaults();
+    hearth_model_info info;
+    hearth_stats st;
+    hearth_engine *e;
+    for (int i = 0; i < 7; i++) tok[i] = (int32_t)(splitmix(&g_rng) % V_);
+    path_in(tr, sizeof tr, "counters.hrtr");
+    path_in(usage, sizeof usage, "counters.usage");
+    o.usage_out = usage;
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e && hearth_info(e, &info) == 0, "counters: open: %s", err);
+    if (!e) return;
+    {
+        const uint64_t t0 = hx_now_ns();
+        double el;
+        CHECK(hearth_trace_start(e, tr) == 0 && hearth_eval(e, tok, 6, NULL, 0) == 0 && hearth_eval(e, tok + 6, 1, NULL, 0) == 0 &&
+                  hearth_trace_stop(e) == 0, "counters: traced evals");
+        el = (double)(hx_now_ns() - t0) * 1e-9;
+        hearth_get_stats(e, &st);
+        CHECK(st.wall_s > 0.0 && st.wall_s <= el && st.wall_s + 1e-9 >= st.attn_s + st.moe_s + st.dense_s,
+              "wall %.6f s (measured %.6f s; attention %.6f + moe %.6f + dense %.6f)", st.wall_s, el, st.attn_s, st.moe_s,
+              st.dense_s);
+    }
+    hearth_close(e);
+    {
+        const int per = info.n_moe_layers * info.top_k;
+        size_t sz;
+        uint8_t *raw = read_all(tr, &sz);
+        uint64_t want = 0;
+        CHECK(raw && sz == 24 + 2 * (size_t)per * 7, "counters: trace size %zu", sz);
+        for (int mi = 0; raw && sz == 24 + 2 * (size_t)per * 7 && mi < info.n_moe_layers; mi++) {
+            int seen[2][256] = {{0}};
+            for (int t = 0; t < 7; t++)
+                for (int j = 0; j < info.top_k; j++) {
+                    const uint8_t *p = raw + 24 + 2 * ((size_t)t * per + (size_t)mi * info.top_k + j);
+                    int *s = &seen[t == 6][(p[0] | (p[1] << 8)) & 255];
+                    want += !*s;
+                    *s = 1;
+                }
+        }
+        CHECK(st.expert_loads_unique == want && want > (uint64_t)2 * per - 1,
+              "expert_loads_unique %llu, want %llu (distinct per call and MoE layer)", (unsigned long long)st.expert_loads_unique,
+              (unsigned long long)want);
+        free(raw);
+    }
+    {
+        size_t sz;
+        uint8_t *raw = read_all(usage, &sz);
+        const uint64_t ticks = raw && sz >= 24 ? (uint64_t)(raw[16] | (raw[17] << 8) | (raw[18] << 16) | ((uint32_t)raw[19] << 24)) : 0;
+        CHECK(ticks == 7, "usage_out counts %llu tokens, want 7 (one store tick per token)", (unsigned long long)ticks);
+        free(raw);
+    }
+    remove(tr);
+    remove(usage);
+
+    o = defaults();
+    o.cache_gb = 0.0;
+    o.prefetch = HEARTH_PREFETCH_OFF;
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e != NULL, "counters: open: %s", err);
+    if (!e) return;
+    hx_store_set_read_hook(hx_model_store(hx_engine_model(e)), slow_reads, NULL);
+    CHECK(hearth_eval(e, tok, 3, NULL, 0) == 0, "counters: eval with slow reads");
+    hearth_get_stats(e, &st);
+    hearth_close(e);
+    CHECK(st.stall_s >= 0.002 && st.stall_s <= st.moe_s + 1e-6, "stall %.4f s with 2 ms reads (moe %.4f s)", st.stall_s, st.moe_s);
+}
+
+/* ------------------------------------------------------------ trace_start guard */
+
+/* Makes path writable but not readable until unlock_read: Windows holds a handle that
+ * denies read sharing, POSIX drops the read permission. 0 if that is not possible here
+ * (e.g. running as root). */
+static int lock_read(const char *path, int *fd) {
+    FILE *f;
+    *fd = -1;
+#if defined(_WIN32)
+    if (_sopen_s(fd, path, _O_WRONLY | _O_BINARY, _SH_DENYRD, _S_IREAD | _S_IWRITE) != 0) return 0;
+#else
+    if (chmod(path, 0200) != 0) return 0;
+#endif
+    f = fopen(path, "rb");
+    if (f) {
+        fclose(f);
+#if defined(_WIN32)
+        _close(*fd);
+#else
+        chmod(path, 0644);
+#endif
+        return 0;
+    }
+    return 1;
+}
+
+static void unlock_read(const char *path, int fd) {
+#if defined(_WIN32)
+    (void)path;
+    _close(fd);
+#else
+    (void)fd;
+    chmod(path, 0644);
+#endif
+}
+
+/* trace_start never truncates a file that is not a routing trace: not the model, not
+ * a mirror, not a heat profile, not a file it cannot read to check; empty files and old
+ * traces are fine. */
+static void test_trace_guard(const char *path) {
+    char pa[700], pb[700], pu[700], pe[700], pt[700], pw[700], err[512];
+    static const uint8_t usage_like[28] = {'H', 'R', 'U', 'S', 1, 0, 0, 0};
+    size_t sz;
+    uint8_t *orig = read_all(path, &sz), *now;
+    hearth_options o = defaults();
+    hearth_engine *e;
+    int32_t tok[3] = {4, 9, 2};
+    float a[V_], b[V_];
+    path_in(pa, sizeof pa, "guard_a.hearth");
+    path_in(pb, sizeof pb, "guard_b.hearth");
+    path_in(pu, sizeof pu, "guard.usage");
+    path_in(pe, sizeof pe, "guard_empty.hrtr");
+    path_in(pt, sizeof pt, "guard_old.hrtr");
+    path_in(pw, sizeof pw, "guard_wonly.hrtr");
+    CHECK(orig && write_bytes(pa, orig, sz) && write_bytes(pb, orig, sz) && write_bytes(pu, usage_like, sizeof usage_like) &&
+              write_bytes(pe, "", 0),
+          "trace guard: setup");
+    o.n_mirrors = 1;
+    o.mirror_paths[0] = pb;
+    e = orig ? open_with(pa, &o, err, sizeof err) : NULL;
+    CHECK(e != NULL, "trace guard: open: %s", err);
+    if (!e) goto out;
+    CHECK(hearth_trace_start(e, pa) == HX_E_ARG, "trace_start on the model's own path must be refused");
+    CHECK(hearth_trace_start(e, pb) == HX_E_ARG, "trace_start on a mirror must be refused");
+    CHECK(hearth_trace_start(e, pu) == HX_E_ARG && file_size(pu) == sizeof usage_like, "trace_start on a heat profile must be refused");
+    now = read_all(pa, &sz);
+    CHECK(now && !memcmp(now, orig, sz), "the model file was changed");
+    free(now);
+    now = read_all(pb, &sz);
+    CHECK(now && !memcmp(now, orig, sz), "the mirror was changed");
+    free(now);
+    CHECK(hearth_eval(e, tok, 3, a, 0) == 0, "eval after refused trace_starts");
+    CHECK(hearth_trace_start(e, pe) == 0 && hearth_eval(e, tok, 1, NULL, 0) == 0 && hearth_trace_stop(e) == 0 &&
+              file_size(pe) == 24 + 2 * 2 * 2,
+          "an empty file becomes a trace (%zu bytes)", file_size(pe));
+    CHECK(write_bytes(pt, "HRTR and then some", 18) && hearth_trace_start(e, pt) == 0 && file_size(pt) == 24 &&
+              hearth_trace_stop(e) == 0,
+          "an old trace is overwritten (%zu bytes)", file_size(pt));
+    CHECK(write_bytes(pt, "HRTR", 4) && hearth_trace_start(e, pt) == 0 && hearth_trace_stop(e) == 0 && file_size(pt) == 24,
+          "a file holding just the trace magic is a trace");
+    CHECK(write_bytes(pt, "HRT", 3) && hearth_trace_start(e, pt) == HX_E_ARG && file_size(pt) == 3,
+          "a 3-byte file is not a trace");
+    {   /* exists, can be written, cannot be read: it cannot be checked, so it is not overwritten */
+        static const char keep[] = "not a trace, keep me";
+        int fd, rc;
+        CHECK(write_bytes(pw, keep, sizeof keep - 1), "trace guard: write the unreadable file");
+        if (lock_read(pw, &fd)) {
+            rc = hearth_trace_start(e, pw);
+            unlock_read(pw, fd);
+            now = read_all(pw, &sz);
+            CHECK(rc == HX_E_ARG && now && sz == sizeof keep - 1 && !memcmp(now, keep, sz),
+                  "trace_start on a file it cannot read returned %d and left %zu bytes", rc, sz);
+            free(now);
+            CHECK(hearth_trace_stop(e) == 0, "trace guard: trace_stop");
+        } else {
+            printf("  note: cannot make a file write-only here (root?): unreadable-file case skipped\n");
+        }
+    }
+    hearth_close(e);
+    o = defaults();
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e && hearth_eval(e, tok, 3, b, 0) == 0 && same(a, b, V_), "trace guard: logits differ from a clean run");
+    hearth_close(e);
+out:
+    remove(pa);
+    remove(pb);
+    remove(pu);
+    remove(pe);
+    remove(pt);
+    remove(pw);
+    free(orig);
+}
+
+/* ------------------------------------------------------------ wide expert ids */
+
+/* Trace ids above 255 use the high byte (FORMAT §9 u16): an MLA model with 272 experts
+ * whose router bias makes experts 256..271 win every time. */
+static void test_wide_ids(const char *path) {
+    char tr[700], err[512];
+    int32_t tok[5] = {7, 1, 99, 42, 3};
+    float a[5 * V_], b[5 * V_];
+    hearth_options o = defaults();
+    hearth_model_info info;
+    hearth_engine *e;
+    path_in(tr, sizeof tr, "wide.hrtr");
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e && hearth_info(e, &info) == 0 && info.n_experts == 272, "wide: open: %s", err);
+    if (!e) return;
+    CHECK(hearth_trace_start(e, tr) == 0 && hearth_eval(e, tok, 5, a, 1) == 0 && hearth_trace_stop(e) == 0, "wide: traced eval");
+    hearth_close(e);
+    {
+        size_t sz;
+        uint8_t *raw = read_all(tr, &sz);
+        const size_t n = 5 * (size_t)info.n_moe_layers * (size_t)info.top_k;
+        int high = 0;
+        CHECK(raw && sz == 24 + 2 * n, "wide: trace size %zu", sz);
+        for (size_t i = 0; raw && sz == 24 + 2 * n && i < n; i++) {
+            const int id = raw[24 + 2 * i] | (raw[25 + 2 * i] << 8);
+            high += id >= 256 && id < 272;
+        }
+        CHECK(high == (int)n, "wide: %d of %zu traced ids in 256..271", high, n);
+        free(raw);
+    }
+    o.cache_gb = 0.0;
+    e = open_with(path, &o, err, sizeof err);
+    CHECK(e && hearth_route_replay(e, tr) == 0 && hearth_eval(e, tok, 5, b, 1) == 0 && same(a, b, 5 * V_),
+          "wide: replaying ids >= 256 reproduces the logits");
+    hearth_close(e);
+    remove(tr);
 }
 
 /* ------------------------------------------------------------ hearth-bench, overhead */
@@ -1835,6 +2867,20 @@ static void test_bench(const char *path) {
               "hearth-bench usage errors exit 2");
         CHECK(bench_main(2, a6) == 1 && bench_main(4, a7) == 1 && bench_main(6, a8) == 1 && bench_main(4, a9) == 1,
               "hearth-bench open / replay / trace failures exit 1");
+    }
+    {   /* hit rates per activation and per unique load */
+        hearth_stats s;
+        memset(&s, 0, sizeof s);
+        CHECK(bench_hit_rate(&s) == 0.0 && bench_unique_hit_rate(&s) == 0.0, "hearth-bench rates of empty stats");
+        s.cache_hits = 30;
+        s.cache_misses = 10;
+        s.expert_loads_unique = 16;
+        CHECK(bench_hit_rate(&s) == 75.0 && bench_unique_hit_rate(&s) == 37.5, "hearth-bench rates %.2f %.2f", bench_hit_rate(&s),
+              bench_unique_hit_rate(&s));
+        s.cache_misses = 16;
+        CHECK(bench_unique_hit_rate(&s) == 0.0, "hearth-bench unique-load rate with every load a miss");
+        s.cache_misses = 20;   /* re-reads of slabs a starved store evicted before they were used */
+        CHECK(bench_unique_hit_rate(&s) == 0.0, "hearth-bench unique-load rate with more misses than loads");
     }
     remove(tr);
     remove(usage);
@@ -1888,6 +2934,51 @@ static void test_overhead(const char *path) {
     CHECK(same(out[0], out[1], V_), "overhead: the thread count changed the output");
     CHECK(best[1] <= 4.0 * best[0] + 0.02, "40 tiny decode steps take %.4f s on %d threads vs %.4f s on 1", best[1], many, best[0]);
     printf("test_model: 40 tiny decode steps: %.2f ms on 1 thread, %.2f ms on %d\n", best[0] * 1e3, best[1] * 1e3, many);
+    if (many > 2) {   /* a region gets threads in proportion to its work: the tiny model's are worth two each */
+        hearth_options o = defaults();
+        hearth_engine *e;
+        o.n_threads = many;
+        e = open_with(path, &o, err, sizeof err);
+        CHECK(e != NULL, "overhead: open: %s", err);
+        if (e) {
+            hx_model *m = hx_engine_model(e);
+            uint64_t r0, t0;
+            int32_t t = 5;
+            hx_model_set_parallel_min(m, 1.0);
+            for (int i = 0; i < 5; i++, t = (t * 7 + 1) % V_) CHECK(hearth_eval(e, &t, 1, out[0], 0) == 0, "overhead: eval");
+            r0 = hx_model_regions(m);
+            t0 = hx_model_region_threads(m);
+            CHECK(r0 > 0 && t0 == 2 * r0, "tiny regions on the pool used %llu threads in %llu regions, want 2 each",
+                  (unsigned long long)t0, (unsigned long long)r0);
+            hx_model_set_parallel_min(m, 0.0);
+            for (int i = 0; i < 5; i++, t = (t * 7 + 1) % V_) CHECK(hearth_eval(e, &t, 1, out[0], 0) == 0, "overhead: eval");
+            CHECK(hx_model_region_threads(m) - t0 > 2 * (hx_model_regions(m) - r0),
+                  "with the threshold at 0 regions get all %d threads", many);
+            {
+                const int mx = hx_model_region_max(m);
+                CHECK(mx == hx_model_core_threads(m) && hx_model_region_max(m) == 0,
+                      "forced decode regions used up to %d threads, want the %d per-core threads", mx, hx_model_core_threads(m));
+            }
+            hearth_close(e);
+        }
+    }
+    for (int nt = 1; nt <= 2; nt++) {   /* one thread: never a region; two: regions of two */
+        hearth_options o = defaults();
+        hearth_engine *e;
+        int32_t t = 9;
+        o.n_threads = nt;
+        e = open_with(path, &o, err, sizeof err);
+        CHECK(e != NULL, "overhead: open: %s", err);
+        if (!e) continue;
+        hx_model_set_parallel_min(hx_engine_model(e), 1.0);
+        for (int i = 0; i < 3; i++, t = (t * 7 + 1) % V_) CHECK(hearth_eval(e, &t, 1, out[0], 0) == 0, "overhead: eval");
+        CHECK(nt == 1 ? hx_model_regions(hx_engine_model(e)) == 0
+                      : hx_model_regions(hx_engine_model(e)) > 0 &&
+                            hx_model_region_threads(hx_engine_model(e)) == 2 * hx_model_regions(hx_engine_model(e)),
+              "%d-thread engine: %llu regions, %llu threads", nt, (unsigned long long)hx_model_regions(hx_engine_model(e)),
+              (unsigned long long)hx_model_region_threads(hx_engine_model(e)));
+        hearth_close(e);
+    }
 }
 
 /* ------------------------------------------------------------ main */
@@ -1956,6 +3047,7 @@ int main(int argc, char **argv) {
         g_no_shared = 0;
         test_invariants(gn, "gqa no shared expert", 9);
         test_prefetch_gate(gn);
+        test_predictions(gn, "gqa no shared expert");
         remove(gn);
     }
     {   /* exact routing ties (tie_rows) */
@@ -1967,13 +3059,51 @@ int main(int argc, char **argv) {
         g_tie = 0;
         test_invariants(gt, "gqa ties", 9);
         test_invariants(mt, "mla ties", 9);
+        test_predictions(gt, "gqa ties");
+        test_predictions(mt, "mla ties");
         remove(gt);
         remove(mt);
     }
+    {   /* head_dim / kv_lora_rank not a multiple of the 32-dim value chunk */
+        char g48[700], m80[700];
+        path_in(g48, sizeof g48, "gqa_hd48.hearth");
+        path_in(m80, sizeof m80, "mla_c80.hearth");
+        g_gqa_hd = 48;
+        g_mla_c = 80;
+        CHECK(make_gqa(g48, 1) && make_mla(m80, 0), "write containers with partial value chunks");
+        g_gqa_hd = 64;
+        g_mla_c = 64;
+        test_invariants(g48, "gqa head_dim 48", 9);
+        test_invariants(m80, "mla kv_lora_rank 80", 9);
+        remove(g48);
+        remove(m80);
+    }
     test_io_failure(mla);
+    test_truncated(mla);
+    test_failure_leaks(mla);
     test_resolution(gqa);
     test_usage_counts(gqa);
     test_trace_failures(gqa);
+    test_prefetch_failures(gqa);
+    test_drain_scope(gqa);
+    test_counters(gqa);
+    test_trace_guard(gqa);
+    test_predictions(gqa, "gqa");
+    test_predictions(mla, "mla");
+    test_predictions(mla0, "mla q_lora=0");
+    {   /* more than 256 experts: trace ids need both bytes */
+        char wide[700];
+        path_in(wide, sizeof wide, "mla_wide.hearth");
+        g_mla_experts = 272;
+        g_high_bias = 1;
+        CHECK(make_mla(wide, 64), "write container with 272 experts");
+        g_mla_experts = 16;
+        g_high_bias = 0;
+        test_invariants(wide, "mla 272 experts", 9);
+        test_wide_ids(wide);
+        test_predictions(wide, "mla 272 experts");
+        remove(wide);
+    }
     test_bench(gqa);
     test_overhead(gqa);
     {

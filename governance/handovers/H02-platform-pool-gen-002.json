@@ -1,0 +1,220 @@
+{
+  "generation_id": "gen-002-h02-platform-pool",
+  "parent_generation": "gen-001-h02-platform-pool",
+  "timestamp": "2026-10-05T06:45:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H02-platform-pool",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified (gen-001 + gen-002, uncommitted): engine/src/{pool.c, platform_win.c, platform_common.inc}, engine/tests/{test_pool.c, test_platform.c}; platform_posix.c unchanged in gen-002; new: governance/handovers/H02-platform-pool-gen-002.json. HEAD is 10f6542 through other engineers' commits (docs/results, scripts, ARCHITECTURE.md text), none touching engine/ or contract headers."
+  },
+  "constraints_touched": [
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DET-1",
+    "INV-DET-3",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier major finding reproduced and root-caused: gen-001's 32-thread tail still followed spin_us because a participant queued behind another process's thread on a different CPU is never reached by the spinners' SwitchToThread, and freshly signalled sleepers get stranded the same way; the dispatch ended only when a spinner hit its deadline or the other thread's time slice ended.",
+        "evidence": "gen-001 pool, 32 threads, spin_us=1000/10000: p999 305-1010 / 401-1700 us, max 1018-1050 / 2045-8427 us. Instrumented runs (16 busy threads): every 3 ms dispatch had the caller in its spin loop and all workers but one started; the laggard was a just-signalled sleeper (its sleeping flag still set), so excluding sleepers from the stall check left those tails.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Stall rule fixes the tail: a participant that has not picked up the dispatch 20 us after the caller started waiting (200 us when the dispatch had to wake workers) makes the caller and every worker that has seen the dispatch sleep; an idle CPU takes the stranded thread.",
+        "evidence": "Interleaved A/B, 20000 samples, 32 threads spin_us=1000: gen-001 mean 12.7-16.2 us, p999 305-619, max 1027-1035 us; final mean 6.4-7.5, p999 71.5-71.9, max 194-364 us. spin_us=10000: gen-001 mean 14.0 / max 2045 us; final 7.2 / 138 us. With 16 busy threads (spin 3000): gen-001 mean 95-151 us with 63-82% of the time in >1 ms dispatches; final 54 us, 0-0.6%. A variant without the rule (back-off only) kept 26-68% of the time in >2 ms dispatches; test_pool's stranded check catches it.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "When no CPU is idle (every CPU busy with other threads) spinning loses to sleeping, so a slow stall (>0.5 ms to clear) or the waiting caller kept off its CPU >0.5 ms starts a sleep-only back-off (10 ms doubling to 1 s), after which the pool spins again.",
+        "evidence": "32 threads + 32 busy threads (spin_us=5000): gen-001 mean 20.6-40.7 ms per dispatch, stall rule without back-off 14.6-23.2 ms, final 0.07-0.2 ms vs a sleeping pool 0.07-0.14 ms; under ctest -j6 next to 16 busy threads (300 ms windows): no back-off 67-1177 us, final 84-149 us, sleeping pool 82-96 us. 1.1 s after the load stops, the pool's fastest dispatch is 4.0-4.5 us again (sleeping pool 35-46 us). Normal-load numbers unchanged by the back-off (32 threads 6-10 us, 16 threads 0.75-0.85 us). Counting workers' own idle-time preemption as overload was tried and dropped (made burst dispatches sleep-only: p50 55-60 us vs 7-18 us).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Workers left out of hx_pool_for_n regions now sleep spin_us after their own last task (hx_pool.h wording); dispatches without them no longer restart the window.",
+        "evidence": "16-thread pool, spin_us=2000, back-to-back for_n(2) regions of 5 us: gen-001 12.8-15.8 CPUs busy, final 1.9-2.8 CPUs (process CPU time / wall time). test_pool asserts < nt/2.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "test_pool timing checks are robust to concurrent runs: runs serialize on a lock file in the temp dir (owner pid; dead owner or >10 min old = taken over), and the 'workers sleep after spin_us' / 'slow tasks are not stalls' / for_n checks use process CPU time instead of latency.",
+        "evidence": "Before the lock: 3 concurrent full runs failed 3 of 6 and ctest -j6 failed 1 of 3; a jobs=2 mutation run scored 37.2% with mutants that die when run alone (e.g. M0118). With the final tests: 3 concurrent runs 9/9 pass (two rounds full, one --quick), ctest 1/1 and -j6 2/2, 6/6 single --quick, full MSVC, MSVC ASan, WSL gcc -O2 / ASan+UBSan / TSan --quick all pass; mutation score of the same 113 mutants 56.6%.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "hx_file_replace (Windows): read-only dst replaced as rename(2) does (FILE_RENAME_FLAG_IGNORE_READONLY_ATTRIBUTE, retried without it if unsupported), the source is opened with FILE_FLAG_OPEN_REPARSE_POINT (a symlink tmp is moved as a link), the missing-tmp error is logged with tmp's own error code, and the MoveFileExW fallback is exercised by test_platform --replace-dir on a 9P share.",
+        "evidence": "test_platform against gen-001's platform_win.c fails 'read-only dst replaced (-1)' and the error report check ('(error 3)' = dst's path-not-found instead of '(error 2)'). --replace-dir \\\\wsl.localhost\\Ubuntu\\tmp\\h02g2rep: 'no POSIX renames here' detected, 293 checks pass (open dst refused then replaced once closed, 9P replaces a read-only dst, 53 of 300 replaces under a concurrent reader fail as documented, 0 torn/missing reads). Symlink check runs on Linux (passes); on this Windows account CreateSymbolicLinkW is not permitted, so the OPEN_REPARSE_POINT change is verified by reading only.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "hx_f16_to_f32 now quiets signalling NaNs (payload kept), matching F16C VCVTPH2PS.",
+        "evidence": "Exhaustive test over all 65536 inputs now asserts sign|0x7fc00000|mant<<13 for NaNs: gen-001 code fails it with 1022 mismatches, final 0. Engine users unaffected: quant.c has its own q_f16; test_quant/test_model pass; golden 21/21 with a DLL from this tree.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Counting only spinning (not sleeping) laggards as stalled is enough.",
+        "evidence": "Woken sleepers were stranded 1-3 ms behind busy threads (16 busy threads: p999 383-3100 us, max ~3 ms); counting every non-started participant removed those tails (max 392-836 us).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The caller should keep yielding every 2 us from the start of its wait (gen-001).",
+        "evidence": "With the stall rule, early caller yields brought the caller-displacement tail back: 16 busy threads, 7-43% of the time in >1 ms dispatches vs 0-1% without early yields. Cost: pinned to one CPU with 4 threads, dispatch 14 -> 34 us (caller now waits 20 us before its first yield).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Waking only ~2x the laggard count of workers on a stall (instead of all) is better.",
+        "evidence": "Windows, 16 busy threads: 117-930 us mean vs 52-75 us when every waiting thread sleeps (other processes take the freed CPUs first). On WSL2 it was about even.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "One 20 us stall threshold also for dispatches that woke workers.",
+        "evidence": "WSL2 (slow VM wake-ups): stall -> sleep -> wake -> stall chained; every 32-thread dispatch in a burst ~610 us. A 200 us threshold for wake dispatches breaks the chain (burst p50 alternating 85/578 us there; Windows unchanged).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The stall rule also helps 32-thread pools on WSL2.",
+        "evidence": "Light load (host busy): gen-001 mean 375-656 us, final 476-723 us (1.1-1.3x worse, p50 2x worse: VM wake-ups are expensive and descheduled vCPUs cannot be rescued from inside the guest). With 16 busy threads: gen-001 4234 us, final 722 us (5.9x better). 16-thread pools unaffected (p50 0.69-0.73 us).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "MoveFileExW(REPLACE_EXISTING | WRITE_THROUGH) can serve as the primary Windows path (task text).",
+        "evidence": "Still rejected (gen-001 evidence reproduced by the verifier). The fallback's behaviour on volumes without POSIX renames is now documented and tested: open handles and, on FAT, a read-only dst refuse the replace.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Quiet-machine target unverified: never fewer than ~7.6 other CPUs busy. At that load 32-thread dispatch mean 6.2-7.0 us vs 16-thread 0.76-0.84 us (~8x); under 85-90% load 6-10 us vs 0.75 us. With ~8 CPUs taken by other processes a 32-thread pool on 32 CPUs is oversubscribed, so this is not a quiet-machine number.",
+      "Native Linux untested (only WSL2, where the stall rescue works poorly and costs 1.1-1.3x at light load). Linux's balancer may refuse to migrate a recently-run (cache-hot) thread to an idle CPU, which would weaken the rescue there too; not verified.",
+      "Surviving pool.c mutants (49 of 113): ~18 equivalent (initial values overwritten, >= vs >, memset-covered atomic_init), 13 back-off tuning constants (doubling/decay, only visible over seconds of overload), the rest perf-only under load (caller yield cadence, stall-check cadence, wake-dispatch threshold, 'every stall starts a back-off'). M0083 (slots[t-2]) is an out-of-bounds read caught by MSVC ASan.",
+      "hx_pool.h says workers spin ~spin_us after a task; they now stop early on a stalled dispatch and do not spin during back-off periods. Proposed amendment in contract_issues.",
+      "Windows: replacing onto a hard link of tmp removes tmp's name (rename(2) leaves both); not changed, documented in the proposed hx_platform.h text.",
+      "tests/py/test_runtime.py hearth_stats layout failures (H03's engine.py vs hearth.h read_errors) persist; unrelated to H02 files.",
+      "Windows machines with several processor groups and macOS code paths remain untested (as in gen-001)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o h02/test_pool.exe engine/src/pool.c engine/tests/test_pool.c            # full ~9.5 s (+ waits for other runs: lock file %TEMP%/hx_test_pool_timing.lock)",
+    "python scripts/hxcc.py --platform --run -o h02/test_pool.exe engine/src/pool.c engine/tests/test_pool.c -- --quick # ~4.5 s; --no-timing skips timing/CPU-time checks (automatic under ASan/TSan) and the lock",
+    "python scripts/hxcc.py --platform --run -o h02/test_platform.exe engine/tests/test_platform.c -- --expect-cpu sse42,avx,avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512bf16,avxvnni,-neon,-dotprod,cores=16,cpus=32",
+    "MoveFileExW fallback: wsl.exe -e bash -lc 'mkdir -p /tmp/h02rep' ; test_platform.exe --replace-dir \\\\wsl.localhost\\Ubuntu\\tmp\\h02rep   (run from PowerShell/cmd; ~40 s; keep the WSL VM up meanwhile)",
+    "MSVC ASan: PATH += VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 ; python scripts/hxcc.py --asan --debug --platform --run -o h02/test_pool_asan.exe engine/src/pool.c engine/tests/test_pool.c ; same for engine/tests/test_platform.c",
+    "WSL: cp -r engine ~/h02/ ; gcc -std=c11 -ffp-contract=off -Wall -Wextra -pthread -Isrc -Iinclude [-O2 | -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=undefined | -O1 -g -fsanitize=thread] tests/test_pool.c src/pool.c src/platform_posix.c -lm ; TSan binaries under setarch $(uname -m) -R ; test_platform with LOCPATH=<localedef de_DE dir>",
+    "cmake -S . -B %LOCALAPPDATA%/hearth/build/h02 -G \"Visual Studio 17 2022\" -A x64 ; cmake --build <dir> --config Release ; ctest --test-dir <dir> -C Release [-j6] --output-on-failure",
+    "python governance/tools/mutate.py --file engine/src/pool.c --lines 25-51,62-66,69,76,89-90,113-114,118-123,127-128,132-133,140,144,146,177,188-210,213-216,219,221-238,240-243,252,261-263,266,268-272,303-304,325,358-363,365 --max-mutants 0 --jobs 2 --seed 1 --test \"python scripts/hxcc.py --platform --run -o {tmp}/mut_pool.exe engine/src/pool.c engine/tests/test_pool.c -- --quick\"",
+    "python governance/tools/mutate.py --file engine/src/platform_win.c --lines 521-566 --max-mutants 0 --jobs 3 --seed 1 --test \"python scripts/hxcc.py --platform --run -o {tmp}/mut_win.exe engine/tests/test_platform.c -- --expect-cpu ...\" ; fallback lines 543-545,562-566 again with -- --replace-dir \\\\wsl.localhost\\Ubuntu\\tmp\\h02rep",
+    "Scratch benches (not in the repo) measured hx_pool_run round trips with in-process busy threads; test_pool's 'pool as large as the machine' sections reproduce the two load cases (nt/2 and nt busy threads)."
+  ],
+  "measurements": [
+    {
+      "metric": "hx_pool_run round trip, 32 threads, spin_us=1000, mean (base 4a6cb80 -> gen-001 -> final)",
+      "value": 6.38,
+      "unit": "us",
+      "conditions": "final 6.4-7.5 us (p50 5.0-5.4, p999 71.5-71.9, max 194-364); gen-001 12.7-16.2 (p999 305-619, max 1027-1035); base 998-1035 (p50 1026-1028); interleaved, 20000 samples each; Windows 11, Ryzen 9 9950X (32 logical CPUs), MSVC /O2, empty task; machine shared with other processes all session (4 python jobs, javaw, OneDrive: 7.6-29 CPUs busy), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, 32 threads, spin_us=10000, max (tail follows spin_us?)",
+      "value": 138.3,
+      "unit": "us",
+      "conditions": "final mean 7.2 us, p999 69 us, max 138 us; gen-001 mean 14.0, p999 401, max 2045 us (other gen-001 runs: max 4015-8427 us); Windows 11, Ryzen 9 9950X (32 logical CPUs), MSVC /O2, empty task; machine shared with other processes all session (4 python jobs, javaw, OneDrive: 7.6-29 CPUs busy), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, 16 threads, spin_us=1000, mean",
+      "value": 0.82,
+      "unit": "us",
+      "conditions": "final 0.76-0.84, gen-001 0.75-0.82, base 0.77; p50 0.6-0.7 all; Windows 11, Ryzen 9 9950X (32 logical CPUs), MSVC /O2, empty task; machine shared with other processes all session (4 python jobs, javaw, OneDrive: 7.6-29 CPUs busy), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "32 vs 16 threads, mean dispatch ratio at ~7.6 other CPUs busy (lightest load seen)",
+      "value": 8.3,
+      "unit": "x",
+      "conditions": "final 32t 6.16-7.01 us vs 16t 0.76-0.84 us; gen-001 32t 8.98-15.4 us. Not a quiet machine; quiet target unverified",
+      "kind": "measured"
+    },
+    {
+      "metric": "32 threads + 16 busy threads (spin_us=3000), mean dispatch",
+      "value": 54.2,
+      "unit": "us",
+      "conditions": "final 54.2-54.5 us, 0-0.6% of time in >1 ms dispatches, max 569-1229 us; gen-001 95.5-151.1 us, 63-82%, max 5975-6225 us; in-process busy threads; Windows 11, Ryzen 9 9950X (32 logical CPUs), MSVC /O2, empty task; machine shared with other processes all session (4 python jobs, javaw, OneDrive: 7.6-29 CPUs busy), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "32 threads + 32 busy threads (every CPU busy), spin_us=5000, mean dispatch over 1 s",
+      "value": 133.2,
+      "unit": "us",
+      "conditions": "final 133 us vs sleeping pool 99 us; gen-001 40683 us; stall rule without back-off 14.6-23.2 ms (test_pool runs); Windows 11, Ryzen 9 9950X (32 logical CPUs), MSVC /O2, empty task; machine shared with other processes all session (4 python jobs, javaw, OneDrive: 7.6-29 CPUs busy), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "16-thread pool, spin_us=2000, for_n(2) regions back to back: CPUs busy",
+      "value": 2.0,
+      "unit": "CPUs",
+      "conditions": "final 1.9-2.8; gen-001 12.8-15.8 (process CPU time over 300 ms); Windows",
+      "kind": "measured"
+    },
+    {
+      "metric": "pinned to one CPU, 4 threads, spin_us=200000, mean dispatch (regression)",
+      "value": 33.4,
+      "unit": "us",
+      "conditions": "gen-001 13.3-14.6 us; the caller now waits 20 us before its first yield; base 2.1 ms; start /affinity 80000000",
+      "kind": "measured"
+    },
+    {
+      "metric": "uneven region (128 chunks of 5-50 us), 32 threads, mean",
+      "value": 179.9,
+      "unit": "us",
+      "conditions": "gen-001 191.8 us (p99 1038), final p99 245 us; Windows 11, Ryzen 9 9950X (32 logical CPUs), MSVC /O2, empty task; machine shared with other processes all session (4 python jobs, javaw, OneDrive: 7.6-29 CPUs busy), numbers noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "WSL2 Linux, 32 threads, spin_us=1000, mean (regression at light load)",
+      "value": 476,
+      "unit": "us",
+      "conditions": "final 476-723, gen-001 375-656 (host load varied); with 16 busy threads final 722 vs gen-001 4234 us; gcc 13.3 -O2",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score pool.c (gen-002 changed lines, all 113 mutants)",
+      "value": 56.6,
+      "unit": "percent",
+      "conditions": "test_pool --quick, MSVC, seed 1, jobs 2 (runs serialized by the lock): killed 54, timeout 10, survived 49 (classified in open_questions). Earlier runs of the same mutants with weaker tests: 37.2%, 53.1%",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_win.c (gen-002 lines 521-566, 75 mutants)",
+      "value": 78.7,
+      "unit": "percent",
+      "conditions": "74.7% with the default test (killed 56, survived 19); the fallback lines rerun with --replace-dir on the 9P share killed 3 more (12 of 13 there). Survivors: allocation-size/free mutants (heap, no LSan on MSVC), alloc-failure branches, retry-time constants, is_path 1->2, ERROR_NOT_SUPPORTED/INVALID_FUNCTION codes 9P never returns",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_common.inc (f16 NaN lines 24-25, 11 mutants)",
+      "value": 100.0,
+      "unit": "percent",
+      "conditions": "test_platform, MSVC, seed 1",
+      "kind": "measured"
+    },
+    {
+      "metric": "test_pool robustness: 3 concurrent full runs, failures",
+      "value": 0,
+      "unit": "count",
+      "conditions": "9 of 9 runs passed (2 rounds full + 1 round --quick); before the lock 3 of 6 failed; ctest -j6 5/5",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "'32-thread dispatch within a small multiple of 16-thread dispatch on a quiet machine': no quiet machine all session. Lightest load seen (~7.6 other CPUs busy): 6.2-7.0 us vs 0.76-0.84 us (~8x).",
+    "Task text asked for MoveFileExW(REPLACE_EXISTING|WRITE_THROUGH) on Windows; it remains the fallback behind the POSIX-semantics rename (director sign-off requested, see contract_issues).",
+    "hx_pool.h's spin wording no longer describes the pool exactly (early sleep on stalls, sleep-only back-off); amendment proposed, header not edited (read-only)."
+  ]
+}

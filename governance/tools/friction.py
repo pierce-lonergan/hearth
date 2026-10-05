@@ -32,8 +32,10 @@ scratch logs out of the repository:
 
     python governance/tools/friction.py check --task T06-store
 
-Signatures are compared after collapsing whitespace and masking hex addresses
-and durations (--exact disables this). Pure standard library, Python 3.9+.
+Signatures are compared after collapsing whitespace and masking what differs
+between runs of the same failure: hex addresses (0x... and MSVC's bare 8 or 16
+digit %p), temporary directory names, process ids (also the ==PID== prefix of
+sanitizer reports) and durations (--exact disables this). Pure standard library, Python 3.9+.
 Exit: 0 ok, 1 thrashing detected, 2 bad input.
 """
 from __future__ import annotations
@@ -81,13 +83,27 @@ def task_log(task: str) -> Path:
     return data_dir() / "attempts" / f"{task}.jsonl"
 
 
+_VOLATILE = [   # (pattern, replacement): parts of an error line that differ between identical failures
+    (re.compile(r"0x[0-9a-fA-F]+"), "0x?"),
+    # MSVC prints %p as 16 (x64) or 8 (x86) bare hex digits: 00000095F031FCC0
+    (re.compile(r"(?<![0-9A-Za-z_])(?=[0-9A-Fa-f]*[0-9])(?:[0-9A-Fa-f]{16}|[0-9A-Fa-f]{8})(?![0-9A-Za-z_])"),
+     "<addr>"),
+    (re.compile(r"\btmp[a-z0-9_]{8}\b"), "tmp?"),                       # tempfile's default names
+    (re.compile(r"\bpytest-\d+\b"), "pytest-?"),                          # pytest's numbered base temp
+    (re.compile(r"\bhearth-(golden|mutate)-[^\s/\\]+"), r"hearth-\1-?"),   # this directory's tools' temp dirs
+    (re.compile(r"==\d+=="), "==?=="),                                  # sanitizers: ==<pid>==ERROR: ...
+    (re.compile(r"\b(pid|PID)([ =:#]+)\d+\b"), r"\1\2?"),
+    (re.compile(r"\b\d+(\.\d+)?\s?(ns|us|ms|s)\b"), "<t>"),
+]
+
+
 def normalize(sig, exact: bool = False) -> str:
     s = ("" if sig is None else str(sig)).strip()
     if exact:
         return s
     s = re.sub(r"\s+", " ", s)
-    s = re.sub(r"0x[0-9a-fA-F]+", "0x?", s)
-    s = re.sub(r"\b\d+(\.\d+)?\s?(ns|us|ms|s)\b", "<t>", s)
+    for pat, rep in _VOLATILE:
+        s = pat.sub(rep, s)
     return s
 
 

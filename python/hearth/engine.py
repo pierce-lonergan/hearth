@@ -196,6 +196,20 @@ def _encode_path(p) -> bytes:
 
 _C_INT_MAX = 0x7FFFFFFF
 
+# hearth_eval / trace / replay return codes (engine/src/hx_model.h)
+_ERROR_CODES = {
+    -1: "bad argument",
+    -2: "token id outside the vocabulary",
+    -3: "KV capacity exceeded",
+    -4: "I/O error: expert data could not be read (see stats()['read_errors'])",
+    -5: "out of memory",
+    -6: "routing trace does not fit this model",
+}
+
+
+def _error_text(rc: int) -> str:
+    return _ERROR_CODES.get(int(rc), "unknown error")
+
 
 def _check_c_int(name: str, v) -> int:
     """A non-negative value for a C int option field (ctypes would silently wrap larger ones)."""
@@ -376,9 +390,10 @@ class Engine:
             rc = self._api.eval(h, ids.ctypes.data_as(POINTER(c_int32)), n,
                                 buf.ctypes.data_as(POINTER(c_float)), 1 if all_logits else 0)
             if rc < 0:
+                # a failed call leaves pos, the routing trace and every counter but read_errors unchanged
                 pos = int(self._api.pos(h))
                 raise HearthError(f"hearth_eval failed (code {rc}) evaluating {n} tokens at position {pos} "
-                                  f"(KV capacity {self.kv_capacity})")
+                                  f"(KV capacity {self.kv_capacity}): {_error_text(rc)}")
             out = buf[:need].copy() if reuse else buf
         return out.reshape(n, V) if all_logits else out
 
@@ -406,6 +421,7 @@ class Engine:
 
     # ---- telemetry -------------------------------------------------------
     def stats(self) -> dict:
+        """Every hearth_stats field (incl. read_errors, failed expert reads) plus derived_stats()."""
         s = HearthStats()
         with self._lock:
             rc = self._api.get_stats(self._handle(), byref(s))
@@ -420,11 +436,12 @@ class Engine:
             self._api.reset_stats(self._handle())
 
     def trace_start(self, path) -> None:
+        """Record routing to path; an existing non-empty file that is not a trace is refused."""
         b = _encode_path(path)
         with self._lock:
             rc = self._api.need("trace_start")(self._handle(), b)
         if rc < 0:
-            raise HearthError(f"hearth_trace_start({os.fspath(path)!r}) failed (code {rc})")
+            raise HearthError(f"hearth_trace_start({os.fspath(path)!r}) failed (code {rc}): {_error_text(rc)}")
 
     def trace_stop(self) -> None:
         with self._lock:
@@ -437,7 +454,7 @@ class Engine:
         with self._lock:
             rc = self._api.need("route_replay")(self._handle(), b)
         if rc < 0:
-            raise HearthError(f"hearth_route_replay({os.fspath(path)!r}) failed (code {rc})")
+            raise HearthError(f"hearth_route_replay({os.fspath(path)!r}) failed (code {rc}): {_error_text(rc)}")
 
     def __repr__(self) -> str:
         state = "closed" if self._h is None else f"pos={self.pos}"

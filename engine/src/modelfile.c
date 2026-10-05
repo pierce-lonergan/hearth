@@ -11,7 +11,9 @@
  * engine relies on: config consistency, non-MoE expert entries empty, and no
  * two regions (sections, tensors, distinct slabs) overlapping. Entries that
  * share one physical slab must agree on size and dtype, and all but one of
- * them must carry the aliased flag.
+ * them must carry the aliased flag. Every canonical tensor of the config
+ * (FORMAT.md §4.1) must be present with its exact shape and an allowed dtype,
+ * so the forward pass can bind them without further checks.
  */
 #include "hx_modelfile.h"
 #include "hx_quant.h"
@@ -586,6 +588,100 @@ done:
     return ok;
 }
 
+/* ---------------------------------------------- canonical tensors (§4.1) */
+
+/* Tensor "blk.<layer>.<suffix>" (layer >= 0) or "<suffix>" exists with exactly the shape
+ * [d0] (ndim 1) or [d0, d1] (ndim 2), and is F32 (f32_only) or a matrix dtype. */
+static int canon(const hx_modelfile *mf, int layer, const char *suffix, int ndim, int64_t d0, int64_t d1, int f32_only,
+                 char *msg, size_t ml) {
+    char name[HX_NAME_LEN + 16];
+    if (layer < 0) snprintf(name, sizeof name, "%s", suffix);
+    else snprintf(name, sizeof name, "blk.%d.%s", layer, suffix);
+    const hx_tensor *t = hx_mf_tensor(mf, name);
+    if (!t) BAD("tensor '%s' is missing", name);
+    if (t->ndim != ndim || t->shape[0] != d0 || (ndim == 2 && t->shape[1] != d1)) {
+        char got[96];
+        int n = 0;
+        for (int k = 0; k < t->ndim && n >= 0 && n < (int)sizeof got; k++)
+            n += snprintf(got + n, sizeof got - (size_t)n, "%s%lld", k ? ", " : "", (long long)t->shape[k]);
+        if (ndim == 1) BAD("tensor '%s' has shape [%s], expected [%lld]", name, got, (long long)d0);
+        BAD("tensor '%s' has shape [%s], expected [%lld, %lld]", name, got, (long long)d0, (long long)d1);
+    }
+    if (f32_only && t->dtype != HEARTH_F32) BAD("tensor '%s' is %s, must be F32", name, hx_dtype_name(t->dtype));
+    if (t->dtype > HEARTH_Q4)
+        BAD("tensor '%s' has dtype %s; matrices must be F32, F16, BF16, Q8 or Q4", name, hx_dtype_name(t->dtype));
+    return 1;
+}
+
+/* FORMAT.md §4.1 for this config, as hearth.format.canonical_tensors: every tensor the forward
+ * pass reads exists with its exact shape and an allowed dtype (norms, biases, rope_inv_freq and
+ * the router F32). Shared experts and router biases belong to MoE layers. Other tensors are
+ * ignored, except rope_inv_freq, which is present iff rope_dim > 0. Called with the tensors
+ * sorted (lookups), before the dense data is loaded. */
+static int check_canonical(const hx_modelfile *mf, char *msg, size_t ml) {
+#define VEC(l, s, n) do { if (!canon(mf, l, s, 1, n, 1, 1, msg, ml)) return 0; } while (0)
+#define MAT(l, s, r, k) do { if (!canon(mf, l, s, 2, r, k, 0, msg, ml)) return 0; } while (0)
+#define F32MAT(l, s, r, k) do { if (!canon(mf, l, s, 2, r, k, 1, msg, ml)) return 0; } while (0)
+    const hx_config *c = &mf->cfg;
+    const int64_t D = c->d_model, H = c->n_heads;
+    MAT(-1, "tok_embd", c->vocab_size, D);
+    if (!c->tie_embeddings) MAT(-1, "lm_head", c->vocab_size, D);
+    VEC(-1, "out_norm", D);
+    if (c->rope_dim > 0) VEC(-1, "rope_inv_freq", c->rope_dim / 2);
+    else if (hx_mf_tensor(mf, "rope_inv_freq")) BAD("tensor 'rope_inv_freq' is present although rope_dim is 0");
+    for (int l = 0; l < c->n_layers; l++) {
+        VEC(l, "attn_norm", D);
+        VEC(l, "ffn_norm", D);
+        if (c->attn_kind == HX_ATTN_MLA) {
+            const int64_t nope = c->qk_nope_dim, rope = c->qk_rope_dim, C = c->kv_lora_rank, ql = c->q_lora_rank;
+            if (ql > 0) {
+                MAT(l, "attn_q_a", ql, D);
+                VEC(l, "attn_q_a_norm", ql);
+                MAT(l, "attn_q_b", H * (nope + rope), ql);
+            } else {
+                MAT(l, "attn_q", H * (nope + rope), D);
+            }
+            MAT(l, "attn_kv_a", C + rope, D);
+            VEC(l, "attn_kv_a_norm", C);
+            MAT(l, "attn_kv_b", H * (nope + c->v_head_dim), C);
+            MAT(l, "attn_o", D, H * c->v_head_dim);
+        } else {
+            const int64_t hd = c->head_dim, q = H * hd, kv = (int64_t)c->n_kv_heads * hd;
+            MAT(l, "attn_q", q, D);
+            MAT(l, "attn_k", kv, D);
+            MAT(l, "attn_v", kv, D);
+            MAT(l, "attn_o", D, q);
+            if (c->qkv_bias) {
+                VEC(l, "attn_q_bias", q);
+                VEC(l, "attn_k_bias", kv);
+                VEC(l, "attn_v_bias", kv);
+            }
+            if (c->qk_norm != HX_QKNORM_NONE) {
+                VEC(l, "attn_q_norm", c->qk_norm == HX_QKNORM_HEAD ? hd : q);
+                VEC(l, "attn_k_norm", c->qk_norm == HX_QKNORM_HEAD ? hd : kv);
+            }
+        }
+        if (c->layer_kind[l] == HX_LAYER_DENSE) {
+            MAT(l, "ffn_gate", c->dense_ffn_dim, D);
+            MAT(l, "ffn_up", c->dense_ffn_dim, D);
+            MAT(l, "ffn_down", D, c->dense_ffn_dim);
+            continue;
+        }
+        F32MAT(l, "moe_router", c->n_experts, D);
+        if (c->score_bias) VEC(l, "moe_router_bias", c->n_experts);
+        if (c->shared_ffn_dim > 0) {
+            MAT(l, "shexp_gate", c->shared_ffn_dim, D);
+            MAT(l, "shexp_up", c->shared_ffn_dim, D);
+            MAT(l, "shexp_down", D, c->shared_ffn_dim);
+            if (c->shared_gate) MAT(l, "shexp_gate_inp", 1, D);
+        }
+    }
+    return 1;
+#undef VEC
+#undef MAT
+#undef F32MAT
+}
+
 /* --------------------------------------------------------------- open */
 
 static int cmp_tensor_name(const void *a, const void *b) {
@@ -713,8 +809,8 @@ static int parse(mf_impl *m, hx_file *f, int want_dense, char *msg, size_t ml) {
     }
 
     {
-        uint64_t sec[4][2] = {{0, PREAMBLE_BYTES}, {meta_off, meta_bytes}, {tdir_off, n_t * TDIR_ENTRY},
-                              {edir_off, n_e * EDIR_ENTRY}};
+        const uint64_t sec[4][2] = {{0, PREAMBLE_BYTES}, {meta_off, meta_bytes}, {tdir_off, n_t * TDIR_ENTRY},
+                                    {edir_off, n_e * EDIR_ENTRY}};
         if (!check_regions(mf, sec, msg, ml)) goto done;
     }
 
@@ -725,14 +821,8 @@ static int parse(mf_impl *m, hx_file *f, int want_dense, char *msg, size_t ml) {
             goto done;
         }
 
-    const hx_tensor *rf = hx_mf_tensor(mf, "rope_inv_freq");
-    if (c->rope_dim > 0) {
-        if (!rf) { snprintf(msg, ml, "tensor 'rope_inv_freq' is missing"); goto done; }
-        if (rf->dtype != HEARTH_F32 || rf->ndim != 1 || rf->shape[0] != c->rope_dim / 2) {
-            snprintf(msg, ml, "tensor 'rope_inv_freq' must be F32 [%d]", c->rope_dim / 2);
-            goto done;
-        }
-    }
+    if (!check_canonical(mf, msg, ml)) goto done;
+    const hx_tensor *rf = hx_mf_tensor(mf, "rope_inv_freq");   /* present iff rope_dim > 0 */
 
     /* Parameter counts mirror hearth.presets.Shape: active excludes the input
      * embedding table unless it doubles as the LM head. */
