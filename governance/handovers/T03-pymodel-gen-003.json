@@ -1,0 +1,126 @@
+{
+  "generation_id": "gen-003-pymodel-verifier-fixes",
+  "parent_generation": "gen-002-pymodel-verifier-fixes",
+  "timestamp": "2026-10-04T18:45:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T03-pymodel",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified (all still untracked): python/hearth/{_native,format,reference,convert}.py, tests/py/{test_format,test_reference,test_convert}.py; python/hearth/{synth,quant}.py unchanged this generation; new: governance/handovers/T03-pymodel-gen-003.json"
+  },
+  "constraints_touched": ["INV-NUM-1", "INV-NUM-2", "INV-FMT", "INV-SAFE", "INV-DET-2", "INV-DEP", "INV-DATA", "INV-HONEST", "INV-VERIFY"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Finding 1 (major) reproduced and closed by tests; synth.py needed no code change. The softmax, sigmoid and group branches of make_tiny's routing-margin check now each have a self-validating test. For each redraw seed the test first shows that the near-tie exists with only that branch disabled, then shows that the shipped make_tiny clears every margin. Margins are re-measured independently from router_trace, against literal thresholds, never read back from synth.",
+        "evidence": "Reproduced the verifier's numbers. deepseek_v3 seed 4 with the sigmoid check off: selection gap 2.34e-05 (shipped 4.75e-03). Golden big_q4 (deepseek_v3 Q4, 4x32, top-4, seed 3) with the group check off: group gap 2.28e-04 (shipped 6.62e-04). A seed survey found mixtral seed 1, the golden F32 fixture seed, needs a softmax redraw. New tests: test_margin_problem_branches (crafted arrays for every rank boundary, each branch, the group boundary, top_k == n_experts, and exact-threshold equality), test_make_tiny_redraws_near_ties (12 seeds: softmax mixtral1/qwen3_moe0/olmoe8; sigmoid deepseek 4/5/9/14 and big 2/4; group deepseek 7/16 and big 3), and test_golden_f32_fixtures_have_clear_margins. The verifier's mutation command (synth.py 171-186, seed 1) went from 73.3% to 100% (44/44 candidates). Setting _SIGMOID_ABS_GAP, _GROUP_ABS_GAP or _SOFTMAX_REL_GAP to -1 in-process now fails 12, 9 and 9 tests (the verifier saw 0). Every golden fixture clears the contract; the tightest is big_q4 at 1.31x (selection) and 1.10x (group).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 2 fixed. Reference handles rope_dim = 0 (no rotation, no rope_inv_freq needed). MLA rotates only the first rope_dim (<= qk_rope_dim) dims of q_pe and k_pe, with pairs formed relative to rope_dim.",
+        "evidence": "test_rope_dim_zero_means_no_rotation (qwen3_moe and deepseek_v3): with rope_inv_freq absent, or present with junk shape [3], the logits are bit-identical to rotation by zero frequencies at factor 1. test_mla_partial_rotary (rope_dim 2 and 8 with GPT-J pairs): bit-identical to rope_dim 16 with zero frequencies past rope_dim. Before the fix both cases raised KeyError or broadcast silently, as the verifier reported.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 3 fixed. The writer turns every bytes-like input into a flat C-contiguous byte view and checks its byte count, in write_tensor, write_tensor_rows and write_expert.",
+        "evidence": "Reproduced: a float32 memoryview of 64 items was accepted for a 64-byte U8 tensor and overwrote the next tensor (b read back [0 0 224 64 ...]). test_writer_byte_buffers_are_sized_in_bytes now pins: the 256-byte view is rejected and b stays intact; a 64-byte float32 view, 2-D uint8 and float32 views, f16 row chunks and memoryview expert payloads are accepted and round-trip; non-contiguous buffers are rejected; a 32-byte chunk is refused as 'bad chunk'.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 4 fixed. The writer always validates metadata through apply_defaults, including when a required key is missing. None values are dropped first, exactly as encode_meta drops them.",
+        "evidence": "test_missing_required_meta_and_bad_layer_kind: each of the 4 required keys missing, and a layer_kind of the wrong length, is refused at the first write and at close() without writes, and no file is left. Forged files (validation monkeypatched) are refused by the reader. The new bos_id test exposed a pre-existing inconsistency (bos_id=None crashed validation) and now pins None and -1 as 'no BOS' and 0 as BOS 0.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 5 fixed. _native.matmul raises ValueError for any isa outside 0..3 before touching the library. None still means only that the CPU cannot run that ISA.",
+        "evidence": "test_matmul_rejects_unknown_isa covers 4, 7, -1, 99, 'avx2' and None, and needs no native library. test_native_bindings_validate shows that isa 0..3 all run or return None, and that scalar (1) always runs.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 6 fixed. Reference validates, before computing anything, every tensor the forward pass reads against FORMAT.md 4.1: presence, exact shape, and F32 for norms, biases, rope_inv_freq, moe_router and moe_router_bias. The table is format.canonical_tensors(config), shared with the converter, which used to have its own _expected_shape. A rejected container's reader is closed explicitly.",
+        "evidence": "test_reference_validates_tensors_against_format: 12 forged cases are all ValueError, including the verifier's [1]-shaped attn_norm, moe_router_bias, out_norm and attn_kv_a_norm, a same-nbytes reshaped tok_embd, F16/BF16 norm and router, missing q_b, rope_inv_freq, k_bias and shexp_gate_inp, and a short q_bias. Tied embeddings, shared_gate=0 and extra unknown tensors are still accepted. A ContainerReader subclass spy proves the explicit close; an unlink check could not, because CPython's refcounting closes the reader as soon as pytest drops the exception. test_canonical_tensor_table_matches_make_tiny checks the table equals make_tiny's tensors for all 5 archs. test_name_mapping_covers_checkpoint checks the converter plan plus rope_inv_freq equals the table for all 6 HF cases.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 7 fixed. ContainerReader rejects what engine/src/modelfile.c check_regions rejects: any overlap among preamble, metadata, directories, tensors and physical slabs; entries sharing a slab that differ in nbytes or dtype; and more than one unflagged entry on one slab. As in C, a slab whose entries are all flagged is accepted.",
+        "evidence": "Structural differential against a scratch harness around hx_modelfile_open, built with hxcc from modelfile.c as of 13:38 (scratchpad t03g3/mfcheck.c and diff_regions.py; not in the repo). 1500 random tensor/slab offset, size, flag, dtype and dim-swap mutations of tiny and aliased make_shaped containers: 1500/1500 agree (507 accepted by both, 993 rejected by both). Negative control with _check_regions disabled: 619/1500 (881 rejected only by C). Reference on the 507 accepted files: 457 evaluate, 50 ValueError (FORMAT shape violations), 0 other exceptions. The previous metadata differential, rerun on the new harness: 1262/1262 agree, 394 accepted by both. Reference on those 394: 316 evaluate, 78 ValueError, 0 KeyError (gen-002: 333 / 42 / 19 KeyError). The 17 files that used to evaluate were silent broadcasts of metadata-inconsistent shapes. Unit cases in test_malformed_files_raise cover tensor on tensor, preamble, metadata, tdir and edir; slab on header and slab on slab; shared slab unflagged, dtype, and size; and alias, all-flagged and lone-flag acceptance.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 8 fixed. The converter's chunk threshold and step are module constants (_CHUNK_ELEMS, _CHUNK_TARGET). A test drives the chunked path for every dense matrix of an FP8 DeepSeek-V3 checkpoint with 32x32 scale blocks.",
+        "evidence": "test_chunked_tensor_path_matches_whole (torch and numpy backends x F32 and Q8 dense) produces output byte-identical to whole-tensor conversion. Chunk starts are asserted: tok_embd and lm_head every 32 rows; FP8 attn_q_b [128, 64] at 0/32/64/96, i.e. four different scale-block rows. A second configuration checks the strict '>' boundary and a 2-block step. test_expert_width_differs_from_d_model covers F=96 != D=64, which no earlier tiny model had: expert orientation, HF logits within 2e-3 relative, and Q4-to-F16 slab fallback.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 9 fixed. The reader rules the verifier listed are now pinned, and every malformed case asserts the rule that fires, not just ValueError.",
+        "evidence": "New cases: unused dim 5, zero dim with nbytes 0, ndim 0, duplicate name, tensor count / entry count beyond the file size, empty directory at EOF accepted and at EOF+1 rejected, n_entries 5/13 for models without routed experts and 0/12 accepted, TENSORS_MAX/META_MAX caps (monkeypatched, constants pinned to C), shared/dense/expert ffn > 2^22, n_experts 65537, kv/q_lora > 2^20, MLA rope_dim > qk_rope_dim, and accepted kv_lora_rank=1, rope_dim 0 and maximal dims. Mutation (seed 7): format.py apply_defaults 224-336: 96.7% before the bool/bos pins, 100% after. Reader 732-858: 75% in the verifier's run, 100% now. Writer plus table 338-615: 98.3%; the survivor is the pre-sizing truncate, equivalent in output. Equivalent code (a redundant overflow clause, an empty-product guard, a dead E==0 branch, a redundant sort key, the unused ContainerWriter.expert_dtype) was removed rather than left as unkillable mutants.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Finding 10 fixed. lib() unloads every candidate it inspects but does not choose (FreeLibrary or dlclose through _ctypes), so scanning <data dir>/build leaves no lingering file locks. The choice policy is unchanged and documented: an explicit choice wins, then the newest full-engine build, then the newest kernels-only build.",
+        "evidence": "test_unchosen_libraries_are_unloaded copies the real kernels DLL into build/{old,mid,new}; lib_path() picks new, and old and mid can be deleted at once. With _release turned into a no-op, the same test fails with PermissionError [WinError 5], reproducing the finding. The fake-library test asserts the exact release list in 6 scenarios. test_loader_edge_cases covers junk and real system DLLs, the 'no candidates' message, and the double-checked-lock fast path. _native.py whole-file mutation: 94% (seed 3); the 3 survivors are macOS/XDG-only lines that cannot run on Windows.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The stricter reader, writer and Reference break no other engineer's code or tests.",
+        "evidence": "python -m pytest tests/py (all engineers, HEARTH_LIB = kernels-only DLL built 12:12, newer than quant.c 10:44 and quant_avx2/avx512.c 10:24): 555 passed, 5 skipped (need the full engine). Golden kernel tests: 5 passed. governance/tools/check_golden.py: golden lock OK. All 11 golden make_tiny fixtures build and evaluate through the validating Reference.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "gen-002: the existing tests protected make_tiny's routing-margin guarantee (INV-NUM-2).",
+        "evidence": "They did not. The seed-11 test needed no redraw and never checked group gaps, so both the sigmoid and the group branch could be disabled with every test passing. It is fixed by the self-validating redraw-seed tests above.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Deleting a rejected container right after Reference raises is a reliable way to test that Reference closed its reader.",
+        "evidence": "Mutation M0169 (the explicit close() deleted) survived that test. CPython frees the Reference, and ContainerReader.__del__ closes the file, as soon as pytest drops the exception. Replaced by a ContainerReader subclass spy.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "One intentional difference from the C reader remains. ContainerReader (a container-level tool) does not require rope_inv_freq when rope_dim > 0; C does. Reference does require it (canonical_tensors), so the ground truth still never computes on such a file. The differentials above use containers that carry rope_inv_freq.",
+      "FORMAT.md/NUMERICS.md wording to settle (see contract_issues in the structured report): rope_inv_freq when rope_dim = 0, MLA partial rotary, region/alias rules, and the condition for shexp_gate_inp.",
+      "No real checkpoint has been converted yet (carried over); downloads need the user's permission.",
+      "Kimi-K2 ships a tiktoken tokenizer (no tokenizer.json); the converter writes no tokenizer reference (carried over)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --shared --platform -o \"%LOCALAPPDATA%/hearth/t03/hearth.dll\" engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c   (kernels-only DLL outside <data dir>/build; REBUILD whenever engine/src/quant*.c changes before claiming the suite passes)",
+    "set HEARTH_LIB=%LOCALAPPDATA%\\hearth\\t03\\hearth.dll   (Bash: export HEARTH_LIB=\"$LOCALAPPDATA/hearth/t03/hearth.dll\")",
+    "python -m pytest tests/py/test_format.py tests/py/test_reference.py tests/py/test_convert.py -q -W error::SyntaxWarning",
+    "HEARTH_LIB=C:/nonexistent/hearth.dll python -m pytest tests/py/test_format.py tests/py/test_reference.py tests/py/test_convert.py -q -rs   (native-free run: every native test must skip with a reason)",
+    "python -m pytest tests/py -q   (all engineers' tests)",
+    "python -m pytest tests/golden/test_golden_invariants.py -q -k kernel_isa",
+    "python governance/tools/mutate.py --file python/hearth/synth.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_reference.py tests/py/test_format.py\" --lines 171-186 --max-mutants 60 --jobs 6 --seed 1",
+    "python governance/tools/mutate.py --file python/hearth/format.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_format.py\" --lines 732-858 --max-mutants 60 --jobs 6 --seed 7   (reader; also 224-336 apply_defaults; 338-615 with tests/py/test_reference.py added)",
+    "python governance/tools/mutate.py --file python/hearth/reference.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_reference.py\" --lines 179-245 --max-mutants 50 --jobs 6 --seed 3",
+    "python governance/tools/mutate.py --file python/hearth/convert.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_convert.py\" --lines 548-606 --max-mutants 40 --jobs 6 --seed 3",
+    "python governance/tools/mutate.py --file python/hearth/_native.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_format.py\" --max-mutants 50 --jobs 6 --seed 3",
+    "C-reader differential (scratch, not in the repo): python scripts/hxcc.py --platform -o \"%LOCALAPPDATA%/hearth/t03/mfcheck3.exe\" engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c <scratch>/mfcheck.c, where mfcheck.c reads paths on stdin and prints OK or ERR <msg> from hx_modelfile_open(path, 1, ...); then compare with ContainerReader acceptance on mutated containers",
+    "python governance/tools/validate_handover.py governance/handovers/T03-pymodel-gen-003.json"
+  ],
+  "measurements": [
+    {"metric": "owned python tests passing with native kernels DLL", "value": 217, "unit": "tests", "conditions": "HEARTH_LIB = kernels-only DLL built 12:12 from quant.c (10:44) / quant_avx2.c / quant_avx512.c (10:24); without native: 198 passed, 19 skipped with a reason", "kind": "measured"},
+    {"metric": "all tests/py passing (all engineers)", "value": 555, "unit": "tests", "conditions": "same DLL; 5 skipped (need the full engine); 2.5 min wall time while other engineers were running jobs (noisy)", "kind": "measured"},
+    {"metric": "Python vs C reader agreement, structural mutations", "value": 1500, "unit": "of 1500 forged containers", "conditions": "scratch hx_modelfile_open harness from modelfile.c as of 2026-10-04 13:38; 507 accepted by both; negative control without _check_regions: 619/1500", "kind": "measured"},
+    {"metric": "Python vs C reader agreement, metadata mutations", "value": 1262, "unit": "of 1262 forged containers", "conditions": "gen-002 generator plus 7 new BAD_META cases; 394 accepted by both; Reference on those: 316 evaluate, 78 ValueError, 0 other", "kind": "measured"},
+    {"metric": "mutation score synth.py routing-margin check (lines 171-186)", "value": 100.0, "unit": "%", "conditions": "verifier's command, seed 1, 44 of 44 candidates; verifier measured 73.3% before", "kind": "measured"},
+    {"metric": "mutation score format.py reader (lines 732-858)", "value": 100.0, "unit": "%", "conditions": "--max-mutants 60 --seed 7, test_format.py; verifier measured 75.0% on the old reader", "kind": "measured"},
+    {"metric": "mutation score format.py apply_defaults (lines 224-336)", "value": 100.0, "unit": "%", "conditions": "--max-mutants 60 --seed 7, test_format.py", "kind": "measured"},
+    {"metric": "mutation score format.py writer and canonical_tensors (lines 338-615)", "value": 98.3, "unit": "%", "conditions": "--max-mutants 60 --seed 7, test_format.py + test_reference.py; 1 survivor is equivalent in output (the pre-sizing truncate)", "kind": "measured"},
+    {"metric": "mutation score reference.py constructor/validation (lines 179-245)", "value": 90.6, "unit": "%", "conditions": "--max-mutants 50 --seed 3; 3 equivalent survivors: rope_dim > 0 vs > 1 (rope_dim is even), zeros(0) vs zeros(1) (sliced to [:0]), reshape(-1) vs reshape(-2) (numpy infers either)", "kind": "measured"},
+    {"metric": "mutation score reference.py MLA attention (lines 385-420)", "value": 96.6, "unit": "%", "conditions": "--max-mutants 30 --seed 3; 1 equivalent survivor (reshape(-2))", "kind": "measured"},
+    {"metric": "mutation score convert.py plan check and chunked path (lines 548-606)", "value": 97.5, "unit": "%", "conditions": "--max-mutants 40 --seed 3, test_convert.py; 1 survivor, block[0] vs block[1] in the chunk step, is equivalent for square FP8 blocks (all known checkpoints use 128x128)", "kind": "measured"},
+    {"metric": "mutation score _native.py (whole file)", "value": 94.0, "unit": "%", "conditions": "--max-mutants 50 --seed 3, test_format.py; 3 survivors are macOS/XDG-only lines that cannot run on Windows", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Real-checkpoint conversion check (at least OLMoE-1B-7B and one FP8 DeepSeek-V3/Kimi-K2 shard) once a model is available locally with the user's permission to download.",
+    "Golden engine tests (test_engine_matches_reference etc.) not run: engine/src has no forward-pass module yet and no DLL exporting hearth_open exists under <data dir>/build (checked 2026-10-04 14:40 local)."
+  ]
+}

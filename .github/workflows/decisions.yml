@@ -1,0 +1,45 @@
+name: decisions
+
+# The decision circuit breaker (governance/tools/adr.py breaker). It is a separate workflow so that
+# adding or removing the 'decisions-reviewed' label starts a fresh run that sees the new labels:
+# re-running an old job replays its original event payload, and the label events must not cancel
+# or repeat the build matrix in ci.yml.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: decisions-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  breaker:
+    name: decision circuit breaker
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # compares against the PR base
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Breaker tool from the base revision (a change cannot weaken its own check)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: .trusted
+          sparse-checkout: governance/tools
+          persist-credentials: false
+      - name: Decision circuit breaker
+        shell: bash
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          ACK: ${{ contains(github.event.pull_request.labels.*.name, 'decisions-reviewed') && '--acknowledged' || '' }}
+        run: |
+          t=.trusted/governance/tools
+          [ -f "$t/adr.py" ] || t=governance/tools   # the base predates the tools
+          python "$t/adr.py" breaker --root . --base-rev "$BASE_SHA" $ACK

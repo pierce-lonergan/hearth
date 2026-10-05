@@ -1,0 +1,82 @@
+{
+  "generation_id": "gen-001-platform-pool",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T13:48:47Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T01-platform",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new: engine/src/{platform_win.c (521), platform_posix.c (410), platform_common.inc (276), pool.c (245)}, engine/tests/{test_platform.c (1009), test_pool.c (362)}, governance/handovers/T01-platform-gen-001.json"
+  },
+  "constraints_touched": ["INV-SAFE", "INV-DEP", "INV-DATA", "INV-DET-1", "INV-DET-3", "INV-HONEST", "INV-VERIFY"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {"claim": "hx_f32_to_f16 / hx_f32_to_bf16 are exact round-to-nearest-even for every f32 input (subnormals, overflow to inf, NaN stays NaN with F16C / AVX512-BF16 quieting), and f16/bf16 -> f32 is exact for all 65536 patterns.",
+       "evidence": "test_platform --exhaustive: all 2^32 inputs vs an independent nearest-neighbour reference (ldexp value tables + binary search, ties to even pattern): 0 mismatches for both formats (11.3 s, 32 threads). The default run checks all 65536 decode/round-trip patterns, every rounding boundary (each representable value, each midpoint, midpoint +-1 ulp, both signs) and 4M random inputs per format.",
+       "verdict": "CONFIRMED"},
+      {"claim": "On Windows a handle opened WITHOUT FILE_FLAG_OVERLAPPED serialises concurrent positional reads in the I/O manager, so reader threads cannot raise NVMe queue depth.",
+       "evidence": "Scratch benchmark on the Samsung 990 PRO, FILE_FLAG_NO_BUFFERING, random reads over a 4 GiB file: synchronous handle 64 KiB 0.62-0.64 GB/s at 1/4/8/16 threads (flat), 1 MiB ~3.9 GB/s flat; overlapped handle 64 KiB 0.65/2.46/4.19/5.73 GB/s, 1 MiB 4.0/6.8/5.9/5.9 GB/s at 1/4/8/16 threads. Measured while other engineers were running builds (noisy).",
+       "verdict": "CONFIRMED"},
+      {"claim": "hx_file_pread through the overlapped design scales with reader threads, and single-thread throughput equals raw Win32.",
+       "evidence": "Scratch bench via hx_file API, direct: 64 KiB 0.31/2.01/3.72/4.12 GB/s at 1/4/8/16 threads, 1 MiB 2.2/6.4/5.8/5.9, 4 MiB 4.4/5.8/5.9/6.2. A back-to-back rerun gave single-thread 0.61-0.63 GB/s (64 KiB) and 3.91 GB/s (1 MiB), the same as raw sync/overlapped Win32 in the same session. Noisy machine.",
+       "verdict": "CONFIRMED"},
+      {"claim": "hx_pool_run round trip (empty task) is about 1 us with 16 threads while workers spin, and no wake-up is lost on the sleep path.",
+       "evidence": "test_pool (MSVC /O2, Windows 11, 9950X, noisy): 16 threads spin_us=1000 mean 0.78-0.98 us, p50 0.6-0.9 us, p99 1.2-1.5 us; 4 threads mean 0.15-0.46 us; 200k back-to-back dispatches at 4 and 16 threads and 20k at 16 threads with spin_us=0 (pure sleep/wake path) all verified every tid ran exactly once. Linux (WSL2, gcc 13.3): 16 threads p50 0.66-0.78 us.",
+       "verdict": "CONFIRMED"},
+      {"claim": "The POSIX implementation (platform_posix.c) compiles warning-free and passes the same tests on Linux.",
+       "evidence": "WSL2 Ubuntu 24.04, gcc 13.3: -std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter, -O2 and -O1 -fsanitize=address,undefined (LeakSanitizer on): test_platform (with --expect-cpu incl. cores=16,cpus=32) and test_pool --quick pass, no sanitizer reports. macOS/BSD branches are NOT compiled anywhere (read-only review).",
+       "verdict": "CONFIRMED"},
+      {"claim": "Contributor tests detect breakage (mutation testing, governance/tools/mutate.py, 60 sampled mutants each, seed 1).",
+       "evidence": "pool.c 73.3% (test_pool --quick); platform_common.inc 86.7% (run on a scratch copy renamed to .h because mutate.py rejects .inc); platform_win.c 75.0% (test_platform --expect-cpu ...). Every survivor was reviewed: timing-equivalent spin/caller-wait variants, leaks (MSVC ASan has no leak checker), unreachable fallbacks (thread-creation failure, malloc failure, GetActiveProcessorCount==0), the large-page path (privilege not held), the GCC-only cpuid branch (not compiled by MSVC), and feature-bit '&&'->'||' mutants that are equivalent on a CPU that has every bit.",
+       "verdict": "CONFIRMED"}
+    ],
+    "hypotheses_falsified": [
+      {"claim": "Periodically yielding (SwitchToThread every 20 us) inside the spin loops improves dispatch latency when the pool has as many threads as logical CPUs.",
+       "evidence": "Scratch A/B, 2 rounds each: 32 threads p50 1.1 us without yield vs 23-42 us with yield; means were noisy either way (23-115 us vs 30-111 us). Kept the plain spin.",
+       "verdict": "REJECTED"},
+      {"claim": "CREATE_WAITABLE_TIMER_HIGH_RESOLUTION gives sub-100 us sleeps on this Windows 11 machine.",
+       "evidence": "Measured: requests of 20-200 us return after ~0.28-0.5 ms (min) / ~0.5 ms (avg); 1 ms -> 1.0-1.5 ms. Still far better than Sleep(1) (~2 ms). hx_sleep_us never returns early, but overshoots by up to ~0.5 ms.",
+       "verdict": "REJECTED"}
+    ],
+    "open_questions": [
+      "Pools with n_threads == logical CPUs (32 here) suffer whenever another process preempts a worker: p50 ~1 us but mean 20-380 us and p99 ~1 ms on this shared machine. Callers should keep the default n_threads = physical cores (hearth.h already does).",
+      "MEM_LARGE_PAGES path is untested: SeLockMemoryPrivilege is not held on this machine, so hx_alloc_large(.., 1) silently used normal pages (confirmed with HEARTH_LOG=3).",
+      "O_DIRECT fallback on Linux was not exercised: WSL2's 6.6 kernel accepts O_DIRECT even on tmpfs (/dev/shm), so the EINVAL path never triggered.",
+      "On Linux, O_DIRECT is accepted at open() time but a filesystem with a logical block size > 4096 would fail reads with EINVAL; Windows checks FileStorageInfo and falls back, POSIX does not (could use statx STATX_DIOALIGN on Linux >= 6.1)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o test_platform.exe engine/tests/test_platform.c",
+    "python scripts/hxcc.py --platform --run -o test_pool.exe engine/src/pool.c engine/tests/test_pool.c",
+    "python scripts/hxcc.py --asan --debug --platform --run -o test_platform_asan.exe engine/tests/test_platform.c   # MSVC ASan: the bin dir holding clang_rt.asan_dynamic-x86_64.dll (VC/Tools/MSVC/<ver>/bin/HostX64/x64) must be on PATH",
+    "python scripts/hxcc.py --asan --debug --platform --run -o test_pool_asan.exe engine/src/pool.c engine/tests/test_pool.c -- --quick",
+    "<build dir>/test_platform.exe --expect-cpu sse42,avx,avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512bf16,avxvnni,-neon,-dotprod,cores=16,cpus=32   # reference machine (Ryzen 9 9950X)",
+    "<build dir>/test_platform.exe --exhaustive   # all 2^32 f32 inputs, ~11 s on 32 threads",
+    "<build dir>/test_platform.exe --large        # writes and removes a 2.25 GiB file in --dir / $TEMP (never a synced folder)",
+    "Linux: gcc -std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -O2 -Iengine/src engine/tests/test_platform.c engine/src/platform_posix.c -lm -o test_platform   (same for test_pool.c + pool.c; add -fsanitize=address,undefined for the sanitizer run)",
+    "python governance/tools/mutate.py --file engine/src/pool.c --test \"python scripts/hxcc.py --platform --run -o t01mut_pool{job}.exe engine/src/pool.c engine/tests/test_pool.c -- --quick\" --max-mutants 60 --jobs 4 --seed 1",
+    "python governance/tools/mutate.py --file engine/src/platform_win.c --test \"python scripts/hxcc.py --platform --run -o t01mut_win{job}.exe engine/tests/test_platform.c -- --expect-cpu sse42,avx,avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512bf16,avxvnni,-neon,-dotprod,cores=16,cpus=32\" --max-mutants 60 --jobs 4 --seed 1"
+  ],
+  "measurements": [
+    {"metric": "hx_pool_run round trip, empty task, 16 threads, spin_us=1000 (mean)", "value": 0.85, "unit": "us", "conditions": "Windows 11, Ryzen 9 9950X, MSVC /O2; range 0.78-0.98 over 4 runs; p50 0.6-0.9, p99 1.2-1.5; other engineers' builds running (noisy)", "kind": "measured"},
+    {"metric": "hx_pool_run round trip, empty task, 4 threads, spin_us=1000 (mean)", "value": 0.25, "unit": "us", "conditions": "same machine; range 0.15-0.46; p50 0.1", "kind": "measured"},
+    {"metric": "hx_pool_run round trip, empty task, 1 thread (mean)", "value": 0.005, "unit": "us", "conditions": "no workers; direct call", "kind": "measured"},
+    {"metric": "hx_pool_run round trip, empty task, 32 threads, spin_us=1000 (p50)", "value": 1.0, "unit": "us", "conditions": "32 threads = all logical CPUs on a shared machine: mean 20-380 us, p99 ~1.05-1.1 ms from preemption", "kind": "measured"},
+    {"metric": "hx_pool_run round trip, empty task, 16 threads, spin_us=0 (sleep/wake path, p50)", "value": 53.7, "unit": "us", "conditions": "Windows condvar wake of 15 threads; Linux WSL2 ~430-500 us (VM wake latency)", "kind": "measured"},
+    {"metric": "hx_pool_for(4*nt items, chunk 1), empty body, 16 threads, spinning (mean)", "value": 1.8, "unit": "us", "conditions": "Windows, same machine, noisy", "kind": "measured"},
+    {"metric": "hx_file_pread direct random 64 KiB, 16 reader threads", "value": 4.12, "unit": "GB/s", "conditions": "Samsung 990 PRO, 4 GiB file in the data dir, 2 GiB read per point, noisy machine; 1 thread 0.31-0.63 GB/s", "kind": "measured"},
+    {"metric": "hx_file_pread direct random 1 MiB, 4 reader threads", "value": 6.38, "unit": "GB/s", "conditions": "same; 1 thread 2.2-3.9 GB/s, 16 threads 5.9 GB/s", "kind": "measured"},
+    {"metric": "raw Win32 synchronous-handle unbuffered 64 KiB random read, 16 threads", "value": 0.62, "unit": "GB/s", "conditions": "baseline for the overlapped design decision; same file and machine", "kind": "measured"},
+    {"metric": "f32->f16 / f32->bf16 exhaustive mismatches vs independent reference", "value": 0, "unit": "count", "conditions": "all 2^32 inputs each", "kind": "measured"},
+    {"metric": "mutation score pool.c / platform_common.inc / platform_win.c", "value": 73.3, "unit": "percent", "conditions": "pool.c 73.3, platform_common.inc 86.7, platform_win.c 75.0; 60 sampled mutants each, seed 1; survivors reviewed (see ledger)", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Task text asked for Windows pread/pwrite on a handle opened WITHOUT FILE_FLAG_OVERLAPPED. Implemented with FILE_FLAG_OVERLAPPED plus a per-request wait instead (still positional and thread-safe, same hx_platform.h contract), because the measured synchronous-handle design serialises reader threads (see ledger). Director should confirm or override.",
+    "platform_posix.c macOS/BSD branches (F_NOCACHE, sysctl hw.memsize/hw.physicalcpu, mach host_statistics64, pthread_cond_timedwait_relative_np, ARM64 dotprod via sysctl/getauxval) are written but never compiled; only the Linux x86-64 path was built and tested (WSL2 gcc 13.3).",
+    "Large-page allocation (MEM_LARGE_PAGES / MADV_HUGEPAGE) code paths not exercised: privilege not held on Windows here; THP madvise is advisory and was not checked for effect."
+  ]
+}

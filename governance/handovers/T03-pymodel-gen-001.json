@@ -1,0 +1,94 @@
+{
+  "generation_id": "gen-001-pymodel",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T15:05:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T03-pymodel",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new: python/hearth/{_native,quant,format,reference,synth,convert}.py, tests/py/{test_format,test_reference,test_convert}.py; created the initial minimal python/hearth/__init__.py (since extended by T07)"
+  },
+  "constraints_touched": ["INV-NUM-1", "INV-NUM-2", "INV-FMT", "INV-SAFE", "INV-DET-2", "INV-DET-3", "INV-DEP", "INV-DATA", "INV-HONEST", "INV-VERIFY"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "hearth.reference matches Hugging Face transformers 4.54.1 (float32, eager) for qwen3_moe, olmoe, mixtral, qwen2_moe and deepseek_v3 (YaRN with mscale != mscale_all_dim, GPT-J interleave, n_group=4/topk_group=2, q_lora_rank=64; and q_lora_rank=None with NEOX rope), both token-by-token and full-sequence, with identical expert sets per token and MoE layer.",
+        "evidence": "tests/py/test_reference.py::test_reference_matches_transformers (6 variants, 16 tokens, router forward hooks): max abs logit error 3.8e-6..7.0e-6, i.e. <= 9.8e-7 relative to max|logit| (tolerance 2e-3). Spot mutants killed by these tests: rope style ignored, rope_attn_factor ignored, attn_scale without YaRN mscale, norm_topk_prob ignored, OLMoE full-width qk_norm skipped.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "With emulate_act_quant the reference applies F32/F16/BF16/Q8/Q4 matrices bit-identically to the engine kernels (NUMERICS 2-3) on scalar, AVX2 and AVX-512.",
+        "evidence": "test_matvec_bit_identical_to_engine_kernels against a kernels-only DLL built from T02's engine/src/quant.c + quant_avx2.c + quant_avx512.c (state at 09:33): uint32 bit patterns equal for all 5 dtypes, 3 ISAs, incl. zero blocks, tiny/large magnitudes and exact .5 rounding ties; a half-away-from-zero act-quant mutant is killed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "numpy F16 and BF16 encoders are bit-identical to the native converter (RNE, overflow to inf, quiet NaN with truncated payload).",
+        "evidence": "1.1M random float32 bit patterns + 100k normals compared against hearth_quantize(F16/BF16): 0 mismatches after aligning NaN payload handling with vcvtps2ph.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "make_tiny routing margins are far above float-order noise, so engine/reference routing equality (INV-NUM-2) does not hinge on near-ties.",
+        "evidence": "Replacing the canonical dot16/sum16 with numpy's own float32 order changes router selection scores by <= 7.2e-7 and logits by <= 6e-6 on all golden-style models; make_tiny enforces >= 3e-4 absolute (sigmoid), >= 2e-3 relative (softmax) and >= 6e-4 group-score gaps on the golden token sequence, redrawing the offending router (at most 1 redraw observed for the 11 golden models).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The container reader rejects malformed files with ValueError (never IndexError/struct.error/crash).",
+        "evidence": "test_malformed_files_raise: 29 corruptions (empty, short, magic, version, align, truncations, out-of-range/huge section offsets and counts, tensor offset/alignment/nbytes/dtype/ndim/shape/name, slab alignment/range/size/dtype/missing, metadata overrun and unknown type) all raise ValueError.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "FP8 e4m3 block-scaled checkpoints (DeepSeek/Kimi style, weight_scale_inv) convert to the same model as their dequantized weights, through both the safe_open+torch reader and the numpy fallback reader.",
+        "evidence": "test_fp8_checkpoint_end_to_end[torch|numpy]: synthetic FP8 DeepSeek-V3 checkpoint (32x32 blocks, partial edge blocks) converted to F32 matches transformers run on the dequantized weights within 2e-3; e4m3 table equals torch's float8_e4m3fn decode for all 256 codes; backends agree bit-for-bit on a bf16 checkpoint incl. row slices.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Reference evaluation is order-independent: eval(batch) == sequence of eval([t]), KV cache persists across calls, reset() clears it; power-of-two emb/residual scales are exactly invisible with eps=0, logit_scale is exact, tied == untied-with-copied-head.",
+        "evidence": "test_kv_cache_across_calls_and_reset (5 archs), test_scales_and_tied_embeddings (bit-exact comparisons; residual/emb/logit/tie mutants killed).",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Activation-quantization emulation keeps quantized-model logits within 5% of exact-weight float evaluation token by token.",
+        "evidence": "On Q8 tiny models act-quant noise occasionally flips a routing decision, producing a single-token logit difference up to 0.32 x max|logit|; median per-token error stays ~1.5%. The test now bounds the median. This is why golden Q4 tests must compare the engine with the emulating reference.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "No real checkpoint (OLMoE, Qwen3-30B-A3B, Mixtral, Qwen1.5-MoE, DeepSeek-V3/Kimi-K2 FP8 shards) has been converted: none is cached locally and downloads need the user's permission. Mapping is validated only on tiny random transformers models with identical tensor names.",
+      "Kimi-K2 ships a tiktoken tokenizer (no tokenizer.json); the converter then writes no tokenizer reference — T07's chat layer needs a plan for that.",
+      "Engine coverage gap: golden synth models never exercise tie_embeddings, emb/residual/logit scales != 1 or partial rotary (rope_dim < head_dim); the reference supports and tests them, the engine is not tested on them by the golden suite."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --shared --platform -o \"%LOCALAPPDATA%/hearth/t03/hearth.dll\" engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c   (kernels-only DLL outside <data dir>/build so the engine loader never picks it up)",
+    "set HEARTH_LIB=%LOCALAPPDATA%\\hearth\\t03\\hearth.dll   (Bash: export HEARTH_LIB=\"$LOCALAPPDATA/hearth/t03/hearth.dll\")",
+    "python -m pytest tests/py/test_format.py tests/py/test_reference.py tests/py/test_convert.py -q",
+    "python -m pytest tests/golden/test_golden_invariants.py -q -k kernel_isa   (the only golden tests that do not need the full engine)",
+    "python governance/tools/mutate.py --file python/hearth/reference.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_reference.py\" --max-mutants 40 --jobs 6 --seed 1",
+    "python -m hearth.convert <hf_dir> <data dir>/models/<name>.hearth --experts q4 --dense q8   (never write containers under OneDrive / the repo)"
+  ],
+  "measurements": [
+    {"metric": "reference vs transformers max abs logit error / max|logit| (worst of 6 variants)", "value": 9.8e-7, "unit": "ratio", "conditions": "tiny random float32 models, 16 tokens, transformers 4.54.1 eager, numpy 2.2.6", "kind": "measured"},
+    {"metric": "router selection-score change from float summation order", "value": 7.2e-7, "unit": "absolute", "conditions": "canonical dot16/sum16 vs numpy float32 order on make_tiny F32 models (golden token sequence)", "kind": "measured"},
+    {"metric": "Q4-expert/Q8-dense converted logits correlation with F32 conversion (worst of 6 variants)", "value": 0.992, "unit": "pearson r", "conditions": "tiny random transformers models, emulating reference, 16 tokens", "kind": "measured"},
+    {"metric": "make_shaped write throughput", "value": 0.45, "unit": "GiB/s", "conditions": "qwen3-30b-a3b geometry, Q4 experts, physical_experts=8, 2.41 GiB container on Samsung 990 PRO; NOISY: other engineers were building/testing concurrently; synthetic weights", "kind": "measured"},
+    {"metric": "make_tiny build time (deepseek_v3 Q4, 4 layers x 32 experts, incl. margin check)", "value": 0.63, "unit": "s", "conditions": "Ryzen 9 9950X, concurrent load from other engineers", "kind": "measured"},
+    {"metric": "python tests (format+reference+convert) passing with native kernels DLL", "value": 104, "unit": "tests", "conditions": "HEARTH_LIB = kernels-only DLL built from T02's quant.c/quant_avx2.c/quant_avx512.c (09:33 state); without the DLL: 93 passed, 11 skipped with a reason", "kind": "measured"},
+    {"metric": "golden kernel tests (test_kernel_isa_and_batch_identity) passing through hearth._native/hearth.quant", "value": 5, "unit": "tests", "conditions": "same kernels-only DLL; the other 16 golden tests need the full engine", "kind": "measured"},
+    {"metric": "mutation score reference.py", "value": 100.0, "unit": "%", "conditions": "governance/tools/mutate.py --max-mutants 40 --seed 1, tests/py/test_reference.py", "kind": "measured"},
+    {"metric": "mutation score format.py", "value": 95.0, "unit": "%", "conditions": "--max-mutants 40 --seed 1, tests/py/test_format.py; 2 survivors equivalent (durability-only flush, bound re-checked by _read_at)", "kind": "measured"},
+    {"metric": "mutation score convert.py", "value": 92.5, "unit": "%", "conditions": "--max-mutants 40 --seed 1, tests/py/test_convert.py; 3 survivors equivalent (thread default, redundant head_dim assignment, num_experts default)", "kind": "measured"},
+    {"metric": "mutation score synth.py", "value": 90.0, "unit": "%", "conditions": "--max-mutants 40 --seed 1, test_reference.py + test_format.py; 4 survivors equivalent (unreachable boundaries, size-estimate helper)", "kind": "measured"},
+    {"metric": "mutation score _native.py", "value": 90.0, "unit": "%", "conditions": "--max-mutants 40 --seed 1, test_format.py + test_reference.py; 4 survivors are POSIX/macOS-only branches or error-message text, untestable on Windows", "kind": "measured"},
+    {"metric": "mutation score quant.py", "value": 87.5, "unit": "%", "conditions": "--max-mutants 40 --seed 1, test_format.py + test_reference.py; 5 survivors equivalent (thread-count heuristics and row splits that cannot change output bytes)", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Real-checkpoint conversion check (at least OLMoE-1B-7B and one FP8 DeepSeek-V3/Kimi-K2 shard) once a model is available locally with the user's permission to download.",
+    "Golden engine tests (test_engine_matches_reference etc.) not run: they need the full engine DLL (T06/T08)."
+  ]
+}

@@ -1,0 +1,71 @@
+{
+  "generation_id": "gen-001-governance",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T13:55:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T05-governance",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "untracked (new): governance/tools/{waves,validate_handover,check_golden,mutate,friction,adr}.py, governance/tools/demo/{hxdemo.h,hxdemo.c,test_hxdemo.c}, governance/README.md, governance/decisions/{TEMPLATE.md,ADR-0001..ADR-0008}, governance/handovers/T05-governance-gen-001.json, CONTRIBUTING.md, .github/workflows/ci.yml, tests/py/test_governance.py; no tracked file modified"
+  },
+  "constraints_touched": ["INV-VERIFY", "INV-DATA", "INV-HONEST", "INV-SAFE", "INV-DEP", "INV-NUM-1"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {"claim": "check_golden.py passes on the current repo: the CRLF->LF-normalised SHA-256 of tests/golden/test_golden_invariants.py equals MANIFEST.sha256 (the working-tree copy is CRLF)", "evidence": "python governance/tools/check_golden.py -> 'golden lock OK: 1 file(s) verified', exit 0; tampered/CRLF/unlisted/missing/malformed variants on temp copies covered by tests/py/test_governance.py (passing)", "verdict": "CONFIRMED"},
+      {"claim": "governance/tasks.json is a valid DAG: 16 tasks, 6 waves, acyclic, disjoint ownership among unfinished tasks", "evidence": "python governance/tools/waves.py validate -> 'OK: 16 tasks, 6 waves, acyclic, ownership disjoint'; wave 0 = T01,T02,T03,T04,T05,T07", "verdict": "CONFIRMED"},
+      {"claim": "The built-in JSON Schema subset validator agrees with jsonschema 4.26 on handover.schema.json for valid and invalid manifests (missing field, bad enum incl. via $ref, bad pattern, extra property incl. nested/$ref, union type, number/bool, date-time)", "evidence": "tests/py/test_governance.py parametrises every invalid case over engines builtin+jsonschema (all pass); suite also passes with jsonschema import blocked (24 handover tests)", "verdict": "CONFIRMED"},
+      {"claim": "mutate.py kills mutants in the C demo (governance/tools/demo/hxdemo.c + test_hxdemo.c via hxcc/MSVC)", "evidence": "all 124 candidates: killed 110 + timeout 2, survived 12 -> 90.3%; sampled 40 (seed 1): 97.5%. Of the 12 survivors 9 are equivalent mutants and 3 are out-of-bounds stack accesses in sum16 (i<=16, i<17, j<=s) that only ASan can detect. Initial tests scored 87.1%; the 4 killable gaps the report exposed (top-k with id 0 taken, stale keys after re-init x2, eviction scanning slot cap) were closed with new test cases.", "verdict": "CONFIRMED"},
+      {"claim": "mutate.py works on a real engine target in parallel without touching the working tree", "evidence": "engine/src/pool.c + engine/tests/test_pool.c --quick (T01 work in progress, snapshot at ~09:20 local), 40 of 254 candidates seed 1, 2 jobs, timeout 120 s: killed 23, timeout 5, survived 11, build-error 1 -> 71.8%. git status showed no tracked-file changes; test_mutate_kills_obvious_mutants_without_touching_the_tree asserts byte equality of the target tree. The T01 engineer is already running mutate.py with {job}-unique hxcc outputs.", "verdict": "CONFIRMED"},
+      {"claim": "--since restricts mutants to lines changed since a git revision (untracked file = all lines; bad revision = exit 2)", "evidence": "scratch git repo in the session scratchpad: one modified line -> only that line's 4 mutants; untracked file -> all 4; 'nosuchrev' -> 'git diff nosuchrev failed', exit 2. Hunk parsing unit-tested (test_mutate_hunk_lines).", "verdict": "CONFIRMED"},
+      {"claim": "The governance tools' own tests kill mutants (dogfooding, 40 mutants each, seed 1, 4 jobs)", "evidence": "waves 97.5%, check_golden 100%, validate_handover 95.0%, friction 95.0%, adr 82.5% (3 equivalent + 4 in git-only code; the git test skips in .git-less job copies), mutate.py 62.5% -> 92.5% after adding lexer/statement edge-case tests (new seed-1 sample of 1438 candidates; 3 survivors: an equivalent bound check, the untested 'for (Unknown *p = ...' declarator case, and _clear_pycache which is defense in depth behind PYTHONDONTWRITEBYTECODE)", "verdict": "CONFIRMED"}
+    ],
+    "hypotheses_falsified": [
+      {"claim": "One default build-error output regex is safe for every language", "evidence": "mutate.py on friction.py classified 5 of 40 mutants as build-error because failing pytest output echoed test data containing 'error C2065'. Fixed: the regex now applies by default only to C targets; Python mutants are compile()-checked before sampling. Regression test: STRONG_TEST carries a fake 'error C2065' assertion message and the suite asserts build-error == 0.", "verdict": "REJECTED"},
+      {"claim": "Typedef names collected from quoted local headers are enough to recognise C pointer declarators", "evidence": "pool.c 'atomic_uint *gen' (typedef from <stdatomic.h>) yielded a '*'->'/' build-error mutant. Fixed with structural declarator rules (file scope; '*' before ')' ',' '*' or qualifiers; 'T *name =|;|,|[|)' at statement start) plus atomic_* names. Verified: no mutant on pool.c:56; every remaining '*' mutant in pool.c, platform_win.c and quant.c inspected is a real product.", "verdict": "REJECTED"},
+      {"claim": "The first version of the demo tests was adequate", "evidence": "first mutation run 87.1% with 4 killable survivors (see validated hypotheses)", "verdict": "REJECTED"}
+    ],
+    "open_questions": [
+      "The CI workflow has never run on GitHub runners. It is checked only by YAML parsing and by running the governance-job commands locally. Unknowns: Python 3.9 availability on ubuntu-latest via setup-python, the windows-latest default Visual Studio generator, and -DCMAKE_COMPILE_WARNING_AS_ERROR across all modules.",
+      "Timeouts count as detected (PIT/Stryker convention). For concurrency code under heavy machine load a timeout could be load-induced; pool.c used 2 jobs and a 120 s timeout for that reason. Should mutate.py re-run timed-out mutants once serially before counting them?",
+      "scripts/hxcc.py --asan --run fails on Windows (exit 127, ASan runtime DLL not on PATH), so ASan-only survivors (OOB) cannot be killed locally with hxcc."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_governance.py -q",
+    "python governance/tools/check_golden.py",
+    "python governance/tools/waves.py validate",
+    "python governance/tools/waves.py next --done T01-platform",
+    "python governance/tools/waves.py --mermaid",
+    "python governance/tools/validate_handover.py",
+    "python governance/tools/validate_handover.py --engine builtin --strict governance/handovers/T05-governance-gen-001.json",
+    "python governance/tools/adr.py lint",
+    "python governance/tools/adr.py breaker --base-rev HEAD",
+    "python governance/tools/mutate.py --file governance/tools/demo/hxdemo.c --max-mutants 0 --jobs 4 --seed 1 --test \"python scripts/hxcc.py --run -o mut_demo{job}.exe governance/tools/demo/hxdemo.c governance/tools/demo/test_hxdemo.c\"",
+    "python governance/tools/mutate.py --file engine/src/pool.c --max-mutants 40 --jobs 2 --seed 1 --timeout 120 --test \"python scripts/hxcc.py --platform --run -o mut_pool{job}.exe engine/src/pool.c engine/tests/test_pool.c -- --quick\"",
+    "python governance/tools/mutate.py --file governance/tools/waves.py --max-mutants 40 --jobs 4 --seed 1 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_governance.py -k waves\"",
+    "python governance/tools/friction.py check <attempt-log.jsonl>"
+  ],
+  "measurements": [
+    {"metric": "mutation score, C demo hxdemo.c, all 124 mutants", "value": 0.903, "unit": "fraction", "conditions": "Ryzen 9 9950X, Windows 11, MSVC 14.44 via hxcc, 4 jobs, timeout 10 s, wall 19.1 s; other engineers building and testing concurrently", "kind": "measured"},
+    {"metric": "mutation score, C demo hxdemo.c, 40 sampled mutants (seed 1)", "value": 0.975, "unit": "fraction", "conditions": "same machine, 4 jobs, wall 4.5 s, concurrent load", "kind": "measured"},
+    {"metric": "mutation score, C demo hxdemo.c before test improvements, all 124 mutants", "value": 0.871, "unit": "fraction", "conditions": "same machine, 4 jobs", "kind": "measured"},
+    {"metric": "mutation score, engine/src/pool.c with test_pool --quick, 40 of 254 mutants (seed 1)", "value": 0.718, "unit": "fraction", "conditions": "T01 work-in-progress snapshot; 2 jobs, timeout 120 s, wall 492.6 s; 5 timeouts (deadlocks) counted as detected; survivors mostly in spin/sleep paths plus a deleted free(); heavy concurrent load", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/waves.py, 40 mutants (seed 1)", "value": 0.975, "unit": "fraction", "conditions": "pytest -k waves, 4 jobs", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/check_golden.py, 40 mutants (seed 1)", "value": 1.0, "unit": "fraction", "conditions": "pytest -k golden, 4 jobs", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/validate_handover.py, 40 mutants (seed 1)", "value": 0.95, "unit": "fraction", "conditions": "pytest -k 'handover or date_time or keywords or invariant', 4 jobs", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/friction.py, 40 mutants (seed 1)", "value": 0.95, "unit": "fraction", "conditions": "pytest -k friction, 4 jobs", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/adr.py, 40 mutants (seed 1)", "value": 0.825, "unit": "fraction", "conditions": "pytest -k adr, 4 jobs; git-revision test skips in .git-less job copies", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/mutate.py, 40 of 1437 mutants (seed 1), before lexer edge-case tests", "value": 0.625, "unit": "fraction", "conditions": "pytest -k mutate, 4 jobs", "kind": "measured"},
+    {"metric": "mutation score, governance/tools/mutate.py, 40 of 1438 mutants (seed 1), after lexer edge-case tests", "value": 0.925, "unit": "fraction", "conditions": "pytest -k mutate, 4 jobs; different sample than the 0.625 run because the candidate set changed", "kind": "measured"},
+    {"metric": "tests/py/test_governance.py wall time (85 tests)", "value": 20.0, "unit": "s", "conditions": "Windows 11, Python 3.13.4, concurrent load from other engineers", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "CI (.github/workflows/ci.yml) not executed on GitHub runners from this session; the build/test jobs cannot pass until every CMake source exists (engine/tools/hearth_bench.c, modelfile.c, store.c, model.c, api.c, platform_posix.c ...).",
+    "governance/tasks.json T05 'owns' does not list governance/decisions/ or tests/py/test_governance.py although this task created them (maintainer to update; see contract issues).",
+    "Survivors in engine/src/pool.c (T01) were reported, not fixed: spin/sleep-path conditions (lines ~57-107) and the deleted free(p->workers) need an ASan/leak build or timing-insensitive tests; T01 owns those files."
+  ]
+}

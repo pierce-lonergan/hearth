@@ -1,0 +1,103 @@
+{
+  "generation_id": "gen-003-stall-chat-mutation-hardening",
+  "parent_generation": "gen-002-kv-sync-hardening",
+  "timestamp": "2026-10-05T03:10:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T07-runtime",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified (still untracked): python/hearth/{engine,generate,chat,server,cli}.py, tests/py/test_runtime.py (81 -> 144 tests); python/hearth/{__init__,__main__}.py unchanged; new: governance/handovers/T07-runtime-gen-003.json"
+  },
+  "constraints_touched": ["INV-DET-2", "INV-LOSSLESS-DEFAULT", "INV-DEP", "INV-DATA", "INV-VERIFY", "INV-HONEST"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Major finding 1 fixed: a streaming client that stops reading can no longer hold the engine gate. Every client socket has a timeout (App/serve(timeout=60.0), CLI 'serve --timeout'; Handler.setup applies it), and every response write goes through Handler._write. That method turns any OSError (reset, broken pipe, a send stalled past the timeout) into ClientGone. _stream_guard treats ClientGone as a disconnect: the generator is closed while the gate is still held, KV bookkeeping stays exact, and nothing is counted as an error. Non-streaming replies are now sent after the gate is released (_locked returns the JSON payload), so a slow reader of a large non-stream reply cannot hold the engine either.",
+        "evidence": "Reproduced first with scratchpad/g3/repro_stall.py: FakeEngine max_seq 40000, max_queue 1, a raw client with SO_RCVBUF 4096 that never reads a /v1/completions stream of 30000 tokens. Before the fix: 'pos=362 busy=True' for all 8 s, then the second request failed with 'TimeoutError timed out' after 20 s. After the fix with timeout=1.0: busy=False from t=2 s, and the second request returned 200 in 0.0 s. Regression tests: test_server_drops_a_client_that_stops_reading (timeout 0.5 s; asserts the gate is released, completion_tokens < 30000, errors == 0, and that the next request succeeds), test_server_closes_idle_connections_after_the_timeout, and test_server_writes_non_stream_replies_after_releasing_the_engine (a spy records gate.busy == False at every 200 reply). Re-introducing the bug in a scratch copy (scratchpad/g3/revert_check.py: R1 no socket timeout, R2 ClientGone not handled, R3 reply written inside the gate) makes these tests fail.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Major finding 2 fixed: 'hearth chat' survives a full context. Conversation.say now rolls back the whole turn (the user message and no assistant entry) if generation raises, and keeps a partial reply if the consumer closes the stream or Ctrl-C arrives. cli._chat_turn checks the prompt length against kv_capacity before generating: if need >= cap it prints '[context full: this turn needs N prompt tokens, the KV cache holds M; /reset ...]' and skips the turn. ValueError/HearthError during a turn prints '[turn failed and was discarded: ...]'; template errors print '[cannot build the prompt: ...]'. A reply cut short by the KV cache (finish 'length' with fewer than -n tokens) prints '[reply cut off: the KV cache (M tokens) is full; ...]'. The REPL keeps running in every case.",
+        "evidence": "test_cli_chat_survives_a_full_context (the verifier's script shape: real tokenizers byte-level tokenizer in a container, Engine replaced by a FakeEngine, --max-seq 140, -n 8, stdin 'hello', 'x'*50, 'third turn', '/exit'): rc 0, one context-full message (174 > 140), history [user 5, assistant 8, user 'third turn', assistant 7], the cut-off message, the KV holds exactly 140, and '/exit' leaves the rest of stdin unread. test_cli_chat_commands_and_failed_turns covers an engine failure mid-reply (rolled back, the next prompt contains no trace of it) plus /help, /bogus, /stats, /system, /reset, Ctrl-C at the prompt, EOF and -q. test_cli_chat_interrupt_and_template_errors covers Ctrl-C mid-reply (3-token partial reply kept) and raise_exception templates. test_conversation_say_rolls_back_a_failed_turn_and_keeps_a_cut_one covers the library side. R8, R9 and R10 in revert_check.py are each killed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Major finding 3 fixed: engine.py, cli.py, chat.py, generate.py and server.py all pass whole-file mutation testing with the full test_runtime.py (compiled ABI stub and real DLL included). Every surviving mutant is classified below as equivalent or not reachable on Windows.",
+        "evidence": "Command: HEARTH_LIB=<repo>/python/hearth/lib/hearth.dll python governance/tools/mutate.py --file F --seed S --timeout 240 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_runtime.py\". All candidates were run for engine.py and 40-mutant samples for the other files. Results: engine.py ALL 256 candidates 93.8% (was 62.5% on a 40-mutant sample). cli.py 97.5% (seed 3) and 95.0% (seed 11) (was 15%). chat.py 100% (seed 3) and 100% (seed 11). generate.py 97.5% (seed 3: 38 killed, plus 1 timeout that is a real infinite loop, M0370 in generate_ids) and 97.5% (seed 11). server.py 100% (seed 3) and 97.5% (seed 11). Survivor classification. engine.py: M0003-5 are the _KEEP_FLOATS retention size and M0110/M0111 the error-buffer size, which is passed with len(); M0125 is the initial buffer size. All three only change allocation. M0148 is reshape(-1)->(-2), which numpy also infers. M0167-169 are the n > 2**31-1 guard, unreachable without an 8 GiB token array. M0175 and M0179 only reallocate or skip reuse of an equal-sized buffer, and the result is a fresh array either way. M0182 is all_logits flag 1->2, and C treats any nonzero int as true. M0227/M0228 change the maxsplit of the NUL split, but ctypes already truncates c_char arrays at the first NUL. M0234 is min(n_eos, 9) on an 8-element list. cli.py: M0284 is the json.dumps indent of 'bench --json' (whitespace only). M0279 is decode_s > 0 vs >= 0, where decode_s > 0 whenever tokens were decoded. M0287 is bench 'return 0' -> None, which main maps to 0. generate.py: M0162 is the propose() guard, since both branches return []. M0361 is rewind(len) when pos == len, a no-op. server.py: M0209 maps 500 -> api_error, but every 500 on the Anthropic route is already raised with kind api_error. The verifier's named survivors are now killed: M0187 by rewind(0) in fake-API, compiled-stub-independent and real-DLL tests plus a real-server request with no shared prefix; M0122 by the kv_capacity table and a 300-token prompt on the real 256-context model returning 400; M0115/M0113/M0117 by hearth_close counts for with/close/__del__; M0067 by option validation; Tokenizer.bos_token; the _parse_metadata need() checks (every truncation point of every entry type); bench tok/s arithmetic and --ids greedy; the --tokenizer flag; min_p renormalisation. revert_check.py re-introduced 35 specific bugs (the 6 findings, the verifier's named mutants and later survivors). All 35 are killed by the final tests.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor finding 4 fixed: Engine range-checks every C int option (threads, io_threads, prefetch_extra, max_seq, max_batch, verbose) to [0, 2**31-1]. It rejects non-integers (TypeError; bool is accepted only for verbose) and requires pin_fraction in [0, 1] and cache_gb finite and >= 0. All checks run before hearth_open.",
+        "evidence": "test_engine_rejects_bad_options_before_opening (21 cases, including max_seq=2**32+100 and 2**31; asserts hearth_open was never called). test_engine_options_reach_hearth_options checks the boundary values 2**31-1 and pin_fraction 1.0, and every field hearth_open receives, for the defaults and for a fully customised call. On the real DLL, test_real_engine_kv_capacity_and_rewind_to_zero checks that Engine(tiny, max_seq=2**32+100) raises ValueError (the verifier saw C receive 100). It also checks kv_capacity 256/100/256 for requests 0/100/1000, that filling to capacity succeeds and one more token raises HearthError, and that rewind(0) followed by re-evaluation is bit-identical.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor finding 5 fixed: Sampler.probs shifts before scaling ((x - max) / T under errstate(over='ignore')), so tiny temperatures tend to a point mass on the argmax, with ties shared. Logits containing NaN or +inf, or all -inf, raise ValueError for both greedy and sampled decoding. -inf alone is allowed as a masked token.",
+        "evidence": "test_tiny_temperature_tends_to_greedy_without_nan runs with warnings as errors. T = 1e-320, 1e-300 and 1e-30 on [5, 1, -3, 0.5] give probs [1, 0, 0, 0], and 20 draws all give token 0 (the verifier saw NaN and token 3). Ties at T = 1e-320 give [0.5, 0.5, 0]. test_non_finite_logits_are_rejected covers the error cases. test_min_p_and_temperature now checks exact probabilities for T = 2 and T = 0.5. Seeded sampled outputs can differ from gen-002 only by float64 rounding at sampling boundaries; greedy decoding is unchanged.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor finding 6 fixed. (1) stream, echo and stream_options.include_usage must be JSON booleans or null; anything else gets 400 (and a non-object stream_options gets 400). (2) HTTP/1.0 streams are close-delimited: no Transfer-Encoding, 'Connection: close', and the bare SSE bytes are sent (RFC 9112 6.1). HTTP/1.1 streams stay chunked. (3) HearthServer uses AF_INET6 when the host contains ':', and srv.url brackets IPv6 hosts. cli main() now maps any OSError (port in use, unresolvable host) to exit 1 with a one-line message. (4) HearthServer.handle_error stays silent for ConnectionError and TimeoutError and keeps the default traceback for everything else. Also: a negative or non-numeric Content-Length now gets 400 'bad Content-Length' (was 413 for negative values).",
+        "evidence": "test_server_rejects_non_boolean_flags, test_server_streams_to_http10_clients_without_chunked_encoding (a raw socket for both versions; HTTP/1.1 is de-chunked and checked), test_server_binds_ipv6_hosts (a real ::1 bind, http.client GET /health), test_cli_serve_reports_a_port_in_use (rc 1, 'hearth serve: OSError', no traceback, engine closed), test_server_is_quiet_about_vanished_clients (a real RST on an idle keep-alive connection reaches handle_error as ConnectionResetError with no 'Traceback' on stderr; a RuntimeError still prints one), test_server_defaults_and_edge_parameters. Manual: 'python -m hearth serve x.hearth --timeout 0' prints the error and exits 2, and make_server(host='::1') prints http://[::1]:<port>.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "No regressions: the full contributor suite and the golden suite pass with these changes and the current DLL.",
+        "evidence": "python -m pytest tests/py/test_runtime.py -q: 144 passed (5 real-DLL tests plus the compiled ABI stub, no skips). python -m pytest tests/py -q: 644 passed, 2 skipped; the skips are in test_format.py (kernels-only build) and test_governance.py (Python 3.14), not in this task's files. HEARTH_LIB=<dll> python -E governance/tools/check_golden.py --run: lock OK, 21 passed, 0 skipped.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "The existing CLI tests would catch a sampler_from() that ignores the sampling flags.",
+        "evidence": "Mutation M0047 (sampler_from returns None) survived, because every CLI test used --temperature 0 and generate() falls back to greedy for None. test_cli_run_prompts_ids_and_outputs now runs with T=3, top_k, top_p, min_p, repetition_penalty and a seed. It asserts the output equals the same Sampler on a fresh engine and differs from greedy (revert case S10).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "A FakeEngine letter bonus of 4.0 is enough to make replies decode to plain letters with a 256-entry byte-level tokenizer.",
+        "evidence": "Replies contained ids from the Latin-1 half of the ByteLevel alphabet. These decode to U+FFFD and re-encode as 3 tokens each, so a turn measured 178 tokens instead of 174. CliEngine uses bonus 8.0 and gets exact token counts.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The POSIX branches of 'doctor' (/proc/cpuinfo, /proc/meminfo, sysconf) can only be checked by reading on this Windows machine.",
+        "evidence": "test_cli_posix_probes_parse_proc_files redirects cli.os (name 'posix', fake sysconf that raises ValueError like the real one) and the /proc paths to fixture files. It exercises every branch of _cpu_features_py and _ram on Windows. They have still not run on a real Linux or macOS kernel.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "A queued request whose client has already disconnected still waits its turn and, if non-streaming, generates in full before the write fails. The gate has no maximum wait. Detecting a dead peer before generating (a non-blocking MSG_PEEK) or adding EngineGate.acquire(timeout) are possible additions; neither was needed for the findings.",
+      "Does prompt-lookup speculation pay off on real MoE models? Verifying k+1 tokens loads the union of their experts. The default stays speculative='none' until it is measured on real weights.",
+      "docs/PYTHON_API.md does not yet describe the runtime surface added in gen-002/gen-003: Engine.kv_capacity and the option ranges, serve()/App timeout, Tokenizer.from_container(path=...), the Conversation.say rollback rule, the server's token_ids extension and chat max_tokens >= 1 (see contract_issues in the gen-003 report)."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_runtime.py -q",
+    "python -m pytest tests/py/test_runtime.py -q -k compiled_abi   # compiles a hearth.h stub with scripts/hxcc.py into pytest's tmp dir; skips without a C toolchain",
+    "python -m pytest tests/py/test_runtime.py -q -k real   # real engine: python/hearth/lib/hearth.dll (or HEARTH_LIB) + hearth.synth.make_tiny; skips without the library",
+    "export HEARTH_LIB=\"$(pwd -W)/python/hearth/lib/hearth.dll\"   # Git Bash; makes mutate.py job copies load the same DLL",
+    "python governance/tools/mutate.py --file python/hearth/engine.py --max-mutants 0 --jobs 5 --seed 3 --timeout 240 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_runtime.py\"",
+    "python governance/tools/mutate.py --file python/hearth/cli.py --max-mutants 40 --jobs 4 --seed 3 --timeout 240 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_runtime.py\"   # same for server.py, chat.py, generate.py; seeds 3 and 11",
+    "python -E governance/tools/check_golden.py --run   # with HEARTH_LIB set and no PYTHONPATH",
+    "python -m hearth serve <model.hearth> --port 8080 [--timeout 60] [--speculative ngram] [--api-key KEY]",
+    "python -m hearth chat <model.hearth> [--max-seq N] [-n MAX_TOKENS]"
+  ],
+  "measurements": [
+    {"metric": "runtime test suite", "value": 144, "unit": "tests passed (0 skipped; includes 5 real-DLL tests and the compiled ABI stub)", "conditions": "Windows 11, Python 3.13, numpy 2.2; python/hearth/lib/hearth.dll as found in the tree; ~27 s wall while other engineers ran builds/tests concurrently", "kind": "measured"},
+    {"metric": "mutation score engine.py (all candidates)", "value": 93.8, "unit": "% (240 of 256 killed; 16 survivors all equivalent)", "conditions": "governance/tools/mutate.py --max-mutants 0 --seed 3, full test_runtime.py incl. real DLL and compiled stub", "kind": "measured"},
+    {"metric": "mutation score cli.py", "value": 97.5, "unit": "% (seed 3, 40 of 512 candidates; seed 11: 95.0%)", "conditions": "as above, 40-mutant samples", "kind": "measured"},
+    {"metric": "mutation score server.py", "value": 100.0, "unit": "% (seed 3, 40 of 578 candidates; seed 11: 97.5%)", "conditions": "as above", "kind": "measured"},
+    {"metric": "mutation score chat.py", "value": 100.0, "unit": "% (seeds 3 and 11, 40 of 314 candidates each)", "conditions": "as above", "kind": "measured"},
+    {"metric": "mutation score generate.py", "value": 97.5, "unit": "% (seed 3, incl. 1 real-infinite-loop timeout; seed 11: 97.5%)", "conditions": "as above", "kind": "measured"},
+    {"metric": "re-introduced bugs detected", "value": 35, "unit": "of 35 (scratchpad revert_check: each fix or survivor reverted in a scratch copy, targeted tests run)", "conditions": "same machine, targeted -k selections", "kind": "measured"},
+    {"metric": "golden invariant tests", "value": 21, "unit": "tests passed (isolated run, 0 skipped)", "conditions": "python -E governance/tools/check_golden.py --run with HEARTH_LIB set", "kind": "measured"},
+    {"metric": "server recovery after a client stops reading a stream", "value": 1.0, "unit": "s until the engine gate is free (timeout set to 1 s; previously never, until the peer closed)", "conditions": "FakeEngine, loopback, client SO_RCVBUF 4096; functional check under concurrent load, not a performance claim", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "The POSIX doctor branches have now run against fixture files with os/Path redirected, but not on a real Linux or macOS machine.",
+    "Speculative decoding speed on real model weights is unmeasured. Correctness is verified on the real DLL with a synthetic tiny model only."
+  ]
+}

@@ -1,0 +1,87 @@
+{
+  "generation_id": "gen-002-kv-sync-hardening",
+  "parent_generation": "gen-001-python-runtime",
+  "timestamp": "2026-10-05T00:55:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T07-runtime",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified (still untracked): python/hearth/{generate,chat,server,cli}.py, tests/py/test_runtime.py; python/hearth/{engine,__init__,__main__}.py unchanged this generation; new: governance/handovers/T07-runtime-gen-002.json"
+  },
+  "constraints_touched": ["INV-DET-2", "INV-LOSSLESS-DEFAULT", "INV-DEP", "INV-DATA", "INV-VERIFY", "INV-HONEST"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Critical finding fixed: generate() with max_new_tokens == 0 returned before syncing the engine, so Conversation recorded the new prompt as held while the engine still held the previous request's KV. Now generate() always syncs the engine to a prefix of the prompt before returning, and Conversation treats the engine's KV as known only after generate() has yielded or returned. Otherwise (an exception, or Ctrl-C before the sync) it resets.",
+        "evidence": "Reproduced before the fix with the fake engine (held started '<|im_start|>user\\nBBB', KV started '...AAA') and with the real DLL plus a make_tiny qwen3_moe Q4 model (94 tokens reported reused; output differed from a fresh engine). After the fix the same script gives held == KV, 17 tokens reused and output equal to a fresh engine. An HTTP replay of the verifier's chat sequence on the real DLL now gives: chat max_tokens=0 -> 400; the next request reports cached_tokens=17 and its reply equals a fresh engine's. Regression tests: test_generate_zero_tokens_leaves_a_prompt_prefix, test_conversation_zero_token_turn_keeps_kv_in_sync, test_conversation_interrupt_keeps_kv_tracking_consistent, test_server_zero_max_tokens_keeps_kv_in_sync, and test_real_server_prefix_reuse_stays_correct (real DLL, token ids in and out). Each was run against a scratch copy with the old code and fails there.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Major finding fixed: the tests now detect KV-content desyncs, copy-out violations and non-FIFO queueing.",
+        "evidence": "The FakeEngine gained crc_amp, a logit term keyed by a running CRC-32 of the whole KV. It is on (1.5) for every server and Conversation engine. request() asserts Conversation.held == FakeEngine.kv after every sequential HTTP request. New tests: test_server_alternating_prompts_match_fresh_runs, test_engine_eval_returns_independent_copies (pure-Python native-API double, no toolchain needed) and test_engine_gate_is_fifo_and_bounded. The tautological copy checks in the compiled-stub driver and test_real_engine_basics were replaced with checks that keep earlier results and compare them after later evals. The verifier's three surviving mutants were each re-applied to a scratch copy. sync_prefix ignoring content is killed by 7 tests, including the real-DLL one. Engine.eval returning a view is killed by 3: the fake-API test, the compiled ABI stub ('results must be copies') and the real-engine test. A LIFO EngineGate is killed by the FIFO test.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor findings fixed. (a) Error replies sent before the body is read (401, 404, GET or OPTIONS with a body) now drain it: up to 1 MiB for unwanted bodies, else the connection is closed, as it is for chunked or malformed lengths. (b) A server without a tokenizer serves /v1/completions with a token-id prompt and returns a non-standard 'token_ids' list (text ''), also when streaming; stop strings and echo get 400. (c) Speculative settings are validated by generate.check_speculative in App.__init__, serve() (before the container is read) and the CLI's run/chat/serve (exit 2 before any model is opened).",
+        "evidence": "test_server_keepalive_survives_error_replies checks 8 requests on one http.client connection, asserting the socket is reused. test_server_closes_connection_rather_than_read_a_large_unwanted_body sends a raw socket with Content-Length 1 MiB+1, chunked framing or 'abc' and reads until EOF. test_server_without_tokenizer_serves_token_id_completions and test_bad_speculative_settings_fail_at_startup cover (b) and (c). Reverting each fix on a scratch copy makes its test fail (M6, M7, M8, M9). Manual check: 'python -m hearth serve x.hearth --ngram-n 0' prints 'hearth serve: ngram_n must be >= 1, got 0' and exits 2.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "hearth_model_info.max_seq is the model's maximum context, not the KV capacity. Engine.kv_capacity (requested max_seq clamped to the model maximum, default min(model, 4096)) matches what the real engine enforces.",
+        "evidence": "Real DLL with a make_tiny model of max_seq 256. Requested 0, 100 and 1000 give info.max_seq 256 every time and kv_capacity 256, 100 and 256. Evaluating exactly kv_capacity tokens succeeds and one more raises HearthError in each case.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Contributor tests pass mutation testing on the changed code (INV-VERIFY).",
+        "evidence": "governance/tools/mutate.py with the test command 'pytest -x tests/py/test_runtime.py -k \"not compiled_abi\"', seeds 7 and 11. generate.py lines 249-396: 95.0% and 97.5%, up from 77.5% at gen-002 start. chat.py lines 384-461: 100% and 100%, up from 65%. server.py, 60 of 550 candidates: 95.0% and 95.0%, up from 68.3%. Remaining survivors are equivalent mutants: a no-op rewind when k == pos or pos == len(seq); propose(0); 'Bearer ' slice 7->6, which strip() absorbs; Anthropic error-kind dict keys that fall back to the error's own kind; the redundant forget_cache() after Conversation already reset. The others are constants (MAX_BODY) and OPTIONS Content-Length on a 204.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "A FakeEngine whose logits depend only on the last two tokens and the position is enough to test prefix reuse.",
+        "evidence": "Verifier finding. Mutants that reuse KV holding the wrong tokens survived the gen-001 suite. Fixed with the whole-KV CRC term and the held == kv assertion.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "A whole-KV hash term (order-sensitive CRC, or a token-set hash) at modest amplitude keeps the toy LM repetitive enough for the speculative acceptance tests.",
+        "evidence": "With an order-sensitive term at 0.6, acceptance on the repetitive prompt fell from 0.444 to 0.0. A token-set hash at 0.2-1.0 gave 0.0-0.11 across seeds 1-3, because each new token perturbs the next one and the text never cycles. So crc_amp is off by default. It is on for server and Conversation tests, and in a third regime of the losslessness test, which does not require acceptance.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "First-draft regression tests exercised the paths they target.",
+        "evidence": "Mutation runs showed three gaps, now fixed. (1) The Ctrl-C test used equal-length prompts, so the stale engine.pos exceeded len(seq) and the old Conversation reset by luck; prompt B is now longer. (2) The mid-burst close test stopped at k=29, before the toy text cycles; it now runs to k=44 and asserts that mid-burst closes occur. (3) The repetition-penalty losslessness test never made the penalty context after an accepted draft matter. A brute-force search with a mutated copy found 18 divergent configurations with vocab 16, and a small-vocabulary grid test now covers them.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Does prompt-lookup speculation pay off on real MoE models? Verifying k+1 tokens loads the union of their experts. Default stays speculative='none' until measured on real weights with 'hearth run --speculative ngram' or 'hearth bench'.",
+      "The token_ids extension for tokenizer-less servers and chat's max_tokens >= 1 (OpenAI's rule; legacy /v1/completions still accepts 0) are not yet in docs/PYTHON_API.md (see contract_issues in the gen-002 report)."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_runtime.py -q",
+    "python -m pytest tests/py/test_runtime.py -q -k compiled_abi   # compiles a hearth.h stub with scripts/hxcc.py into pytest's tmp dir; skips without a C toolchain",
+    "python -m pytest tests/py/test_runtime.py -q -k real   # real engine: python/hearth/lib/hearth.dll (or HEARTH_LIB) + hearth.synth.make_tiny; skips without the library",
+    "python governance/tools/mutate.py --file python/hearth/generate.py --lines 249-396 --max-mutants 40 --jobs 4 --seed 7 --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_runtime.py -k \\\"not compiled_abi\\\"\"",
+    "python governance/tools/mutate.py --file python/hearth/chat.py --lines 384-461 --max-mutants 30 --jobs 4 --seed 7 --test <same as above>",
+    "python governance/tools/mutate.py --file python/hearth/server.py --max-mutants 60 --jobs 4 --seed 7 --test <same as above>",
+    "python -m pytest tests/golden -q   # read-only maintainers' tests; run as a regression check",
+    "python -m hearth serve <model.hearth> --port 8080 [--speculative ngram] [--api-key KEY]"
+  ],
+  "measurements": [
+    {"metric": "runtime test suite", "value": 81, "unit": "tests passed (0 skipped; includes 5 real-DLL tests and the compiled ABI stub)", "conditions": "Windows 11, Python 3.13, numpy 2.2; python/hearth/lib/hearth.dll built by T08; ~19 s wall while other engineers ran builds/tests concurrently", "kind": "measured"},
+    {"metric": "mutation score generate.py (lines 249-396)", "value": 95.0, "unit": "% (seed 7, 40 mutants; seed 11: 97.5%)", "conditions": "governance/tools/mutate.py, test_runtime.py without compiled_abi", "kind": "measured"},
+    {"metric": "mutation score chat.py (lines 384-461)", "value": 100.0, "unit": "% (seeds 7 and 11, 20 scored mutants each)", "conditions": "as above", "kind": "measured"},
+    {"metric": "mutation score server.py", "value": 95.0, "unit": "% (seeds 7 and 11, 60 of 550 candidates each)", "conditions": "as above; all survivors are equivalent mutants or constants", "kind": "measured"},
+    {"metric": "golden invariant tests", "value": 21, "unit": "tests passed", "conditions": "tests/golden run read-only against the current tree and DLL", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "POSIX code paths in cli doctor (RAM via /proc/meminfo or sysconf, CPU flags via /proc/cpuinfo): checked by reading only, since no Linux/macOS machine is available.",
+    "Speculative decoding speed on real model weights is unmeasured (correctness is verified on the real DLL with a synthetic tiny model only)."
+  ]
+}

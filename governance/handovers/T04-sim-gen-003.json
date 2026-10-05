@@ -1,0 +1,138 @@
+{
+  "generation_id": "gen-003-sim-verifier-fixes-2",
+  "parent_generation": "gen-002-sim-verifier-fixes",
+  "timestamp": "2026-10-04T13:30:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T04-sim",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified (uncommitted, never committed): python/hearth/sim/{cache,core,cli,timing,trace}.py, tests/py/test_sim.py (91 -> 112 tests), docs/SIMULATOR.md (sec. 1, 3.2, 3.5, 4, 5, 8.4, 8.6, 9); new: governance/handovers/T04-sim-gen-003.json. Line endings of the edited files are LF (.gitattributes: * text=auto eol=lf)."
+  },
+  "constraints_touched": [
+    "INV-HONEST",
+    "INV-LOSSLESS-DEFAULT",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier finding (major): Belady was not an upper bound with the GPU expert tier, because _Belady.initial() warm-started VRAM keys that run_cache never lets into the cache. Fixed: make_policy passes the VRAM mask to _Belady, which sets first[vram] = INF. Belady is again the exact optimum of the relaxed problem over the non-VRAM keys.",
+        "evidence": "Reproduced first: the verifier's CLI command gave lru-layer 68.2% > belady 63.4%; after the fix it gives belady 76.3% >= every online policy (ran). New tests (ran, pass): test_belady_bounds_online_policies_with_a_vram_tier, with 90 small schedules where Belady == the exhaustive optimum of the non-VRAM sub-problem plus 60 larger bound-only schedules, all online policies x 2 settings; and test_belady_upper_bound_with_the_gpu_expert_tier_through_simulate, with the verifier's repro and a tiny shape with exactly 7 VRAM slabs, 5 seeds x 2 configs. Both fail on the gen-2 code (scratch copy, ran).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier finding (major): the LFU decay direction, the heat rescale, sampled-LFU victim choice and lru-layer partition sizing were untested. Now covered by exact tests: a hand-worked decay-1/2 vs decay-1 sequence; an exact-integer LFU reference over 1500-2000-token decay-1/2 traces (4-6 rescales, incl. a speculative schedule); a white-box check of the rescale threshold; the sampled victim distribution (uniform with 1 sample, plus the expected mixture with protected/held slabs); per-partition capacities with slots % L != 0 and per-layer hits on a cyclic trace.",
+        "evidence": "mutate.py on final code (ran): _LFU.tick (lines 487-496, seed 3) 0% (verifier) -> 88.9%. The verifier's second region set mapped to current lines (145-287, 389-418, 653-659, seed 5, 20 mutants) 65% -> 95.0%. Survivors are listed and argued equivalent in docs/SIMULATOR.md sec. 5. The tick mutants M0298/M0302/M0306 (inverted decay, rescale multiply, no rebuild) were also checked in scratch against the integer reference: all three detected.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier finding (minor, perf): a cache full of protected prefetches made every admission scan the whole cache. Held (prefetched, unused) slabs are now kept out of the LRU order (stamped, merged back at admission position on release) and out of the LFU heap. The demand last resort is a policy method that takes the oldest/coldest held slab. LFU memoises a repeated REJECT under the same prot set, and sampled mode still draws the same samples. All of this is result-identical to gen 2.",
+        "evidence": "Scratch harness (ran) compares the gen-2 snapshot of cache.py with the final one: 53 100 random run_cache configurations, 6 seeds. Policies lru/lru-layer/lfu (4 settings incl. sampled)/pinned/lfu-pinned/belady; prefetch off and (0.5,0), (0.8,3), (0,6), (0.5,64), (1,0); spec windows, VRAM and cold keys, skip rank, warm-up. 0 differ, about 163 000 last-resort evictions exercised. Harness sensitivity: a deliberately wrong LRU last resort gave 138 of 3540 differing. In-repo: test_held_prefetch_rules_match_a_naive_model (150 random op sequences vs a naive timestamp model; >100 last resorts and >100 rejects) and test_a_cache_full_of_held_prefetches_rejects_without_a_scan. Doc sec. 7 example outputs and the sec. 8.6/8.7 rows reproduce byte-identically (ran). Timing for kimi-k2 Prefetch(0.5,64) at 4 GiB, gen 2 -> gen 3: LRU 50.6 -> 7.9 s, sampled LFU 44.1 -> 15.1 s, exact LFU 21.6 -> 7.0 s (same session, noisy).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor findings fixed, each with a test that fails on gen-2 code (ran in a scratch copy): (a) a warm-up after which no step starts now raises ValueError, and the noisy warning counts measured tokens; (b) the CLI and simulate() reject negative --spec-k/--prefetch-extra/--prefetch, because Spec/Prefetch are always constructed and _as_prefetch(number) validates; (c) Spec.k becomes an int, and io_threads/lfu_samples too, with non-integral values rejected, warmup included; (d) calibrate() validates each point and names it; (e) Trace validates n_layers (0 or moe_layers..2^32-1); (f) a cache larger than the RAM left (the allocated slots, after the min/max clamps) makes Result.feasible False with an 'INFEASIBLE: cache' warning, flagged in every table; (g) SIMULATOR.md sec. 8.4 now says 1461 slots (23.9 GiB).",
+        "evidence": "tests: test_warmup_must_leave_a_measured_step, test_cli_rejects_bad_inputs_without_traceback (24 flag sets), test_simulate_rejects_bad_inputs (31 cases), test_integral_floats_are_normalised, test_calibrate_rejects_bad_measurements, test_trace_validates_n_layers, test_cache_beyond_free_ram_is_infeasible, test_prefetch_spec_forms_and_warning_boundaries. All 112 pass (ran, 22 s). On the gen-2 code, 14 of the then-111 tests failed, all of them tests of these findings or of the new interface.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Contributor tests for every changed region pass mutation testing.",
+        "evidence": "Final code, test command '{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py' (ran). cache.py: policy code 145-496 seed 3, 40 mutants, 87.5%; LFU admit/Belady/make_policy/run_cache loops seed 4, 40 mutants, 82.5%; tick 88.9%; verifier region set 95.0%. core.py changed lines seed 4, 24 mutants, 79.2% -> 95.8%. timing.py calibrate 100% (12). trace.py 80.0% -> 100% (10). cli.py changed lines: no mutable operators. All 15 remaining survivors are listed in SIMULATOR.md sec. 5 with the reason each is result-equivalent (stamp constants, performance-only shortcuts, an arbitrary tie rule, RNG-stream-only changes in the wrong-guess draw, an overwritten placeholder).",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "(gen 2) Belady upper-bounds every online policy whenever prefetch and skip_miss_rank are off.",
+        "evidence": "False with gpu='dense+experts': warm-started VRAM keys held Belady slots forever (verifier repro and 385/300-schedule scratch counts; reproduced here). Fixed in gen 3.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "(gen 2) The gen-2 mutation scores (cache.py 90%) meant the LFU/LRU policy internals were tested.",
+        "evidence": "Verifier: those runs covered only sampled regions; tick() scored 0% and the LRU/LFU-victim/partition regions 65%. Reproduced the 0%-class survivors with the new reference before writing tests.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Real routing skew/locality of Kimi/DeepSeek is still unknown; every sec. 8 number is SIMULATED on synthetic traces (kimi-k2/this-pc 0.6-1.7 tok/s prefetch off, 0.6-2.0 with prefetch at an assumed recall of 0.8).",
+      "Real recall of the engine's SHARED prefetch predictor; the simulator assumes none by default and uses 0.8 where labelled.",
+      "store.c also refuses prefetches whose victim is 'hot' and breaks LFU heat ties by last_seq then slot index (the simulator: by key, and sampled mode keeps the first of equal samples). Not modelled; documented in sec. 6. Model them once store.c is final.",
+      "Should the engine's LFU decay default be about 0.9 instead of 0.995 (sec. 8.4)? Needs real traces.",
+      "All timing scalars are uncalibrated until T09 runs calibrate()."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_sim.py -q",
+    "python -m ruff check python/hearth/sim tests/py/test_sim.py",
+    "python governance/tools/mutate.py --file python/hearth/sim/cache.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --max-mutants 40 --jobs 4 --seed 3 --lines 145-496",
+    "python governance/tools/mutate.py --file python/hearth/sim/cache.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --max-mutants 20 --jobs 4 --seed 5 --lines 145-287,389-418,653-659",
+    "python governance/tools/mutate.py --file python/hearth/sim/cache.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --max-mutants 40 --jobs 5 --seed 4 --lines 457-496,510-612,661-690,773-866",
+    "python governance/tools/mutate.py --file python/hearth/sim/core.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --max-mutants 24 --jobs 4 --seed 4 --lines 38-43,202-213,266-272,302-320,331-338,355-361   # likewise timing.py --lines 320-331, trace.py --lines 44-53",
+    "PYTHONPATH=python python -m hearth sim --model olmoe-1b-7b --vram-gib 3.0 --gpu dense+experts --cache-gb 0 --tokens 400 --zipf 1.2 --reuse 0.3 --seed 2 --compare-policies   # belady must be >= every online policy",
+    "PYTHONPATH=python python -m hearth sim --model kimi-k2 --hw this-pc --cache-gb 40 --compare-policies",
+    "PYTHONPATH=python python -m hearth sim --model kimi-k2 --hw this-pc --levers --markdown",
+    "PYTHONPATH=python python -m hearth sim --model kimi-k2 --tokens 2000 --sweep-cache 4,8,16,32,100,200   # 100/200 GiB rows flagged (INFEASIBLE) on this-pc",
+    "PYTHONPATH=python python -m hearth sim --model kimi-k2 --trace <recorded.hrtr> --cache-gb <GiB> --policy lfu --lfu-samples <engine samples>   # calibration against engine runs, then hearth.sim.calibrate([(Result, measured_tok_s), ...])"
+  ],
+  "measurements": [
+    {
+      "metric": "sim wall time, kimi-k2 2000 tokens, 5 online policies",
+      "value": 3.2,
+      "unit": "s",
+      "conditions": "this-pc, Python 3.13, numpy 2.2; Windows CPU load 47-85% from other engineers (noisy); 2.6 s measured earlier at lighter load",
+      "kind": "measured"
+    },
+    {
+      "metric": "sim wall time, kimi-k2 2000 tokens, belady",
+      "value": 0.68,
+      "unit": "s",
+      "conditions": "this-pc, same noisy conditions",
+      "kind": "measured"
+    },
+    {
+      "metric": "sim wall time, kimi-k2 2000 tokens, 4 GiB, Prefetch(0.5, 64), LRU",
+      "value": 7.9,
+      "unit": "s",
+      "conditions": "this-pc, paired run: gen-2 code 50.6 s then gen-3 code 7.9 s back to back, during a concurrent 5-job mutation run (noisy); sampled LFU 44.1 -> 15.1 s, exact LFU 21.6 -> 7.0 s; a later gen-3-only run gave 6.9 / 14.9 / 6.1 s",
+      "kind": "measured"
+    },
+    {
+      "metric": "tests/py/test_sim.py wall time (112 tests)",
+      "value": 21.2,
+      "unit": "s",
+      "conditions": "this-pc, CPU load 47-85% from other work (noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "Belady hit rate, olmoe-1b-7b, gpu dense+experts, 3 GiB VRAM, engine-minimum cache (verifier repro)",
+      "value": 76.3,
+      "unit": "%",
+      "conditions": "synthetic zipf 1.2 reuse 0.3 seed 2, 400 tokens; was 63.4% in gen 2 (below lru-layer 68.2%)",
+      "kind": "simulated"
+    },
+    {
+      "metric": "kimi-k2 decode speed, this-pc, LFU, all free RAM (42.8 GiB), prefetch off",
+      "value": 1.2,
+      "unit": "tok/s",
+      "conditions": "synthetic zipf 1.1 reuse 0.25 2000 tokens seed 0, Q4 experts, Q8 backbone, uncalibrated; unchanged from gen 2 (re-run, identical)",
+      "kind": "simulated"
+    },
+    {
+      "metric": "mutation score, python/hearth/sim/cache.py _LFU.tick",
+      "value": 88.9,
+      "unit": "%",
+      "conditions": "mutate.py seed 3, lines 487-496, 9 mutants; verifier measured 0% on gen-2 code; 1 equivalent survivor",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Calibration against engine measurements (tasks.json accept item 'calibrated against engine measurements') still cannot be done: no full engine run of a MoE model exists yet. calibrate()/retime() and the procedure in docs/SIMULATOR.md sec. 4 are ready for T09.",
+    "No real routing traces exist yet; every analysis number in docs/SIMULATOR.md sec. 8 is SIMULATED on synthetic traces."
+  ]
+}

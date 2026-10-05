@@ -1,0 +1,179 @@
+{
+  "generation_id": "gen-001-sim-core",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T14:25:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T04-sim",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new: python/hearth/sim/{__init__,__main__,hardware,trace,cache,timing,feasibility,core,report,cli}.py, tests/py/test_sim.py (53 tests), docs/SIMULATOR.md, governance/handovers/T04-sim-gen-001.json"
+  },
+  "constraints_touched": [
+    "INV-HONEST",
+    "INV-LOSSLESS-DEFAULT",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-VERIFY",
+    "INV-DET-2"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Belady (with bypass) as implemented is the exact offline optimum for single-request streams and upper-bounds every online policy on the same trace/budget.",
+        "evidence": "tests/py/test_sim.py::test_belady_is_exactly_optimal_on_small_streams (40 random streams vs exhaustive search) and test_belady_upper_bounds_every_online_policy (6 cache/spec configs) pass; ran locally.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Global LRU collapses to ~0 hits when the cache is smaller than one token's working set (L_moe*k) under cyclic layer access, while LFU keeps hot experts.",
+        "evidence": "test_lru_cyclic_pathology (olmoe shape, 64 slots < 128: LRU < 0.5%, LFU > 20%); SIMULATED kimi-k2 4-8 GiB: LRU 0% vs LFU 22-34%; kimi-k3 on this-pc (1462 slots < 1472 working set): LRU 8% vs LFU 39%.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The stream-dedupe synthetic sampler equals successive sampling (Gumbel-top-k) without replacement.",
+        "evidence": "test_synthetic_matches_successive_sampling: max marginal deviation < 0.02 at 30k tokens; ad-hoc check 0.0025-0.006 at 40k tokens.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The simulator meets the speed requirement: 2000-token Kimi-K2 trace through all online policies well under a minute.",
+        "evidence": "Measured on this-pc: 5 online policies 2.7 s total when quiet, 9.6 s at 99% CPU load from other engineers; Belady 0.6-2.6 s.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "calibrate() recovers known calibration scalars from (Result, tok/s) points.",
+        "evidence": "test_calibrate_recovers_known_scalars: rms log error < 0.01, io_eff within 10%.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "tests/py/test_sim.py detects behaviour-changing mutations of the simulator core.",
+        "evidence": "governance/tools/mutate.py (30 mutants/file, seed 1): cache 86.7%, timing 86.7%, trace 93.3%, core 86.7%; every survivor inspected and equivalent/behaviour-neutral. Mutation testing also exposed a Nelder-Mead stall in calibrate(), fixed with restarts.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Speculative decoding (prompt lookup, batched verification) speeds up storage-bound MoE decode in general.",
+        "evidence": "SIMULATED kimi-k2/this-pc: k=4 alpha=0.6 gives 0.71x at reuse 0.25; it only helps when consecutive tokens share experts (reuse >= ~0.5 at alpha 0.8, ~0.75 at alpha 0.6) or when DRAM-bound (kimi-k3 workstation 1.70x at alpha 0.8). Verification loads the union of the window's experts.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "LFU with the engine's default decay 0.995 dominates LRU whenever routing is skewed at all.",
+        "evidence": "SIMULATED kimi-k2/this-pc with cache > per-token working set: at zipf 0 / 0.5 with reuse 0.25, LFU(0.995) hit 12% / 25% vs LRU 31% / 34%; decay 0.9 matches LRU there and stays within 2 points of 0.995 at zipf 1.1.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Next-layer prefetch recovers most storage stall when storage is the bottleneck.",
+        "evidence": "SIMULATED kimi-k2/this-pc: recall 0.8 gives only 1.14x; 79% of prefetches arrive late because the single drive is saturated by demand reads; prefetch only fills storage idle time during attention.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Real routing skew (Zipf exponent) and temporal locality of Kimi/DeepSeek models are unknown until engine traces are recorded; SIMULATED kimi-k2/this-pc spans 0.6-1.7 tok/s over zipf 0-1.4.",
+      "Should the engine's default LFU heat decay be ~0.9 instead of 0.995? Needs real traces; hx_store_opts.heat_decay is not exposed in hearth_options.",
+      "Real next-layer predictor recall for the engine's two-step ('shared') prefetch; the sim takes recall as an input.",
+      "All timing scalars are uncalibrated (overhead 1 ms/step, 20 us/layer, efficiencies 1.0) until T09 fits them with calibrate()."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_sim.py -q",
+    "python -m ruff check python/hearth/sim tests/py/test_sim.py",
+    "python governance/tools/mutate.py --file python/hearth/sim/cache.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --max-mutants 30 --jobs 4 --seed 1   # likewise timing.py, trace.py, core.py",
+    "PYTHONPATH=python python -m hearth.sim --model kimi-k2 --hw this-pc --cache-gb 40 --compare-policies",
+    "PYTHONPATH=python python -m hearth.sim --model kimi-k2 --hw this-pc --levers --markdown",
+    "PYTHONPATH=python python -m hearth.sim --model kimi-k3 --hw laptop-16gb --feasibility",
+    "PYTHONPATH=python python -m hearth.sim --model kimi-k2 --trace <recorded.hrtr> --cache-gb <GiB> --policy lfu --lfu-samples <engine samples>   # calibration against engine runs, then hearth.sim.calibrate([(Result, measured_tok_s), ...])"
+  ],
+  "measurements": [
+    {
+      "metric": "sim wall time, kimi-k2 2000 tokens, 5 online policies",
+      "value": 2.7,
+      "unit": "s",
+      "conditions": "this-pc, Python 3.13, numpy 2.2, machine mostly idle; 9.6 s at 99% CPU load from concurrent builds",
+      "kind": "measured"
+    },
+    {
+      "metric": "sim wall time, kimi-k2 2000 tokens, belady",
+      "value": 0.6,
+      "unit": "s",
+      "conditions": "this-pc, idle-ish; 2.6 s under load",
+      "kind": "measured"
+    },
+    {
+      "metric": "tests/py/test_sim.py wall time (53 tests)",
+      "value": 20.2,
+      "unit": "s",
+      "conditions": "this-pc, concurrent load from other engineers (10-25 s observed)",
+      "kind": "measured"
+    },
+    {
+      "metric": "kimi-k2 decode speed, this-pc, LFU, 42.8 GiB cache",
+      "value": 1.2,
+      "unit": "tok/s",
+      "conditions": "synthetic zipf 1.1 reuse 0.25 2000 tokens seed 0, Q4 experts, Q8 backbone, uncalibrated; storage-bound",
+      "kind": "simulated"
+    },
+    {
+      "metric": "kimi-k2 DRAM-bandwidth ceiling, this-pc (all experts in DRAM)",
+      "value": 2.62,
+      "unit": "tok/s",
+      "conditions": "Q8 backbone 11.5 GB + 480 slabs 11.2 GB per token at 60 GB/s",
+      "kind": "simulated"
+    },
+    {
+      "metric": "kimi-k3 decode speed, this-pc, LFU, 23.9 GiB cache",
+      "value": 0.36,
+      "unit": "tok/s",
+      "conditions": "synthetic zipf 1.1 reuse 0.25, Q4 experts, Q8 backbone, uncalibrated; storage-bound",
+      "kind": "simulated"
+    },
+    {
+      "metric": "kimi-k3 decode speed, workstation-128gb-2nvme, LFU",
+      "value": 0.95,
+      "unit": "tok/s",
+      "conditions": "synthetic zipf 1.1, 2x12 GB/s NVMe, 55 GB/s DRAM; DRAM-bound",
+      "kind": "simulated"
+    },
+    {
+      "metric": "kimi-k2 this-pc speed-up from a second NVMe drive",
+      "value": 1.61,
+      "unit": "x",
+      "conditions": "levers table, synthetic zipf 1.1",
+      "kind": "simulated"
+    },
+    {
+      "metric": "mutation score python/hearth/sim/cache.py",
+      "value": 86.7,
+      "unit": "%",
+      "conditions": "mutate.py, 30 sampled mutants, seed 1; 4 survivors all analysed as equivalent (was 63.3% before targeted tests)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score python/hearth/sim/timing.py",
+      "value": 86.7,
+      "unit": "%",
+      "conditions": "mutate.py, 30 sampled mutants, seed 1; 4 equivalent survivors (was 60.0%)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score python/hearth/sim/trace.py",
+      "value": 93.3,
+      "unit": "%",
+      "conditions": "mutate.py, 30 sampled mutants, seed 1; 2 equivalent survivors (was 56.7%)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score python/hearth/sim/core.py",
+      "value": 86.7,
+      "unit": "%",
+      "conditions": "mutate.py, 30 sampled mutants, seed 1; 4 equivalent survivors (was 50.0%)",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Calibration against engine measurements (tasks.json accept item 'calibrated against engine measurements') cannot be done yet: the engine (T06/T08) is not built. calibrate()/retime() and the procedure in docs/SIMULATOR.md sec. 4 are ready for T09.",
+    "No real routing traces exist yet; every analysis number in docs/SIMULATOR.md sec. 8 is SIMULATED on synthetic traces."
+  ]
+}

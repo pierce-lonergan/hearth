@@ -1,0 +1,86 @@
+{
+  "generation_id": "gen-001-modelfile-store",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T15:40:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T06-store",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new: engine/src/{modelfile.c (832), store.c (864)}, engine/tests/{test_modelfile.c (1459), test_store.c (1473)}, governance/handovers/T06-store-gen-001.json"
+  },
+  "constraints_touched": ["INV-FMT", "INV-SAFE", "INV-DET-1", "INV-DEP", "INV-DATA", "INV-HONEST", "INV-VERIFY"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {"claim": "modelfile.c parses every container written by python/hearth/format.py exactly as ContainerReader + apply_defaults does (config incl. defaults, tensor directory and bytes, expert entries, distinct-slab region size).",
+       "evidence": "Scratch cross-check (test_modelfile --dump vs ContainerReader): synth.make_tiny for qwen3_moe/olmoe/mixtral/qwen2_moe/deepseek_v3 x F32/F16/BF16/Q8/Q4 = 25/25 agree; synth.make_shaped with physical_experts=3 (aliased slabs, GQA and MLA+dense layer+shared expert) 2/2 agree. Q8/Q4 synthesis used a scratch DLL built from quant.c only (T08's api.c does not exist yet).",
+       "verdict": "CONFIRMED"},
+      {"claim": "The reader never crashes or reads out of bounds on malformed input and rejects every structurally invalid variant with a message (INV-FMT, INV-SAFE).",
+       "evidence": "test_modelfile: 200 random valid containers round-tripped field by field (load_dense 0/1), then ~5,000-9,000 variants per run (truncation at every section/entry/tensor/slab boundary +-1 and random points; preamble huge/overflowing counts and offsets; tensor and expert entry misalignment, overlap with sections/tensors/slabs, out-of-range, bad dtype/ndim/shape/name/duplicates; metadata bad types, bad UTF-8 (overlong, surrogate, >U+10FFFF), length overflows, missing required keys, inconsistent dims; random byte flips). Clean under MSVC /fsanitize=address (seeds 4-8, up to 8983 variants) and gcc 13.3 -fsanitize=address,undefined with LeakSanitizer (WSL2).",
+       "verdict": "CONFIRMED"},
+      {"claim": "Every slab the store hands out holds the file's bytes for that (layer, expert), under concurrency, and stays intact until released.",
+       "evidence": "test_store hashes each slab at acquire and again (via a second acquire) right before release: 96 configurations (LRU/LFU x 1,2,3,4,8,16 readers x min/min+3/40/all slots x direct/buffered, 1-4 caller threads), ~350k random acquire/try_acquire/release/prefetch/tick/wait_any operations per run, mixed-dtype slabs (8-48 KiB) with ~15% aliased entries. 0 failures over seeds 1-5 and 21, also under MSVC ASan and gcc ASan+UBSan.",
+       "verdict": "CONFIRMED"},
+      {"claim": "No deadlock at the minimum slot count (2*top_k + n_io + 2) with all top-k of a layer demanded at once while the previous layer's top-k is still held.",
+       "evidence": "min_slots_burst: 1/2/4/16 readers x LRU/LFU, 60 tokens x 5 MoE layers, with prefetch noise, under a 60 s no-progress watchdog.",
+       "verdict": "CONFIRMED"},
+      {"claim": "A caller that demands more experts than there are slots (batch union) and then blocks in acquire or wait_any on a late one would deadlock if demanded-but-uncollected slabs stayed protected; dropping those holds when a blocked caller finds the store starved with nothing in flight (and waking readers at tick) removes the deadlock.",
+       "evidence": "overcommit test (80 experts into 11-26 slots; reverse-order blocking acquire; tick then busy-poll of the queue head; wait_any-only polling of the last expert). Scratch builds with each of the three fixes removed hang in exactly that phase (watchdog fires after 60 s); the real build passes.",
+       "verdict": "CONFIRMED"},
+      {"claim": "Global LRU collapses under cyclic layer access when the cache is smaller than one token's working set; LFU keeps a substantial hit rate on Zipf-skewed routing.",
+       "evidence": "test_store policy check (synthetic trace): 8 MoE layers x top-4 = 32 slabs/token, 16-slot cache, Zipf(1.2) per layer, 800 tokens: LRU hit rate 0.000, LFU 0.258 (asserted: LRU < 0.05, LFU > 0.20 and > 4x LRU).",
+       "verdict": "CONFIRMED"},
+      {"claim": "Reads are spread over mirrors and non-identical mirrors are refused.",
+       "evidence": "A mirror differing only in the last 8 bytes of one slab (invisible to the open-time spot check): over 60 forced re-reads that slab came 24-30 times from the primary and 30-36 times from the mirror. Mirrors differing in size, preamble, metadata, tensor directory, expert directory, first slab page or a mid-file slab page are rejected at open.",
+       "verdict": "CONFIRMED"},
+      {"claim": "Contributor tests detect breakage (governance/tools/mutate.py, seed 1).",
+       "evidence": "Final sources: store.c 65.0% (80 sampled: 37 killed, 15 detected as hangs, 28 survived), modelfile.c 80.0% (60 sampled: 45 killed, 3 timeouts, 12 survived). Every survivor reviewed: leak/destroy-only (free/hx_mutex_destroy removed; MSVC ASan has no leak checker, the gcc LSan run is clean), out-of-memory and SIZE_MAX paths, log/message-only lines, equivalent tie-breaks/sentinels/redundant guards, mirror retry rotation (needs a read that fails on only one byte-identical copy). Earlier rounds found real gaps (holds, protection order, prefetch eviction, mirror header comparison, pin tie order, alignment-only slab errors, UTF-8 overlongs, rope_inv_freq shape) which were then covered.",
+       "verdict": "CONFIRMED"}
+    ],
+    "hypotheses_falsified": [
+      {"claim": "Fixed scratch file names in %TEMP% are fine for the C tests.",
+       "evidence": "The first store mutation run executed test_store in 4 parallel jobs that clobbered each other's container ('file not found' failures); that run's score was discarded. Scratch names now carry a per-process tag and HEARTH_MUTATION_TMP is preferred.",
+       "verdict": "REJECTED"},
+      {"claim": "Holding demanded slabs until collected (or token end) is enough to prevent eviction thrash without risking deadlock.",
+       "evidence": "Not for callers that demand more than fits and block on a late expert (see overcommit ledger entry); holds now also drop when a blocked caller finds the store starved.",
+       "verdict": "REJECTED"}
+    ],
+    "open_questions": [
+      "hx_store_acquire returns NULL after 3 failed read attempts (a slab past EOF / I/O error), contrary to the header's 'never NULL for valid ids'; try_acquire on such an expert keeps returning NULL and wait_any returns at once when nothing else is pending, so a polling engine loop would spin. Needs a contract decision (see contract_issues).",
+      "Per-layer canonical tensor shapes/dtypes (FORMAT 4.1 table) are NOT validated by modelfile.c, only rope_inv_freq; model.c (T08) must check every tensor it binds or out-of-bounds reads are possible on crafted files.",
+      "Dense-region load uses up to 4 threads of 64 MiB unbuffered reads; its throughput on a multi-GB backbone was not measured.",
+      "Benchmark peak for 2.39 MiB slabs is at 2 readers (7.0 GB/s) and drifts to ~6.0 GB/s at 4-16; whether that is the SSD or the overlapped-handle path was not investigated."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o test_modelfile.exe engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_modelfile.c   # add -- --quick for ~1 s, --seed N, --iters N (fuzz variants)",
+    "python scripts/hxcc.py --platform --run -o test_store.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c   # add -- --quick; the two 'giving up after 3 read attempts' errors in the output are expected",
+    "python scripts/hxcc.py --asan --debug --platform --run -o test_modelfile_asan.exe <same sources as above>   # MSVC ASan: put VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 (clang_rt.asan_dynamic-x86_64.dll) on PATH",
+    "python scripts/hxcc.py --asan --debug --platform --run -o test_store_asan.exe <same sources as above>",
+    "<build dir>/test_store.exe --bench [--gib 6] [--dir D]   # writes ~6 GiB per slab size into the data dir with unbuffered writes, prints the GB/s table, deletes the files (~20 s)",
+    "<build dir>/test_modelfile.exe --dump <file.hearth>   # JSON of what the C reader parsed, for cross-checking with python/hearth/format.py",
+    "Linux (WSL2 gcc 13.3): gcc -std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -O2 -Iengine/include -Iengine/src engine/src/modelfile.c engine/src/store.c engine/src/quant.c engine/src/platform_posix.c engine/tests/test_store.c quant_avx2.o quant_avx512.o -lm   (quant_avx*.o compiled with their -m flags; same for test_modelfile.c; add -O1 -fsanitize=address,undefined for the sanitizer run)",
+    "python governance/tools/mutate.py --file engine/src/store.c --test \"python scripts/hxcc.py --platform --run -o t06mut_store{job}.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c -- --quick\" --max-mutants 80 --jobs 4 --seed 1",
+    "python governance/tools/mutate.py --file engine/src/modelfile.c --test \"python scripts/hxcc.py --platform --run -o t06mut_mf{job}.exe engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_modelfile.c -- --quick\" --max-mutants 60 --jobs 4 --seed 1"
+  ],
+  "measurements": [
+    {"metric": "cold demand-read throughput, direct I/O, 2.39 MiB Q4 slabs (Qwen3-30B-A3B expert 2048x768), readers 1/2/4/8/16", "value": 7.01, "unit": "GB/s (peak, 2 readers)", "conditions": "test_store --bench, Samsung 990 PRO 2TB, Ryzen 9 9950X, Windows 11; 5.98 GiB synthetic container, random order, whole file per point; two runs: 4.82/7.01/6.48/6.08/5.88 and 4.62/7.02/6.03/6.00/5.98 GB/s; other engineers' builds/mutation jobs running (noisy); synthetic weights", "kind": "measured"},
+    {"metric": "cold demand-read throughput, direct I/O, 22.3 MiB Q4 slabs (DeepSeek-V3/Kimi-K2 expert 7168x2048), readers 1/2/4/8/16", "value": 6.78, "unit": "GB/s (peak, 8 readers)", "conditions": "same machine and caveats; 5.58 GiB container; runs: 5.80/6.10/6.23/6.78/6.43 and 5.91/5.97/6.31/6.73/6.45 GB/s", "kind": "measured"},
+    {"metric": "cold demand-read throughput, buffered I/O, 2.39 MiB slabs, readers 1/2/4/8/16", "value": 6.12, "unit": "GB/s (peak)", "conditions": "each point reads a disjoint never-read fifth (1.2 GiB) of a file written unbuffered; runs: 2.42/4.60/6.02/5.84/6.12 and 2.31/4.73/6.17/6.14/6.00 GB/s; noisy", "kind": "measured"},
+    {"metric": "cold demand-read throughput, buffered I/O, 22.3 MiB slabs, readers 1/2/4/8/16", "value": 6.95, "unit": "GB/s (peak)", "conditions": "disjoint 1.11 GiB fifths; runs: 2.65/5.03/6.49/6.29/6.44 and 2.63/4.77/6.10/6.69/6.95 GB/s; noisy", "kind": "measured"},
+    {"metric": "single-reader direct read latency (reader busy time per slab)", "value": 0.5, "unit": "ms per 2.39 MiB slab", "conditions": "same bench; 4.0 ms per 22.3 MiB slab", "kind": "measured"},
+    {"metric": "unbuffered sequential write of the benchmark container (test writer)", "value": 2.2, "unit": "GB/s", "conditions": "64 MiB pwrite chunks, single thread, including pseudo-random fill and hashing", "kind": "measured"},
+    {"metric": "LFU vs LRU hit rate, cyclic layer access, cache 16 slots < 32 slabs/token, Zipf(1.2) routing", "value": 0.258, "unit": "hit rate (LFU); LRU 0.000", "conditions": "test_store policy check, synthetic trace, 800 tokens, first 20% excluded", "kind": "measured"},
+    {"metric": "mutation score store.c", "value": 65.0, "unit": "percent", "conditions": "80 sampled mutants, seed 1, test_store --quick; survivors reviewed (ledger)", "kind": "measured"},
+    {"metric": "mutation score modelfile.c", "value": 80.0, "unit": "percent", "conditions": "60 sampled mutants, seed 1, test_modelfile --quick; survivors reviewed (ledger)", "kind": "measured"},
+    {"metric": "test runtime test_modelfile / test_store (full)", "value": 4.0, "unit": "s (modelfile); store 6-14 s", "conditions": "MSVC /O2 on a loaded machine; --quick ~1 s / ~3 s", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "hx_store_acquire can return NULL for a valid id (unrecoverable read error after 3 attempts) although hx_store.h says it never does; reported as a contract issue rather than hidden (no zero-filled slab is ever returned).",
+    "POSIX build verified on Linux (WSL2 gcc 13.3) only; macOS/BSD not compiled. The Linux direct_io configurations ran against /tmp in WSL2, but whether O_DIRECT was granted or silently fell back to buffered was not checked.",
+    "Mirror read-error failover (retry on the next copy) is implemented but not exercised: it needs a read that fails on one byte-identical copy only."
+  ]
+}

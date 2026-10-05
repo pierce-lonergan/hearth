@@ -1,0 +1,143 @@
+{
+  "generation_id": "gen-002-kernels-nan-canon-mutation",
+  "parent_generation": "gen-001-kernels",
+  "timestamp": "2026-10-04T15:35:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T02-kernels",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified (all still untracked, never committed): engine/src/quant.c, engine/src/quant_avx2.c, engine/src/quant_avx512.c, engine/tests/test_quant.c; new: governance/handovers/T02-kernels-gen-002.json"
+  },
+  "constraints_touched": [
+    "INV-DET-1",
+    "INV-DET-2",
+    "INV-DET-3",
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier minor finding 'NaN outputs not bit-identical' was real and is fixed: every kernel (scalar, AVX2, AVX-512; all five dtypes; tiles and remainder paths) stores a NaN result as the canonical quiet NaN 0x7fc00000, so outputs are memcmp-identical across ISA, T, row range and thread split including NaNs (INV-DET-1/2/3).",
+        "evidence": "Reproduced first with a scratch program (F32 5x16, w[3]=NaN 0x7fc00123, x[3]=NaN 0x7fc00456, x[9]=+inf): before the fix scalar gave 7fc00123 for all rows, AVX2/AVX-512 gave 7fc00456 for rows 0-3 (4-row tile) and 7fc00123 for row 4; after the fix all ISAs/T give 7fc00000. Fix: q_canon() in quant.c scalar stores, canon4/canon8 (AVX2 blendv) and canon4/canon16 (AVX-512 masked move) before every store. New test_nonfinite(): 400 cases (150 with --small) of raw-bit weights (NaN with arbitrary payload/sign, inf, subnormal f32/f16/bf16 values; Q8/Q4 blocks with NaN/inf/subnormal scales) and NaN/inf/huge activations; checks ISA identity, batched == single, random row splits == whole, every NaN == 0x7fc00000, scalar == NUMERICS reference, no writes outside rows: 71237 NaN outputs, 0 failures. Scratch 4000-case fuzz (10 x test_nonfinite with another seed): 0 failures. Mutants that remove canonicalisation (scalar only, AVX2 only, AVX-512 16-row tile only, AVX-512 4-row tile only, AVX2 tree only, all at once = gen-1 behaviour) are all killed. dumpbin /disasm of the /O2 objects: 0 vfmadd/vfmsub/vfnmadd/vfnmsub in quant.obj, quant_avx2.obj, quant_avx512.obj.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier major finding (contract behaviour untested) was real; every listed mutant is now killed by test_quant.",
+        "evidence": "All 17 reproduced as survivors of the gen-1 test first, then killed by the new test (scratch harness building a mutated copy of engine/): hx_act_prepare inverted / returns 0 for x / returns 0 for act (act_prepare checks: pointer identity, bytes == act_quantize_q8, no write past n/64 blocks, float dtypes never touch act); n_rows<0 || T<0 -> && (each bad argument alone); !W||!X||!Y -> !W&&!X||!Y (crashes on NULL W: killed) and -> return 0; I32 dequant +1 and loop never runs (I32/U8 dequant bit patterns incl. INT32_MIN/MAX, 123456789 -> 0x4ceb79a3); Q8 x/d -> x*(1/d) (test_q8_ties: 12 f16-exact non-power-of-two scales, amax = 127*d, x = (k+0.5)*d: 61 wrong under the mutant); Q4 NaN cleaning removed (test_quant_nan: 24 blocks per dtype memcmp-equal to the block with the NaN replaced by 0.0f, incl. signalling and negative NaNs and an all-NaN block; 22/24 differ under the mutant); HEARTH_ISA=avx2 mapped to AVX-512 (in-process check when HEARTH_ISA is set, plus 12 child runs of the test binary with HEARTH_ISA = scalar/avx2/AVX512/Avx2/auto/empty/bogus/avx/avx2x/scalar2 and with a feature masked); avx2/avx512 tables returning NULL (test_isa_tables: on x86-64 both tables must be compiled in, available iff hx_cpu_features() reports the bits, hearth_cpu_isa() = best, ISAs under test = 1 + has2 + has512); the -2 path (test_isa_gating clears each of avx2/fma/f16c/avx512f/bw/vl/vnni in turn and checks hx_kernels_for, hearth_matmul -2 and hearth_cpu_isa). The tautological Q4 NaN assertion was removed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Mutation testing (governance/tools/mutate.py, ALL candidates, seed 2, test = test_quant --no-bench --small) after the test work: quant.c 92.0% (933 killed + 8 timeouts of 1023; 82 survived), quant_avx2.c 90.1% (402 of 446; 44 survived; 8 build errors excluded), quant_avx512.c 88.8% (490 of 552; 62 survived; 13 build errors excluded). gen-1 test on quant.c: 88.5% on the same full set (verifier: 76% on a 50-mutant sample, seed 7). Every survivor is classified below; none is a known missing test.",
+        "evidence": "Reports: <data dir>/mutation/engine_src_quant_c-s2-20261004-112418-mrfa81f4f0, engine_src_quant_avx2_c-s2-20261004-110351-mrd4d9845b, engine_src_quant_avx512_c-s2-20261004-110727-mr1dbeec61 (mutation.json/.md; ids and line numbers refer to the files as handed over). ASan supplement (same command with hxcc --asan, ASan runtime DLL on PATH) on the lines of the out-of-bounds survivors: quant.c lines 30,33,40,62,224,363,611,619,622 -> 44/44 killed; quant_avx2.c lines 59,85,86,232,241,242,271,272,274,291,292,323 -> 46/57 killed (the 11 left are the array-enlarging/tile-step equivalents listed below plus M0322); quant_avx512.c lines 83,225,267,284,298,315,319,322,329,352 -> 28/39 killed, lines 327,337 -> 8/8 killed. Two mutants are nondeterministic in the plain build (avx512 M0513 and M0448 swapped killed/survived between two runs; both read past a buffer and are killed deterministically under ASan; quant.c M0718 likewise races, see leak class).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "quant.c survivors (82), all equivalent or only observable with ASan / leak tooling. Boundary-equivalent (both sides give the same result at the boundary): M0081,M0295,M0319,M0387,M0939 (n<=0 -> n<0: n==0 yields the same empty result), M0124,M0416 (amax update on >=), M0132,M0137,M0155,M0160,M0428,M0429 (clamps at exactly -127/127/-8/7), M0703 (t<=rem?t:rem is still min(t,rem)), M0822 (T == SIZE_MAX/ab: a SIZE_MAX-byte allocation fails either way), M0956,M0962 (softmax max loop from 0 / on >=). Equivalent by construction: M0061,M0066 (f16 saturation masks: inf has an even mantissa, bit 0 of 0x7bff already set, NaN scales never reach it with odd mantissa), M0217 (sizeof q4_div[1]), M0245,M0248 (duplicate-scale skip only saves work; a duplicate scores equal and ties keep the earlier), M0263 (best_sqq==0 means every scale quantizes to 0; refit cannot lower the error), M0289 ((q-8)<<4 == (q+8)<<4 mod 256), M0558 (return 2 is truthy), M0577 (invalid ISA reaches hx_kernels_for's default: NULL anyway), M0589 (loop still stops at the first mismatch or at both NULs), M0593 ('Z' occurs in no keyword), M0852,M0853,M0896,M0897 (16-chunk loop vs tail loop compute the same lane assignment). Equivalent by measurement (independent Python reference of the documented algorithm, 1024 heavy-tailed + 192 pinned blocks): M0151,M0152,M0153 (divisors -10.5/-11/-12 sign-flipped: 0 blocks change), M0234 (sx2 sign flipped = constant shift of every candidate error: 0 blocks change), M0269 (accept an equal-error refit: 0 exact ties occur). Thread-count only (output is thread-count independent by design; checked with 1/2/3/5/7/auto/1000 threads incl. a 300x57344 matrix): M0663-M0672, M0675, M0678, M0679-M0685, M0688-M0694, M0710 (a row quantized twice, same bytes), M0713, M0716, M0722 (jobs run inline via the fallback). Leak / unjoined thread (same bytes; not observable without leak tooling, MSVC ASan has no leak checker): M0717, M0718, M0719, M0727 (a created thread is treated as failed: its job is rerun inline and the thread is never joined; can race with a later free of dst), M0845 (activation buffer leaked). Out-of-bounds by one, killed by the ASan run: M0037,M0040,M0046,M0057 (memcpy 5 bytes), M0275 (q[64]), M0460,M0885,M0932 (tree loop j<=s reads L[16]; L[0] is still correct), M0904,M0907 (dot16 chunk writes L[16]).",
+        "evidence": "Per-mutant reasoning above; the measured class uses scratch q4ref.py/q4probe.py (independent numpy/pure-Python implementation of the quant.c Q4 comment, which reproduces both pinned Q4 hashes bit for bit). ASan kills as listed in the previous entry.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "quant_avx2.c survivors (44): 23 equivalent, 20 out-of-bounds killed by ASan, 1 undetectable UB. Equivalent: M0085,M0087,M0323,M0369,M0371,M0373,M0375,M0407 (stack arrays enlarged 8->9), M0201,M0202,M0205 (float 4-row tile bound/step: rows go to the bit-identical single-row path or are recomputed), M0291 (smask lane 7 is never stored when nr<8), M0308 (T==1 fast path disabled: general path is bit-identical), M0347,M0430 (mask store with an all-ones mask), M0352,M0356 (empty extra token chunk / same tn), M0434 (extra empty tile, nr=0: no stores), M0437 (r+=7: overlapping tiles recompute identical rows), M0440,M0443,M0446 (same nr, or all-ones mask), M0452 (q4 flag 2 is truthy). ASan-killed: M0021 (memcpy 3 bytes into uint16), M0084,M0086,M0368,M0370,M0372,M0374,M0406 (arrays shrunk to 7, index 7 used), M0294,M0297,M0326,M0329,M0381,M0384,M0410,M0413 (loops to 8 inclusive), M0300,M0302,M0303,M0304 (masked lanes load rows past the tile/matrix). Undetectable on MSVC: M0322 (s[8]->s[7] in the decode path; the array is kept in registers so /O2 and ASan code are both correct; GCC/Clang -Warray-bounds would flag it).",
+        "evidence": "Reports listed above; ASan supplement report engine_src_quant_avx2_c-s2-20261004-111014-mr738271cd.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "quant_avx512.c survivors (62): 50 equivalent, 10 out-of-bounds killed by ASan, 2 undetectable UB. Equivalent: M0026,M0028,M0030,M0032 (red_quad1 idx moved within the same 128-bit lane: after the two in-lane shuffle-adds all four elements of a lane hold that row's total), M0033-M0053 (idx[4..15]: only the low 128 bits are used), M0067,M0353,M0383,M0408,M0469,M0520 (arrays enlarged), M0124 (tail-mask shift count n+n16 == rem mod 32; C UB, x86 masks shift counts, so equivalent on this target), M0131,M0132,M0135 (float 4-row tiling), M0258 (a->q - 0), M0374 (decode fast path off), M0390,M0394,M0452,M0456 (empty extra token chunk / same tn), M0537,M0538,M0541 (16-row tile bound/step: rows recomputed by the identical 4-row path), M0545 (extra empty 4-row tile), M0548 (r+=3 overlap), M0551,M0554,M0557 (same nr, or mask bits >= 4 ignored for __m128), M0563 (q4 flag 2). ASan-killed: M0066 (v[3]), M0255 (memcpy 3), M0352 (x[3] in q16_step), M0382 (u[15]), M0438,M0441 (rp[4]), M0444,M0446,M0447 (masked lanes load rows past the tile/matrix), M0513 (token loop t<=tn reads the activation block after the last token; also killed in the first plain run). Undetectable on MSVC: M0461 (acc[tn] zeroed one past when tn=8), M0519 (x[4]->x[3] in qtile4), both register-allocated.",
+        "evidence": "Reports listed above; ASan supplements engine_src_quant_avx512_c-s2-20261004-111119-mrb4bf64fb and -112858-mrabb2a536 (line 327: M0513 killed).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The authoritative Q4 quantizer matches its documented algorithm (quant.c comment) exactly, now also on heavy-tailed data where clipping candidates and refit iterations decide more blocks.",
+        "evidence": "Scratch q4ref.py (numpy float32/float16 RNE + Python doubles, written from the comment, not from the C code's structure) reproduces PIN_Q4 0x5ed717f72d36fb0c (det_fill 24x512, seed 1) and the new PIN_Q4_TAILS 0xb020847e5d2b0807 (det_fill_tails 64x1024, seed 3, libm-free: 4-uniform sum / (0.125 + |2-uniform sum|)). New test_q4_search: 1500 (--small) / 6000 blocks of outlier, Laplace, Student-t(3), half-zero and coarse-grid data are never worse than any documented candidate scale (error summed directly in double, tolerance 1e-9 relative); the refit beats every candidate in 97% of blocks. Magnitude ties: (7,-7,0..) -> d=0xbc00, (-7,7,0..) -> d=0x3c00, nibbles 0x81 0x8f then 0x88. Q4 RMSE on N(0,1) unchanged: 0.089591 vs absmax/7 0.107569.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "hearth_matmul no longer risks a size_t wrap of the activation buffer (INV-SAFE hardening): n_cols up to 2^40 and T up to INT_MAX are individually valid, and ab*T could wrap (to exactly 0 for Q4/Q8, n_cols=2^40, T=2^30), giving a tiny allocation and a heap overflow. It now returns -3 when T > SIZE_MAX/ab.",
+        "evidence": "test_sizes: hearth_matmul(Q8, 2^40 cols, T=INT32_MAX) and (Q4, 2^40 cols, T=2^30) both return -3 without allocating or reading X. Mutants that weaken the guard (M0824 SIZE_MAX/ab -> SIZE_MAX*ab) are killed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Builds and correctness on the final code: MSVC 14.44 /W3 /fp:precise warning-free; test_quant --no-bench passes in /O2 (117681 checks, 0 failures), /Od, and /fsanitize=address (full size, no ASan report), also with HEARTH_ISA=avx2 and =scalar set for the parent; kernel golden test passes against a kernels-only DLL.",
+        "evidence": "Commands in procedures. HEARTH_LIB=<data dir>/build/hxcc/hearth_kernels.dll python -m pytest tests/golden/test_golden_invariants.py -k kernel_isa_and_batch_identity -q -> 5 passed; check_golden.py -> golden lock OK. tests/py (reference, format, convert) with that DLL: 103 passed, 1 failed (see falsified hypothesis on test_q4_conversion_close_to_f32[deepseek_v3]).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "NaN canonicalisation has no measurable throughput cost (one compare + blend/masked move per stored vector).",
+        "evidence": "Interleaved A/B against a scratch build with canonicalisation removed, test_quant --bench-only --small, 3 rounds each, machine shared (~33% CPU busy): AVX-512 Q4 L2 T=1 68.3/61.7/66.0 GB/s with vs 55.8/56.8/68.5 without; AVX-512 F32 164.9/166.3/180.6 vs 152.8/165.1/176.4. Differences are within run-to-run noise.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "MSVC AddressSanitizer catches every one-element-past write into the kernels' small SIMD stack arrays.",
+        "evidence": "avx2 M0322 and avx512 M0461/M0519 survive both the /O2 and the ASan build: the arrays are register-allocated, so the generated code is correct and nothing is out of bounds at run time. (ASan does catch the other 30 out-of-bounds kernel mutants.)",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The deep clipping divisors -10.5, -11 and -12 of the Q4 candidate list change quantizer output on realistic or heavy-tailed data.",
+        "evidence": "Independent Python reference: sign-flipping any of them changes 0 of 1024 heavy-tailed blocks and 0 of 192 pinned blocks (-9.75: 1 block, -9.5: 3, -10.0: 0 here but it decides some blocks of test_q4_search's mixed data). The least-squares refit reaches equal or better scales. They are kept because changing the authoritative candidate set is a format-affecting decision for maintainers.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "tests/py/test_convert.py::test_q4_conversion_close_to_f32[deepseek_v3] (owned by T03) fails because of T02's Q4 quantizer.",
+        "evidence": "It fails with rel RMS logit error 0.1603 vs its 0.15 threshold. A scratch DLL whose Q4 quantizer is reduced to plain absmax/7 (no search, no refit) also fails: 0.1505. qwen3_moe passes with both (0.0862 with the search, 0.1026 with absmax/7). gen-2 did not change the quantizer: both gen-1 pinned hashes are unchanged. The threshold is marginal for this tiny routed model, where routing flips dominate the end-to-end error.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "CONTRACT docs/NUMERICS.md §3 (needs a maintainer): after 'Bias (if any) is added afterwards: `y[r] = y[r] + b[r]`.' add: 'A result that is NaN is stored as the canonical quiet NaN 0x7fc00000. (IEEE 754 does not fix which NaN operand an add/mul returns, x86 returns the first, and compilers commute SIMD operands, so raw NaN payloads would depend on ISA, T and row range.) Bit-identity therefore covers NaN outputs too.' The kernels already implement this.",
+      "CONTRACT engine/src/hx_quant.h kernel comment: 'Must equal, for every (t, r), the T=1 result (NUMERICS §3).' -> append ' NaN results are stored as 0x7fc00000.'",
+      "CONTRACT engine/include/hearth.h hearth_matmul comment lacks return codes; proposed: 'Returns 0 on success, -1 bad arguments (including NULL W/X/Y when there is work), -2 the requested ISA cannot run on this CPU/build, -3 the activation buffer cannot be allocated (or its size overflows size_t).'",
+      "CONTRACT engine/src/hx_platform.h hx_cpu_features: test_quant.c simulates CPUs without AVX2/AVX-512 by clearing bits through a cast of the returned pointer. This is valid C only because platform_win.c and platform_posix.c return a non-const static hx_cpu. Proposed: document 'returns the process-wide cache (a non-const object); tests may override fields while single-threaded', or add a test hook void hx_cpu_override(const hx_cpu *).",
+      "T03: test_q4_conversion_close_to_f32[deepseek_v3] threshold 0.15 is marginal (see falsified hypothesis); T03 owns that test.",
+      "Maintainers: Q4 divisors -10.5/-11/-12 never changed measured output after the refit; pruning them would speed the quantizer slightly but is a format decision.",
+      "The POSIX branches of the new test code (setenv/unsetenv under _POSIX_C_SOURCE, single-quoted exe path for system()) are reviewed by reading only; a path containing a single quote would break the POSIX child command."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform -o test_quant.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c",
+    "<data dir>/build/hxcc/test_quant.exe --no-bench      # correctness, ~1 s; must be run by its full path (it re-runs itself with --dispatch-child)",
+    "<data dir>/build/hxcc/test_quant.exe                 # correctness + throughput table (allocates 1 GiB, ~25 s)",
+    "<data dir>/build/hxcc/test_quant.exe --bench-only    # throughput table only",
+    "python scripts/hxcc.py --asan --platform -o test_quant_asan.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c",
+    "PATH=\"<MSVC>/bin/HostX64/x64:$PATH\" <data dir>/build/hxcc/test_quant_asan.exe --no-bench   # ASan runtime DLL must be on PATH; --small for a quicker run",
+    "python scripts/hxcc.py --debug --platform --run -o test_quant_dbg.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c -- --no-bench",
+    "HEARTH_ISA=scalar|avx2|avx512 <data dir>/build/hxcc/test_quant.exe --no-bench --small   # parent dispatch honours the env (checked in-process)",
+    "python governance/tools/mutate.py --file engine/src/quant.c --max-mutants 0 --jobs 8 --timeout 60 --seed 2 --test \"{python} scripts/hxcc.py --platform --run -o mq_{job}.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c -- --no-bench --small\"   # ~15 min; same for quant_avx2.c / quant_avx512.c (~4 min each)",
+    "PATH=\"<MSVC>/bin/HostX64/x64:$PATH\" python governance/tools/mutate.py --file engine/src/quant_avx2.c --lines 59,85,86,232,241,242,271,272,274,291,292,323 --max-mutants 0 --jobs 6 --timeout 180 --seed 2 --test \"{python} scripts/hxcc.py --asan --platform --run -o mqa_{job}.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c -- --no-bench --small\"   # ASan supplement; quant.c lines 30,33,40,62,224,363,611,619,622; quant_avx512.c lines 83,225,267,284,298,315,319,322,327,329,337,352",
+    "python scripts/hxcc.py --shared --platform -o hearth_kernels.dll engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c",
+    "HEARTH_LIB=<data dir>/build/hxcc/hearth_kernels.dll python -m pytest tests/golden/test_golden_invariants.py -k kernel_isa_and_batch_identity -q"
+  ],
+  "measurements": [
+    {"metric": "mutation score quant.c (all 1023 candidates, seed 2)", "value": 92.0, "unit": "%", "conditions": "933 killed + 8 timeouts, 82 survived (all classified); test_quant --no-bench --small; gen-1 test on the same set: 88.5%", "kind": "measured"},
+    {"metric": "mutation score quant_avx2.c (all 454 candidates, seed 2)", "value": 90.1, "unit": "%", "conditions": "402 killed, 44 survived (23 equivalent, 20 killed by the ASan supplement, 1 register-allocated UB), 8 build errors excluded", "kind": "measured"},
+    {"metric": "mutation score quant_avx512.c (all 565 candidates, seed 2)", "value": 88.8, "unit": "%", "conditions": "490 killed, 62 survived (50 equivalent, 10 killed by the ASan supplement, 2 register-allocated UB), 13 build errors excluded", "kind": "measured"},
+    {"metric": "test_quant checks", "value": 117681, "unit": "checks", "conditions": "--no-bench, 0 failures in /O2, /Od and /fsanitize=address builds", "kind": "measured"},
+    {"metric": "NaN outputs exercised by test_nonfinite (full mode)", "value": 71237, "unit": "outputs", "conditions": "400 raw-bit cases, all canonical 0x7fc00000 and identical across ISAs, T, row splits", "kind": "measured"},
+    {"metric": "AVX-512 Q4 matvec, L2-resident (512 KiB, cols 4096, T=1), 1 thread", "value": 69.6, "unit": "GB/s weight bytes", "conditions": "Ryzen 9 9950X, MSVC 14.44 /O2, machine ~33% busy with other engineers' work; 72.0 in a second run; gen-1 reported 74-90 on an also-busy machine; A/B shows no cost from NaN canonicalisation", "kind": "measured"},
+    {"metric": "AVX-512 Q8 matvec, L2-resident, 1 thread", "value": 113.0, "unit": "GB/s weight bytes", "conditions": "as above; 98.3 in the other run", "kind": "measured"},
+    {"metric": "AVX-512 F32 matvec, L2-resident, 1 thread", "value": 160.0, "unit": "GB/s weight bytes", "conditions": "as above", "kind": "measured"},
+    {"metric": "AVX-512 F16 matvec, L2-resident, 1 thread", "value": 118.7, "unit": "GB/s weight bytes", "conditions": "as above", "kind": "measured"},
+    {"metric": "AVX2 Q4 matvec, L2-resident, 1 thread", "value": 47.7, "unit": "GB/s weight bytes", "conditions": "as above", "kind": "measured"},
+    {"metric": "AVX-512 Q4 matvec, 1 GiB DRAM-resident, 16 threads", "value": 50.6, "unit": "GB/s weight bytes", "conditions": "hx_thread_create, static 16-row split, T=1; 52.2 in the other run; shared machine", "kind": "measured"},
+    {"metric": "AVX-512 F32 matvec, 1 GiB DRAM-resident, 16 threads", "value": 57.3, "unit": "GB/s weight bytes", "conditions": "as above", "kind": "measured"},
+    {"metric": "AVX-512 Q4 batched T=8, L2-resident, 1 thread (weight bytes x 8 / s)", "value": 176.1, "unit": "GB/s effective", "conditions": "as above", "kind": "measured"},
+    {"metric": "Q4 RMSE on N(0,1) (scale search)", "value": 0.089591, "unit": "rms error (signal rms 1.0)", "conditions": "1,048,576 values; absmax/7 baseline 0.107569; quantizer unchanged from gen-1 (pinned hashes)", "kind": "measured"},
+    {"metric": "Q8 RMSE on N(0,1)", "value": 0.005925, "unit": "rms error (signal rms 1.0)", "conditions": "1,048,576 values", "kind": "measured"},
+    {"metric": "test_q4_conversion_close_to_f32[deepseek_v3] rel RMS logit error, T02 quantizer vs absmax/7", "value": 0.1603, "unit": "relative rms", "conditions": "absmax/7-only scratch DLL: 0.1505; test threshold 0.15 (T03's test); qwen3_moe 0.0862 vs 0.1026", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "POSIX/GCC/Clang compilation of quant*.c and test_quant.c is still not verified (no compiler on this machine); the new POSIX branches (setenv, sh quoting) are reviewed by reading only.",
+    "The NaN-canonicalisation rule is implemented and tested but not yet in docs/NUMERICS.md (contract, maintainer-owned): see open_questions.",
+    "Throughput numbers were measured on a shared, busy machine and must be re-measured on a quiet machine before publication (INV-HONEST).",
+    "Three kernel mutants (avx2 M0322, avx512 M0461, M0519) are one-past writes into register-allocated SIMD arrays that no available tool detects; a GCC/Clang -O2 -Warray-bounds build would be the check."
+  ]
+}

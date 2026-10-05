@@ -1,0 +1,74 @@
+{
+  "generation_id": "gen-001-python-runtime",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T13:40:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T07-runtime",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new: python/hearth/{engine,generate,chat,server,cli,__main__}.py, tests/py/test_runtime.py; extended: python/hearth/__init__.py (lazy exports)"
+  },
+  "constraints_touched": ["INV-DET-2", "INV-LOSSLESS-DEFAULT", "INV-DEP", "INV-DATA", "INV-SAFE", "INV-VERIFY", "INV-HONEST"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "ctypes HearthOptions/HearthModelInfo/HearthStats match engine/include/hearth.h field for field (name, order, type, offset, size).",
+        "evidence": "test_ctypes_structs_match_header (regex parse of hearth.h) and test_engine_against_compiled_abi_stub (MSVC-compiled stub reports sizeof/offsetof of every field, generated from the header) both pass; on a scratch copy each test killed 5/5 layout mutants (cache_gb float, swapped hits/misses, eos_ids[7], dropped verbose, pin_fraction double), control passed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Greedy prompt-lookup speculative decoding is token-for-token identical to plain greedy decoding, given an engine whose batched eval equals sequential eval (INV-DET-2).",
+        "evidence": "test_speculative_greedy_is_lossless (12 seeds x 5 prompts x 3 draft configs x 2 FakeEngine regimes incl. frequent rejections), stop-token / repetition-penalty / KV-capacity variants, and the compiled C stub through real ctypes (generation to the KV limit, 157 accepted drafts).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Speculative sampling with a point-mass draft preserves the sampling distribution.",
+        "evidence": "accept_point_mass empirical frequencies match p (40k draws); end-to-end chi-square vs exact enumerated distribution passes, and a negative control (always-accept) is detected; on the C stub the measured acceptance equals mean p(draft) at T=0.8/0.3/0.05 (0.0127 vs 0.0136, 0.2602 vs 0.2588, 0.6860 vs 0.6860).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Server stays consistent when a streaming client disconnects mid-generation (KV cache and the server's held-token record agree; next request is correct).",
+        "evidence": "test_server_client_disconnect_mid_stream (RST mid-stream, generation stops early, held == engine KV, follow-up output equals fresh run). Fixed a real race found in review: the Run generator is now closed while the engine gate is held.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Chat template rendering matches transformers.",
+        "evidence": "test_chat_template_matches_transformers_rendering compares against transformers.utils.chat_template_utils.render_jinja_template (transformers 4.54.1) on a template using trim, strftime_now and bos_token.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Holding back max(len(stop))-1 characters is an acceptable stop-string strategy.",
+        "evidence": "It delayed text that could not start a stop string; replaced by holding back only the longest unsent suffix that is a proper prefix of some stop string (test_text_stream_stop_strings_are_held_back).",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Does prompt-lookup speculation pay off on real MoE models? Verifying k+1 tokens loads the union of their experts; benefit depends on acceptance vs extra expert bytes. Default is speculative='none' in CLI and server until measured with hearth bench / run --speculative ngram on real weights.",
+      "Is hearth_model_info.max_seq the model maximum or the effective KV capacity? Engine.kv_capacity currently re-derives the header rule (requested max_seq, else min(model max_seq, 4096)).",
+      "Real-engine integration tests (4 in tests/py/test_runtime.py) have never run: no DLL exporting hearth_open exists yet (T08)."
+    ]
+  },
+  "procedures": [
+    "python -m pytest tests/py/test_runtime.py -q",
+    "python -m pytest tests/py/test_runtime.py -q -k compiled_abi   # compiles a hearth.h stub with scripts/hxcc.py into pytest's tmp dir; skips without a C toolchain",
+    "HEARTH_LIB=<path to engine dll> python -m pytest tests/py/test_runtime.py -q -k real   # once T08 builds the engine",
+    "python -m hearth doctor",
+    "python -m hearth synth tiny tiny.hearth && python -m hearth bench <data dir>/models/tiny.hearth --prompt-tokens 64 --gen-tokens 32",
+    "python -m hearth serve <model.hearth> --port 8080 [--speculative ngram] [--api-key KEY]"
+  ],
+  "measurements": [
+    {"metric": "runtime test suite", "value": 54, "unit": "tests passed (4 real-engine tests skipped)", "conditions": "Windows 11, Python 3.13.4, numpy 2.2.6; ~14-22 s wall while other engineers ran builds/tests concurrently", "kind": "measured"},
+    {"metric": "ABI layout mutants killed", "value": 5, "unit": "of 5 (each ABI test)", "conditions": "mutated scratch copy of hearth/engine.py; regex-header test and MSVC-compiled stub test", "kind": "measured"},
+    {"metric": "toy speculative tokens per forward", "value": 2.25, "unit": "tokens/forward", "conditions": "pure-Python FakeEngine toy LM, repetitive prompt, draft_len 6, greedy; correctness fixture only, NOT a model performance number", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Integration tests against the real engine (tests/py/test_runtime.py::test_real_engine_*) are written but skipped until T08 provides a library exporting hearth_open; they must be run then.",
+    "POSIX code paths in cli doctor (RAM via /proc/meminfo or sysconf, CPU flags via /proc/cpuinfo) checked by reading only; no Linux/macOS machine available."
+  ]
+}

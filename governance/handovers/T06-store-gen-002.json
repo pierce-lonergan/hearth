@@ -1,0 +1,153 @@
+{
+  "generation_id": "gen-002-store-verifier-fixes",
+  "parent_generation": "gen-001-modelfile-store",
+  "timestamp": "2026-10-04T17:25:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T06-store",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified: engine/src/store.c (864 -> 922 lines), engine/tests/test_store.c (1473 -> 2222), engine/tests/test_modelfile.c (scratch dir fallback only); modelfile.c unchanged; new: governance/handovers/T06-store-gen-002.json"
+  },
+  "constraints_touched": [
+    "INV-FMT",
+    "INV-SAFE",
+    "INV-DET-1",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "CRITICAL (verifier) fixed: a container with n_experts > 0 and no MoE layer (no expert directory, or an all-empty one) made load_usage write past the 1-element heat arrays, save_usage write a 24-byte profile the store then refused, and hx_store_heat return 1 element instead of n_layers*n_experts.",
+        "evidence": "Reproduced first with a scratch probe (4 dense layers, n_experts 64, no expert directory, 4x64 profile): MSVC ASan 'heap-buffer-overflow ... WRITE of size 8 in load_usage store.c:539' against the gen-001 store.c. Fix: the heat profile length n_heat = n_layers*n_experts is now independent of nkeys; count_f (hx_store_heat, usage_out) has n_heat entries; heat/count/heat_tick stay per key. Same probe on the fixed store: open ok twice, heat round trip exact, ASan clean. New test dense_usage (n_experts 8 without / with an empty expert directory, n_experts 0): profile loads, hx_store_heat equals it, usage_out -> usage_in round trip exact with tokens accumulating, over two rounds. A mutant re-coupling n_heat to nkeys fails 3 checks there.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "MAJOR (verifier) fixed: every spec-level store behaviour the verifier's targeted mutants showed as untested is now covered, deterministically where order matters.",
+        "evidence": "store.c gained a test seam hx_store_set_read_hook (not in hx_store.h): a per-store hook called on the reader thread before every read attempt, outside the lock; it may block or fail the attempt and sees the file index and whether the handle is unbuffered. New tests: promotion (queued prefetch demanded -> read next and once; prefetch demanded while in flight is held: with all other slots acquired/held a further demand waits instead of evicting it), protection (LRU: unused prefetch outlives unprotected slabs, use or a tick ends it, wasted counted; LFU: when the 8-slot sample holds only protected slabs the full scan still evicts the single unprotected one), seeded_heat (profile changes LFU victim choice vs a control run; seeded heat on the r/(1-decay) scale via the prefetch hot rule at rates 0.4 vs 0.6 per token), pf_queue_limit (1 and 5 readers: exactly in-flight + max(2*top_k, 2*n_io, 4) hints accepted, the rest dropped and re-hintable), pin_cap (pin_fraction 0.9 at min+6 slots pins exactly n_slots-min, then top-k bursts complete; warm start with n_slots+3 profiled experts fills exactly the unpinned slots), direct_vs_buffered now asserts the handle mode seen by the hook (direct_io 1 -> all unbuffered when the platform grants it for the file, 0 -> all buffered). Scratch driver with the verifier's mutants, each applied alone to store.c, run against test_store --quick: T2 direct_io ignored, T3 no queued promotion, T8 protection kept on use, T10 protection never expires, T12 pin cap removed, T15 seeded heat zeroed, T16 queue bound off by one, T16b queue unbounded (crash), T19 no hold on in-flight promotion: all KILLED (T12 by an assertion in 4 s, not by the 60 s watchdog).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "MAJOR (verifier) fixed, INV-DATA: neither test ever falls back to the current directory; the benchmark writes only into the data dir chosen as hxcc.py/hearth._native choose it.",
+        "evidence": "test_store --bench: --dir, else $HEARTH_DATA, else %LOCALAPPDATA%/hearth (then %USERPROFILE%/hearth) on Windows or $XDG_CACHE_HOME/hearth, ~/.cache/hearth on POSIX; it probes writability and otherwise stops with 'data dir ... is not writable (create it, set HEARTH_DATA or pass --dir)' (no temp fallback: /tmp may be RAM-backed). Test scratch (test_store, test_modelfile): --dir, HEARTH_TEST_DIR, HEARTH_MUTATION_TMP, TEMP, TMP, TMPDIR, then /tmp on POSIX only; none writable -> exit 2. WSL2 Ubuntu run with HEARTH_DATA/TEMP/TMP/TMPDIR/LOCALAPPDATA unset, cwd an empty fake_repo: both tests used /tmp, the cwd stayed empty; the bench refused a missing $XDG_CACHE_HOME/hearth and, once that existed, wrote there and deleted its files.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (verifier) addressed within the current contract: one failed read no longer disables an expert for the store's lifetime and polling cannot spin.",
+        "evidence": "failed[] now has FAIL_NOW (cleared at hx_store_tick) and FAIL_EVER (only quiets repeated logs). Within a token, acquire/try_acquire of a failed expert return NULL without queuing reads; after the next tick it is read again. hx_store_wait_any now waits out its timeout even with nothing pending (the header's literal contract). A failed prefetch never marks the expert. Tests (read hook injects failures): acquire NULL with >= 2 attempts, wait_any(30 ms) took >= 30 ms, no re-read in the same token after the device recovers, correct bytes after a tick, a demand right after a failed prefetch succeeds; mirror failover in both directions (failure only on copy 0, then only on copy 1: the attempt moves to the other copy and returns correct bytes; gen-001 had left this unexercised). Mutants: tick does not clear, wait_any returns when idle, no failover, failed prefetch marks the expert: all KILLED.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (verifier) addressed: a usage profile can no longer block hx_store_open.",
+        "evidence": "A missing, wrong-size, wrong n_layers/n_experts, bad magic/version, NaN/negative/infinite, truncated or over-long profile, or a directory given as usage_in, is ignored with a WARN log; nothing is taken from it (validated fully before use: a mutant that applies entries before validation is KILLED); when usage_out names the same file it is replaced by a valid profile on close. test_store 'bad usage' now asserts open succeeds, pinned 0, resident 0, heat all 0, and the file is valid after close.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "No regressions: all earlier properties still hold (byte-exact slabs under concurrency, no deadlock at the minimum slot count, overcommit, mirrors, policy check).",
+        "evidence": "Windows MSVC /O2: test_store full seeds 1-5 (0 failed of ~400-415k checks each, 14-15 s), 6 parallel --quick instances (seeds 11-16) 0 failed; MSVC ASan (/fsanitize=address, /Od) full seeds 1 and 7: 0 failed; test_modelfile normal and ASan (seed 9): 0 failed. Linux (WSL2 gcc 13.3, -fsanitize=address,undefined, -Wall -Wextra): both tests 0 failed, no warnings. Policy check unchanged: LRU 0.000, LFU 0.258.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "On Linux (WSL2 ext4 /tmp) O_DIRECT is actually granted, so the direct_io configurations there really are unbuffered (gen-001 open question).",
+        "evidence": "direct_vs_buffered prints the platform's answer for the test file and asserts the store used that mode: 'unbuffered handles granted and used for this file' on both Windows NTFS and WSL2 /tmp.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "A seeded-heat test that only compares a hot seed against zero heat pins down the seeding behaviour.",
+        "evidence": "mutate.py (seed 1) showed h*tokens instead of h/tokens surviving; only the hot-rule test at rates 0.4 vs 0.6 per token distinguishes the scale (now kills x tokens, raw counts, and missing 1/(1-decay)).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Editing the test while a mutate.py run is in progress only affects later mutants harmlessly.",
+        "evidence": "A run was stopped and discarded: its jobs copy the tree per mutant, and a briefly uncompilable test would have counted as kills. The reported score comes from a run started after the last test edit.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "hx_store_acquire still returns NULL (for the rest of the token) when an expert cannot be read on any attempt/mirror, against hx_store.h 'Never NULL for valid ids'; needs a maintainer decision (contract_issues). The engine (T07/T08) must treat NULL as an I/O error, not a missing expert.",
+      "usage_out is rewritten in place (truncate + one pwrite): a crash during close can leave a torn profile. It is now harmless (ignored with a warning at the next open, then replaced), but history is lost; atomic replace needs a platform rename (contract_issues).",
+      "Per-layer canonical tensor shapes/dtypes (FORMAT 4.1) are still not validated by modelfile.c, only rope_inv_freq; model.c (T08) must check every tensor it binds (carried over from gen-001).",
+      "pf_queue_limit asserts the queue bound max(2*top_k, 2*n_io, 4) and in-flight bound max(n_io-1, 1) of store.c (white-box); retuning those constants needs the test updated.",
+      "Benchmark peak for 2.39 MiB slabs is at 2 readers and drifts lower at 4-16 (also this run); not investigated (carried over)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o test_store.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c   # add -- --quick (~4 s), --seed N, --dir D; the 'giving up after 3 read attempts' errors in the output are expected (injected / truncated-file cases)",
+    "python scripts/hxcc.py --platform --run -o test_modelfile.exe engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_modelfile.c   # add -- --quick, --seed N, --iters N",
+    "python scripts/hxcc.py --asan --debug --platform -o test_store_asan.exe <same sources as test_store> ; then run <build dir>/test_store_asan.exe with VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 (clang_rt.asan_dynamic-x86_64.dll) on PATH; same for test_modelfile",
+    "<build dir>/test_store.exe --bench [--gib 6] [--dir D]   # writes ~6 GiB per slab size into the data dir ($HEARTH_DATA, %LOCALAPPDATA%/hearth or ~/.cache/hearth, must exist), prints the GB/s table, deletes the files (~20 s)",
+    "Linux (WSL2 gcc 13.3): gcc -std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -O1 -g -fsanitize=address,undefined -Iengine/include -Iengine/src engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/platform_posix.c engine/tests/test_store.c quant_avx2.o quant_avx512.o -lm   (quant_avx2.o: -mavx2 -mfma -mf16c; quant_avx512.o: -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma -mf16c); same for test_modelfile.c. Copy the sources to a WSL-local dir first, run from an empty cwd.",
+    "python governance/tools/mutate.py --file engine/src/store.c --test \"python scripts/hxcc.py --platform --run -o {tmp}/t06m_store.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c -- --quick\" --max-mutants 80 --jobs 4 --seed 1 --timeout 240   # do not edit the tree while it runs"
+  ],
+  "measurements": [
+    {
+      "metric": "cold demand-read throughput, direct I/O, 2.39 MiB Q4 slabs (Qwen3-30B-A3B expert 2048x768), readers 1/2/4/8/16",
+      "value": 7.07,
+      "unit": "GB/s (peak, 2 readers)",
+      "conditions": "test_store --bench, Samsung 990 PRO 2TB, Ryzen 9 9950X, Windows 11; 5.98 GiB synthetic container, random order, whole file per point; 4.83/7.07/6.00/5.93/6.13 GB/s; other engineers' builds and mutation runs active (noisy); synthetic weights",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, direct I/O, 22.3 MiB Q4 slabs (DeepSeek-V3/Kimi-K2 expert 7168x2048), readers 1/2/4/8/16",
+      "value": 6.58,
+      "unit": "GB/s (peak, 4 and 8 readers)",
+      "conditions": "same machine and caveats; 5.58 GiB container; 5.95/5.93/6.58/6.58/6.13 GB/s",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, buffered I/O, 2.39 MiB slabs, readers 1/2/4/8/16",
+      "value": 6.28,
+      "unit": "GB/s (peak, 4 readers)",
+      "conditions": "each point reads a disjoint never-read fifth (1.2 GiB) of a file written unbuffered; 2.44/4.50/6.28/5.75/5.96 GB/s; noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, buffered I/O, 22.3 MiB slabs, readers 1/2/4/8/16",
+      "value": 6.7,
+      "unit": "GB/s (peak, 8 readers)",
+      "conditions": "disjoint 1.11 GiB fifths; 2.53/4.49/6.33/6.70/6.62 GB/s; noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "LFU vs LRU hit rate, cyclic layer access, cache 16 slots < 32 slabs/token, Zipf(1.2) routing",
+      "value": 0.258,
+      "unit": "hit rate (LFU); LRU 0.000",
+      "conditions": "test_store policy check, synthetic trace, 800 tokens, first 20% excluded (unchanged from gen-001)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score store.c",
+      "value": 70.0,
+      "unit": "percent",
+      "conditions": "governance/tools/mutate.py seed 1, 80 of 1297 candidates, test_store --quick, MSVC /O2: 56 killed, 24 survived. Survivors reviewed: 8 leak/close-only (MSVC ASan has no leak checker; the gcc LSan run is clean), 3 log/message-only, 7 equivalent (slot_of -2 vs -1; pfq_remove's bound never reached because only queued keys are removed; an extra broadcast; qsort comparator magnitude; preload wait on pre_len is redundant because loading counts queued preloads; a redundant bound on sections modelfile.c already validated; an empty mirror path still rejected by hx_file_open), 3 out-of-memory paths, 1 LFU sampling disabled (always the exact full-scan minimum: slower, not wrong), 1 tick-clear off-by-one (memory-only, killed by the ASan run), 1 tie order of equal heat left to MSVC qsort (keeps key order here). Different file and candidate set than gen-001's 65.0%, so not directly comparable; the gen-002 run without the last test additions scored 60.0% on the same candidates.",
+      "kind": "measured"
+    },
+    {
+      "metric": "verifier's targeted store.c mutants killed",
+      "value": 9,
+      "unit": "of 9",
+      "conditions": "T2, T3, T8, T10, T12, T15, T16, T16b, T19, each alone against test_store --quick (scratch driver; T12 by an assertion in 5 s, not the watchdog); plus 17 further targeted mutants for the new behaviours and for mutate.py survivors, all killed (1 only under ASan: off-by-one in the tick clear loop)",
+      "kind": "measured"
+    },
+    {
+      "metric": "test runtime test_store full / --quick",
+      "value": 14.7,
+      "unit": "s (full); --quick ~4 s; MSVC ASan full ~21 s",
+      "conditions": "MSVC /O2 on a loaded machine",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "hx_store_acquire can return NULL for a valid id (unreadable expert, until the next tick) although hx_store.h says it never does; kept as a reported contract issue (no zero-filled slab is ever returned, no hang).",
+    "usage_out is not replaced atomically: hx_platform.h has no rename/replace; proposed in contract_issues.",
+    "POSIX build verified on Linux (WSL2 gcc 13.3) only; macOS/BSD not compiled."
+  ]
+}

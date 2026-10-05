@@ -1,0 +1,207 @@
+{
+  "generation_id": "gen-001-forward-api",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T20:49:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T08-forward",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new (untracked): engine/src/hx_model.h (72 lines), engine/src/model.c (1698), engine/src/api.c (200), engine/tools/hearth_bench.c (184), engine/tests/test_model.c (1485); build product python/hearth/lib/hearth.dll (gitignored, built with hxcc --shared). No other file touched; tests/golden lock verified by check_golden.py."
+  },
+  "constraints_touched": [
+    "INV-DET-1",
+    "INV-DET-2",
+    "INV-DET-3",
+    "INV-NUM-1",
+    "INV-NUM-2",
+    "INV-FMT",
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY",
+    "INV-LOSSLESS-DEFAULT"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "The golden suite passes against the real engine: 21/21 tests of tests/golden/test_golden_invariants.py (INV-NUM-1/2, INV-DET-1/2/3, malformed files, rewind), run isolated through check_golden.py.",
+        "evidence": "python -E governance/tools/check_golden.py --run: 'golden suite OK: 21 passed, 0 failed, 0 errors, 0 skipped' both with python/hearth/lib/hearth.dll (hxcc) and with HEARTH_LIB=<cmake build>/Release/hearth.dll, on the final sources. Also python -m pytest tests/golden -q: 21 passed.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The engine reproduces hearth.reference to within libm rounding on all 5 architectures and all 5 dtypes, with identical routing; on Q8/Q4 containers bit for bit (max abs error 0.0).",
+        "evidence": "Scratch script (Engine vs Reference(emulate_act_quant=True), golden token sequence, one token at a time, trace compared with routing_history): max abs logit error 0 for every Q4 and Q8 container and qwen3/mixtral/qwen2 F32; at most 2.6e-6 (|logits| ~7) for F32/F16/BF16 elsewhere, attributable to the reference computing exp/sin/cos in float64. routes_equal True for all 25 containers. Not a committed test (tests/py is not T08's), see open_questions.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The engine is bit-identical to an independent naive single-token forward pass written from NUMERICS §1-5 inside engine/tests/test_model.c (no code shared with model.c), for GQA (qkv bias, qk_norm 1 and 2, partial NEOX RoPE, dense layer, softmax routing + norm_topk, gated shared expert, tied embeddings, emb/residual/logit scales, per-expert F32/F16/BF16/Q8/Q4 slabs) and MLA (q_lora 64 and 0, GPT-J RoPE with attn factor and partial rope_dim, sigmoid + bias + group-limited routing, routed_scale, ungated shared expert, 4 and 20 heads), including 300-token sequences that cross the 256-position score chunk.",
+        "evidence": "test_model: 386 checks, 0 failed (MSVC /O2, 2.6 s; MSVC ASan /Od seeds 1, 2, 3, 7: 0 failed, no ASan report). The naive comparison is memcmp-exact.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "INV-DET-1/2/3 hold beyond the golden configurations: batched == sequential == chunked (max_batch 3, 5, 7, 13, 33, 64), forced attention sub-batches (1, 7 tokens), minimum caches with batches whose expert union exceeds the slot count, LRU/LFU, prefetch off/next/shared with extra, 1-16 threads, 1-8 readers, direct/buffered, one and two mirrors, pinning + warm start, scalar/AVX2/AVX-512, warm-cache single-wave batches, trace replay of the engine's own routing (reproduces its logits exactly), rewinds at 0/1/50/99.",
+        "evidence": "test_model.c invariants per model flavour, plus a scratch Python stress script (3 containers x 9 configurations x 100 tokens, replay, rewinds): ALL OK on the final build.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Public API never crashes on bad input: NULL handles/pointers, bad options (negative counts, unknown enums, NaN/inf/negative cache_gb, pin_fraction outside [0,1], 9 or -1 mirrors, NULL mirror, a non-identical mirror), missing/garbage/truncated containers, an I32 matrix, a wrong-length norm vector, token ids -1 and vocab, n < 0, pos+n > capacity (pos unchanged, engine still usable, later logits unaffected), rewind beyond pos or negative, trace into a missing directory, malformed traces for replay (magic, n_experts, top_k, n_moe_layers, partial row, no rows, id out of range, duplicate id, truncated header), and an expert slab that cannot be read (eval returns HX_E_IO after ~1 s, pos unchanged, next eval succeeds).",
+        "evidence": "test_model error-path sections; golden test_malformed_files_fail_cleanly; ASan builds clean.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Full CMake build works warning-free at /W3 and every engine test passes under ctest; tests/py (incl. T07's four real-engine integration tests, previously skipped) passes against the real engine.",
+        "evidence": "cmake -S . -B %LOCALAPPDATA%/hearth/build/cmake_t08 -G 'Visual Studio 17 2022' -A x64; cmake --build ... --config Release: no warning lines; ctest -C Release: 6/6 passed (test_model, test_modelfile, test_platform, test_pool, test_quant, test_store). python -m pytest tests/py -q: 558 passed, 2 skipped. A separate build dir was used to stay out of other engineers' concurrent builds; the canonical %LOCALAPPDATA%/hearth/build/cmake dir was not touched.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "No vectorised libm is substituted anywhere (a vector expf could differ from scalar expf for some elements and break bit-identity across T, alignment or ISA).",
+        "evidence": "dumpbin /symbols on every object of the DLL (MSVC /O2): no __vdecl_* / __svml symbols; model.c's cosf/sinf go through __declspec(noinline) wrappers (HX_NOINLINE), expf only through quant.c's hx_softmax/hx_sigmoid/hx_swiglu.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Decode is at the measured DRAM roofline when experts are cached and at the NVMe roofline when they stream; compute overlaps I/O.",
+        "evidence": "Qwen3-30B-A3B shape fully cached: ~2.3 GB weights/token (attention 934 MB, experts 960 MB, routers 96 MB, head 320 MB) in 42.9 ms = ~54 GB/s, vs T02's 50.6-57.3 GB/s 16-thread DRAM matvec measurements. 4 GiB cache, synthetic greedy routing: 5.69 GB/s of reads (990 PRO practical max ~6-7 GB/s) with 89.5 ms/token, i.e. the ~42 ms of compute hidden behind the reads.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Reading a shared cache row once for all heads that use it (GQA group / all MLA heads), with scores through the dispatched F32 kernel, speeds up long-context attention without changing a single bit.",
+        "evidence": "Same per-container error figures and stress results before and after the rewrite; fully cached Qwen3-30B-A3B shape at ~3000 tokens of context: decode 13.63 -> 15.6 tok/s (attention 46.7 -> 40 ms/token), 3000-token prefill 118.7 -> 179-181 tok/s (attention 21.0 -> 12.4 s). Noisy machine.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Mutation testing: test_model kills the mutants that matter; survivors are output-equivalent or documented gaps.",
+        "evidence": "governance/tools/mutate.py on model.c, 80 sampled each: seed 1 62.5% (before the gap-closing tests) -> 70.0%; seed 2 80.0%; focused re-run of the former survivor lines (seed 3) 78.0% with the rest classified. api.c seed 1 (60 of 310): 60.0% -> 71.7% after the hx_parse_isa seam test. Survivors classified: performance-only chunk/threshold constants, defensive checks made redundant by modelfile.c validation, HX_OK == 0 returns, log calls, leaks (MSVC has no leak checker), dims that are multiples of 32, the trace u16 high byte (ids >= 256 never occur in the tiny models), a leaked trace handle on restart (the platform opens with delete sharing), 2-D alternatives of the vector shape test. Reports: %LOCALAPPDATA%/hearth/mutation/engine_src_model_c-s*-20261004-*/mutation.md.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Issuing the next-layer prediction to the store is always worth it.",
+        "evidence": "With routing replayed from a Zipf(1.1) trace (which the synthetic router cannot predict) 94% of prefetches were wasted: 119 GB read for 128 tokens vs 29 GB without prefetch, 6.15 vs 13.45 tok/s. Fix: every prediction is scored against the next layer's actual experts (EWMA of precision) and handed to the store only while precision >= 0.5 * top_k / (top_k + prefetch_extra). After the fix: replay 13.4-13.8 tok/s (= prefetch-off level, 0 prefetches issued), synthetic greedy case unchanged at 11.0-11.2 tok/s with 92% precision. Output never depends on it.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Per-(token, head) attention, each head streaming its KV rows with portable dot16, is adequate.",
+        "evidence": "Long-context decode was 13.6 tok/s at 3000 positions vs 23 at short context, and MLA would stream the shared latent cache once per head (128x for DeepSeek). Replaced by the shared-row passes (see validated hypotheses).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "hearth_open may reset the process-wide log level to WARN when verbose = 0.",
+        "evidence": "It undid the embedding application's (and test's) own hx_set_log_level, flooding test output with expected store warnings. Now only HEARTH_LOG sets the level, and verbose 1/2 only raise it.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Prefetch precision on real models is unknown: synthetic make_shaped weights give 92% (residual stream barely changes between random layers), replayed traces give ~6% (unpredictable by construction). Measure with a converted real model; PF_MIN_PREC = 0.5 is a guess.",
+      "Hit rates on make_shaped containers with greedy decoding are inflated: tok_embd rows come from 97-row pools and greedy argmax repeats tokens (27 distinct of 48). Use --replay with a recorded or hearth.sim trace for cache studies.",
+      "The engine-vs-reference bit-exactness on Q8/Q4 containers (max error 0.0) is a strong regression signal but lives only in a scratch script; tests/py (T03/T07 owners) could assert it.",
+      "Attention value sums (o = sum_t p_t v_t, sequential in t) run in portable C (SSE2 by MSVC); with an elementwise canonical axpy in hx_kernels they could use AVX-512 (see contract_issues). Prefill at 3000 tokens is 74% attention.",
+      "At long context the F32 KV cache dominates: ~576 MB/token of reads at 3000 positions for Qwen3-30B-A3B; an opt-in F16/BF16 KV (INV-LOSSLESS-DEFAULT: opt-in, measured) would halve it.",
+      "Pool spin 1000 us was ~2% faster than 100 us on the I/O-bound replay benchmark (two runs each, noisy); revisit on a quiet machine.",
+      "DeepSeek-V3 / Kimi-K2 shaped benchmarks (MLA at 128/64 heads, C=512) were not run; MLA is verified for correctness only on tiny containers (4 and 20 heads)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --shared --platform -o dll/hearth.dll engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c   # then copy <data dir>/build/hxcc/dll/hearth.dll to python/hearth/lib/hearth.dll (gitignored); hxcc prints the full path (in this app sandbox it resolves under AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/hearth)",
+    "python scripts/hxcc.py --platform --run -o test_model.exe engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c engine/tests/test_model.c   # ~2.6 s; -- --seed N, --dir D. The 'giving up after 3 read attempts' / 'could not be read' lines are the injected I/O-failure case",
+    "python scripts/hxcc.py --asan --debug --platform -o test_model_asan.exe <same sources>; run <build dir>/test_model_asan.exe with .../VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 on PATH (clang_rt.asan_dynamic-x86_64.dll)",
+    "python -E governance/tools/check_golden.py --run   # golden suite, isolated; or python -m pytest tests/golden -q",
+    "cmake -S . -B %LOCALAPPDATA%\\hearth\\build\\cmake -G \"Visual Studio 17 2022\" -A x64 && cmake --build %LOCALAPPDATA%\\hearth\\build\\cmake --config Release && ctest --test-dir %LOCALAPPDATA%\\hearth\\build\\cmake -C Release --output-on-failure",
+    "python -m pytest tests/py -q",
+    "python scripts/hxcc.py --platform -o hearth-bench.exe <engine sources> engine/tools/hearth_bench.c   # (CMake target hearth-bench builds the same)",
+    "PYTHONPATH=python python -c \"from hearth import synth, _native; synth.make_shaped(_native.data_dir()/'models'/'q30.hearth', preset='qwen3-30b-a3b')\"   # 17.0 GB, ~26 s; delete afterwards (INV-DATA: data dir only)",
+    "hearth-bench <data dir>/models/q30.hearth --tokens 128 --prompt 16 --warmup 8 --cache-gb 16 --usage-in q30.usage --warm 1   # fully cached (record q30.usage first with --usage-out on a 256-token run)",
+    "hearth-bench <...>/q30.hearth --tokens 128 --prompt 32 --warmup 64 --cache-gb 4 --direct 1 [--replay zipf.hrtr]   # streaming; zipf.hrtr = hearth.sim.trace.synthetic_for(presets.get('qwen3-30b-a3b'), 2000, zipf=1.1, reuse=0.25, seed=0).save(...)",
+    "python governance/tools/mutate.py --file engine/src/model.c --test \"{python} scripts/hxcc.py --platform --run -o {tmp}/t08m_model.exe engine/src/pool.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/src/modelfile.c engine/src/store.c engine/src/model.c engine/src/api.c engine/tests/test_model.c\" --max-mutants 80 --jobs 8 --seed 1 --timeout 300   # ~10 min; do not edit the tree while it runs"
+  ],
+  "measurements": [
+    {
+      "metric": "decode, Qwen3-30B-A3B shape, Q4 experts / Q8 dense, fully cached (14.34 GiB of experts resident)",
+      "value": 23.27,
+      "unit": "tok/s",
+      "conditions": "SYNTHETIC weights (hearth.synth.make_shaped), Ryzen 9 9950X, 61.6 GB DDR5, Windows 11, MSVC /O2 AVX-512, 16 compute threads, 128 tokens after a 16-token prompt; 42.9 ms/token = attention 17.9 + MoE 19.5 + head/embed 5.5 ms; machine ~69% busy with other work (noisy; 22.4-23.6 over several runs)",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode, same, 4 GiB expert cache (28% of experts), direct I/O, synthetic greedy routing",
+      "value": 11.17,
+      "unit": "tok/s",
+      "conditions": "Samsung 990 PRO 2TB; hit 62.3% (inflated, see open_questions); 5.69 GB/s of slab reads; stall 48%; prefetch precision 92%; noisy machine",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode, same, 4 GiB cache, direct I/O, routing replayed from a synthetic Zipf(1.1)/reuse 0.25 trace",
+      "value": 13.79,
+      "unit": "tok/s",
+      "conditions": "routing REPLAYED (hearth_route_replay), output is not the model's; LFU, hit 76.3%, 3.15 GB/s, stall 38.5%, prefetch auto-disabled by the precision gate; LRU + prefetch off: 12.96 tok/s, hit 72.8%; before the gate (prefetch always issued): 6.15 tok/s; noisy machine",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode at ~3000 tokens of context, fully cached, same shape",
+      "value": 15.17,
+      "unit": "tok/s",
+      "conditions": "attention 40 ms/token (F32 KV cache ~576 MB/token); before the shared-row attention rewrite 13.63 tok/s; noisy machine (15.2-15.6)",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 512 tokens, fully cached, same shape",
+      "value": 389.6,
+      "unit": "tok/s",
+      "conditions": "one hearth_eval of 512 tokens (max_batch 512); attention 0.57 s, MoE 0.74 s; 64 tokens: 192 tok/s; noisy machine",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 3000 tokens, fully cached, same shape",
+      "value": 179.0,
+      "unit": "tok/s",
+      "conditions": "chunks of 512; attention 12.4 s of 16.8 s; before the rewrite 118.7 tok/s",
+      "kind": "measured"
+    },
+    {
+      "metric": "prefill 32 tokens, 4 GiB cache, cold, direct I/O",
+      "value": 16.42,
+      "unit": "tok/s",
+      "conditions": "I/O-bound: 3959 unique expert loads = 9.96 GB at 5.1 GB/s",
+      "kind": "measured"
+    },
+    {
+      "metric": "decode thread scaling, fully cached, same shape",
+      "value": 23.62,
+      "unit": "tok/s at 16 threads",
+      "conditions": "8 threads 22.99, 16 23.62, 24 21.68, 32 12.26 (SMT siblings + 8 reader threads); 64 tokens each; noisy machine",
+      "kind": "measured"
+    },
+    {
+      "metric": "test_model checks",
+      "value": 386,
+      "unit": "checks, 0 failed",
+      "conditions": "MSVC /O2 2.6 s; MSVC ASan /Od 12.4 s, seeds 1, 2, 3, 7",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score model.c",
+      "value": 80.0,
+      "unit": "percent",
+      "conditions": "mutate.py seed 2, 80 of 2483 candidates, test_model; seed 1: 70.0% (62.5% before the gap-closing tests); survivors classified in the ledger",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score api.c",
+      "value": 71.7,
+      "unit": "percent",
+      "conditions": "mutate.py seed 1, 60 of 310 candidates, test_model (60.0% before the hx_parse_isa seam test). 17 survivors: redundant option checks (an unknown ISA also fails in hx_kernels_for; 9 mirrors fail on the NULL 9th path), isa_name only reached for an ISA this CPU lacks, HX_OK==0 returns, normalisations, log calls, unreachable out-of-memory paths, leaks, and one memory-only mutant (parse loop i <= 4 reads past a static array; ASan-visible)",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "POSIX build not compiled (no gcc/clang here): model.c/api.c/test_model.c/hearth_bench.c use only C11 + hx_platform.h, checked by reading only. test_model.c uses fseek with long offsets (its containers are a few MB).",
+    "No real-weight model was available: all performance numbers are on synthetic make_shaped weights; prefetch precision and cache hit rates on real routing are unmeasured.",
+    "Trace ids >= 256 (u16 high byte) are not exercised by any test (tiny models have <= 16 experts); the code writes and validates both bytes.",
+    "Benchmarks were measured on a shared, ~69% busy machine; T09 should re-measure on a quiet one."
+  ]
+}

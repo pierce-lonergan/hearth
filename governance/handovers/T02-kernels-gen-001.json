@@ -1,0 +1,224 @@
+{
+  "generation_id": "gen-001-kernels",
+  "parent_generation": null,
+  "timestamp": "2026-10-04T13:55:00Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T02-kernels",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "new: engine/src/quant.c, engine/src/quant_avx2.c, engine/src/quant_avx512.c, engine/tests/test_quant.c, governance/handovers/T02-kernels-gen-001.json"
+  },
+  "constraints_touched": [
+    "INV-DET-1",
+    "INV-DET-2",
+    "INV-DET-3",
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Scalar, AVX2 and AVX-512 kernels are memcmp-identical for F32/F16/BF16/Q8/Q4, any T, any row range; batched T == T single calls (INV-DET-3, INV-DET-2 at kernel level).",
+        "evidence": "engine/tests/test_quant.c: 295 matmul cases (rows 1..67, cols 1..4096 float / 64..4096 quant, T 1..9, 7 input kinds incl. zero blocks, outliers, +-max, exact .5 ties, subnormal/tiny, cancellation), random row splits, ldy padding sentinels; all 65536 f16/bf16 bit patterns; 117486 checks, 0 failures under /O2, /Od and /fsanitize=address. dumpbin of quant_avx2.obj / quant_avx512.obj contains no vfmadd/vfmsub/vfnm instructions.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The scalar kernels and quantizers implement docs/NUMERICS.md exactly (not just consistently across ISAs).",
+        "evidence": "test_quant.c compares the scalar kernels bitwise to an independent NUMERICS §1-§3 implementation decoded from the FORMAT.md byte layout; helpers (sum16, dot16, rmsnorm, softmax, swiglu, sigmoid, rope, axpy) bitwise vs canonical-order code and within tolerance of float64. Pinned FNV hashes of Q8/Q4 quantizer output and of all five dtypes' matmul output on libm-free inputs were reproduced exactly by an independent numpy/pure-Python implementation (scratch script, not in repo).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Mutation sensitivity: the test detects FMA contraction, wrong reduction tree, wrong mul order, truncating rounding, lane/tail mistakes, nibble swaps, wrong Q4 bias, mask/store errors, quantizer changes and helper-order changes.",
+        "evidence": "21 hand-made mutants run against test_quant --no-bench --small during development (7 of them before the final kernel/quantizer restructure, the rest on the final code); 20 killed (1..315 failures each). Two mutants first survived and the test was strengthened until they were killed: rmsnorm eps doubled (added an eps=0.25 case + bitwise canonical checks) and dropping SNaN quieting in the scalar f16 converter (equivalent inside kernels; added a dequantize SNaN bit-pattern check). One earlier mutant (refit tie-break <= in the old refit-every-candidate quantizer) survived as near-equivalent and no longer applies to the current algorithm. Not run through governance/tools/mutate.py (not available yet).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "ASAN catches SIMD over-reads in this harness (MSVC instruments intrinsic loads).",
+        "evidence": "Injected a 1-byte over-read in the AVX-512 Q8 unpack: ASAN reported heap-buffer-overflow READ of size 32. Clean code: ASAN run 0 failures, no reports.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Multi-threaded decode over a DRAM-resident matrix approaches the machine's read bandwidth.",
+        "evidence": "Plain AVX-512 streaming read of 1 GiB measured 56 GB/s (1 thread) to 62 GB/s (16-32 threads). Kernels at 16 threads on 1 GiB: 55-60 GB/s for every dtype (AVX-512 and AVX2), i.e. ~90-97% of that ceiling. Measured while other engineers ran builds/tests (CPU 50-100% busy at times): noisy.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Q4 scale search beats a plain absmax/7 baseline on every block and overall.",
+        "evidence": "Per-block squared error <= baseline for all 16384 test blocks; RMSE on N(0,1) 0.08959 vs 0.10756 (16.7% lower, SNR 20.95 vs 19.37 dB). Q8 (absmax/127 per spec) RMSE 0.005925 (44.55 dB).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The maintainers' kernel-level golden test passes with these kernels.",
+        "evidence": "HEARTH_LIB=<data dir>/build/hxcc/hearth_kernels.dll python -m pytest tests/golden/test_golden_invariants.py -k kernel_isa_and_batch_identity -q -> 5 passed (F32, F16, BF16, Q8, Q4), using T03's python/hearth/_native.py and quant.py as they were at 2026-10-04T13:58Z.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "vpgatherdd is the fastest way to collect the 16 per-row f16 block scales.",
+        "evidence": "Single-core L2 Q4: gather 59 GB/s, 16 scalar loads + pinsrw 76 GB/s, loads packed 4-per-u64 in GPRs then vmovq/vpinsrq 86 GB/s (adopted). Masked per-lane loads were far slower (16-25 GB/s).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Software prefetch improves the DRAM-bound multi-threaded Q4/Q8 kernels.",
+        "evidence": "Prefetch distances 512/1024/2048 bytes (all rows or alternating rows) lowered 16-thread DRAM throughput from ~57 to 52-55 GB/s and single-core L2 from ~84 to ~70 GB/s. Not used.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Least-squares refitting every Q4 candidate is needed for quality.",
+        "evidence": "Refitting only the winner (up to 3 iterations) changed RMSE/rms by < 0.01% on N(0,1), Student-t(4) and Laplace data (e.g. 0.089782 -> 0.089779) at ~1.7x the speed; adopted and documented in quant.c.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "GCC/Clang builds (Linux/macOS, and the CMake -mavx512* flags) were not compiled here (no gcc/clang on this machine); reviewed by reading only.",
+      "Q4 quantizer throughput (~25-40 M weights/s per core, ~400 M/s at 16 threads, noisy) means ~30 min to quantize a 671B model. The arithmetic is plain scalar C by mandate; an SSE2/AVX2 version of the same operations would be bit-identical and several times faster if maintainers allow it.",
+      "Float-dtype kernels re-read the row tile per token for T > 1 (fine for routers; a token-blocked variant would help large-T prefill on F16/BF16 weights)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform -o test_quant.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c",
+    "<data dir>/build/hxcc/test_quant.exe                 # correctness + throughput table (allocates 1 GiB, ~20 s)",
+    "<data dir>/build/hxcc/test_quant.exe --no-bench      # correctness only (~1 s)",
+    "<data dir>/build/hxcc/test_quant.exe --bench-only    # throughput table only",
+    "python scripts/hxcc.py --asan --platform -o test_quant_asan.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c",
+    "PATH=\"<MSVC bin/HostX64/x64>:$PATH\" <data dir>/build/hxcc/test_quant_asan.exe --small   # the ASAN runtime DLL must be on PATH",
+    "python scripts/hxcc.py --debug --platform -o test_quant_dbg.exe engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_quant.c",
+    "python scripts/hxcc.py --shared --platform -o hearth_kernels.dll engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c   # kernels-only DLL for ctypes",
+    "HEARTH_ISA=scalar|avx2|avx512 <exe>   # dispatch override; prints a warning and uses the best ISA if unknown/unsupported",
+    "HEARTH_LIB=<data dir>/build/hxcc/hearth_kernels.dll python -m pytest tests/golden/test_golden_invariants.py -k kernel_isa_and_batch_identity -q"
+  ],
+  "measurements": [
+    {
+      "metric": "AVX-512 Q4 matvec, L2-resident (512 KiB, cols 4096, T=1), 1 thread",
+      "value": 89.5,
+      "unit": "GB/s weight bytes",
+      "conditions": "Ryzen 9 9950X, MSVC 14.44 /O2, shared machine (other builds running), best of runs varied 74-90",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 Q8 matvec, L2-resident, 1 thread",
+      "value": 133.7,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above; varied 96-134",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 F16 matvec, L2-resident, 1 thread",
+      "value": 131.4,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 F32 matvec, L2-resident, 1 thread",
+      "value": 145.8,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX2 Q4 matvec, L2-resident, 1 thread",
+      "value": 51.8,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX2 Q8 matvec, L2-resident, 1 thread",
+      "value": 73.4,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "scalar Q4 matvec, L2-resident, 1 thread",
+      "value": 1.9,
+      "unit": "GB/s weight bytes",
+      "conditions": "reference path only",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 Q4 matvec, 1 GiB DRAM-resident, 16 threads",
+      "value": 57.0,
+      "unit": "GB/s weight bytes",
+      "conditions": "hx_thread_create, static 16-row-aligned split, T=1; varied 52-60 with machine load",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 Q8 matvec, 1 GiB DRAM-resident, 16 threads",
+      "value": 55.7,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above; varied 51-60",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 F32 matvec, 1 GiB DRAM-resident, 16 threads",
+      "value": 60.3,
+      "unit": "GB/s weight bytes",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "plain streaming read ceiling, 1 GiB, 16-32 threads",
+      "value": 62.0,
+      "unit": "GB/s",
+      "conditions": "scratch AVX-512 load+add loop, same machine",
+      "kind": "measured"
+    },
+    {
+      "metric": "AVX-512 Q4 batched T=8, L2-resident, 1 thread (weight bytes x 8 / s)",
+      "value": 188.8,
+      "unit": "GB/s effective",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "Q4 quantizer throughput, 16 threads",
+      "value": 398.0,
+      "unit": "M weights/s",
+      "conditions": "4096x4096 uniform data, machine ~60% busy with other work",
+      "kind": "measured"
+    },
+    {
+      "metric": "Q4 quantizer throughput, 1 thread",
+      "value": 40.5,
+      "unit": "M weights/s",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "Q8 quantizer throughput, 16 threads",
+      "value": 6030.0,
+      "unit": "M weights/s",
+      "conditions": "as above",
+      "kind": "measured"
+    },
+    {
+      "metric": "Q4 RMSE on N(0,1) (scale search)",
+      "value": 0.089589,
+      "unit": "rms error (signal rms 1.0)",
+      "conditions": "1,048,576 values; absmax/7 baseline 0.107563",
+      "kind": "measured"
+    },
+    {
+      "metric": "Q8 RMSE on N(0,1)",
+      "value": 0.005925,
+      "unit": "rms error (signal rms 1.0)",
+      "conditions": "1,048,576 values",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "POSIX/GCC/Clang compilation of quant*.c and test_quant.c not verified (no compiler available on this Windows machine).",
+    "Only the kernel-level golden test (test_kernel_isa_and_batch_identity, 5/5 passed against a kernels-only DLL) could be run; the engine-level golden tests need model.c/api.c (T08).",
+    "Throughput numbers were measured on a shared, busy machine and must be re-measured on a quiet machine before publication (INV-HONEST)."
+  ]
+}

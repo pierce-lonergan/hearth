@@ -1,0 +1,85 @@
+{
+  "generation_id": "gen-002-pymodel-verifier-fixes",
+  "parent_generation": "gen-001-pymodel",
+  "timestamp": "2026-10-04T17:04:15Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T03-pymodel",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "modified (all still untracked): python/hearth/{_native,quant,format,reference,synth,convert}.py, tests/py/{test_format,test_reference,test_convert}.py; new: governance/handovers/T03-pymodel-gen-002.json"
+  },
+  "constraints_touched": ["INV-NUM-1", "INV-NUM-2", "INV-FMT", "INV-SAFE", "INV-DET-2", "INV-DET-3", "INV-DEP", "INV-DATA", "INV-HONEST", "INV-VERIFY"],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Verifier finding 1 (major) reproduced and fixed: test_q4_conversion_close_to_f32[deepseek_v3] failed with a DLL built from the current quant*.c, because Q4 noise flips near-tied routing decisions and one flip moves a token's logits by up to 1.07x its own max|logit|. The test now bounds Q4-vs-F32 error with the Q4 model replaying the F32 routing (new Reference.replay_routes), and only loosely bounds free-routing agreement.",
+        "evidence": "Before the fix, with a fresh DLL (12:12, from quant.c 10:44 / quant_avx2.c and quant_avx512.c 10:24): 1 failed, 99 passed (assert 0.3203 < 0.15*1.9977). Sweep over 6 archs x seeds 1..8, Q4 experts + Q8 dense: free routing gives rel RMSE 0.073..0.337, corr >= 0.9425, decision agreement 0.79..1.0. Replayed routing gives rel RMSE 0.073..0.141, corr >= 0.9899, per-token max error / max|logit| <= 0.244. Test bounds: rel < 0.2, corr > 0.98, per-token <= 0.35, agreement >= 0.6. Parametrized over (qwen3_moe,1), (deepseek_v3,1), (deepseek_v3,3; failed the old bound), (qwen2_moe,5; agreement 0.81).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier finding 2 (major) fixed: ContainerReader rejects metadata whose FORMAT.md 3.1 key has the wrong type, and applies the C reader's config rules (ranges, head divisibility, MLA, rope_dim, MoE/group consistency, dense_ffn_dim, bos/eos < vocab, tokenizer length/NUL). The only errors raised are ValueError (TypeError is converted too). The writer refuses the same metadata before writing.",
+        "evidence": "Differential run against engine/src/modelfile.c, using a scratch harness around hx_modelfile_open (scratchpad mfcheck.c, not in the repo): 1255 forged containers, made from the 58 BAD_META unit cases plus 1200 random single- or double-key metadata mutations of make_tiny models for all 5 archs (wrong types, boundary u32 values, NaN/inf/negative f32, bad layer_kind/eos arrays, long or NUL tokenizer strings). Agreement 1255/1255: 394 accepted by both, 861 rejected by both. Reference on the 394 accepted files: 333 evaluate, 42 ValueError, 19 KeyError (missing tensor), 0 other exceptions. Unit tests: test_metadata_types_and_ranges_are_validated (58 cases with message matching), test_metadata_validation_accepts_valid_variants, test_reference_rejects_bad_config (forged files incl. n_kv_heads 0 and 3).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Verifier minor findings fixed: n_layers is bounded (<= 512, as HX_MAX_LAYERS) before any per-layer list exists; act_quant_q8 ignores NaN in the block absmax like C; f16 decode quiets signalling NaNs (vcvtph2ps / q_f16); make_tiny works for any max_seq >= 1 and deletes the container when its checks fail; _native.matmul returns None only for rc == -2 and raises RuntimeError for every other failure.",
+        "evidence": "test_huge_layer_count_is_rejected_cheaply: n_layers 1e8 and 0xFFFFFFFF are rejected with < 4 MiB peak traced memory and in < 1 s. test_f16_decode_all_patterns: all 65536 f16 patterns match the definition and native hearth_dequantize bit for bit, for F16 and also as Q8/Q4 block scales (includes 0*inf and 0*NaN). test_matvec_bit_identical_to_engine_kernels now covers NaN, all-NaN-block and +-inf activations and NaN weights on scalar/AVX2/AVX-512; reference matvec stores NaN outputs as the kernels' canonical 0x7FC00000. test_make_tiny_short_max_seq (5 archs, max_seq 1 and 8; max_seq 0 raises and leaves no file). test_native_bindings_validate checks rc -2/-1/-3.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Each new or strengthened test catches the defect it targets.",
+        "evidence": "Scratch revert check: each of 12 fixes was reverted in a copy of python/ + tests/ and the relevant tests were run. All 12 were caught: act-quant NaN, f16 sNaN, canonical NaN, matmul rc, meta type check, n_layers bound, n_kv_heads range, dense-layer slab, max_seq tokens, make_tiny cleanup, out-of-vocab special ids, replay ignored.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The stricter reader breaks no other engineer's code or test.",
+        "evidence": "python -m pytest tests/py (all engineers' tests, HEARTH_LIB = kernels-only DLL): 512 passed, 5 skipped. The golden fixture builds all 11 golden make_tiny models, incl. big_q4 deepseek_v3 Q4 4x32 top-4, and they pass the new validation. Golden kernel tests: 5 passed.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "A whole-logit-matrix RMSE bound (0.15) is a sound check of Q4 conversion quality on tiny random MoE models.",
+        "evidence": "With free routing it holds only by seed luck: deepseek_v3 seeds 2..8 give 0.214..0.337. Routing flips are legitimate quantization effects, not errors. Superseded by replayed-routing bounds.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Intentional remaining differences from the C reader: C also requires rope_inv_freq to be present when rope_dim > 0 (Python checks its dtype/shape only when present, so generic format-test containers stay readable; Reference then raises KeyError if it is absent), and C rejects overlapping regions and alias groups without exactly one unflagged entry. Python does not check either, which is harmless for a reader that does bounded positional reads.",
+      "No real checkpoint has been converted yet (carried over from gen-001); downloads need the user's permission.",
+      "Kimi-K2 ships a tiktoken tokenizer (no tokenizer.json); the converter writes no tokenizer reference (carried over)."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --shared --platform -o \"%LOCALAPPDATA%/hearth/t03/hearth.dll\" engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c   (kernels-only DLL outside <data dir>/build; REBUILD whenever engine/src/quant*.c changes before claiming the suite passes)",
+    "set HEARTH_LIB=%LOCALAPPDATA%\\hearth\\t03\\hearth.dll   (Bash: export HEARTH_LIB=\"$LOCALAPPDATA/hearth/t03/hearth.dll\")",
+    "python -m pytest tests/py/test_format.py tests/py/test_reference.py tests/py/test_convert.py -q",
+    "HEARTH_LIB=C:/nonexistent/hearth.dll python -m pytest tests/py/test_format.py tests/py/test_reference.py tests/py/test_convert.py -q -rs   (native-free run: every native test must skip with a reason)",
+    "python -m pytest tests/golden/test_golden_invariants.py -q -k kernel_isa",
+    "python governance/tools/mutate.py --file python/hearth/format.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_format.py\" --max-mutants 60 --jobs 6 --seed 2",
+    "python governance/tools/mutate.py --file python/hearth/reference.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_reference.py\" --max-mutants 50 --jobs 4 --seed 2",
+    "python governance/tools/validate_handover.py governance/handovers/T03-pymodel-gen-002.json"
+  ],
+  "measurements": [
+    {"metric": "owned python tests passing with native kernels DLL", "value": 175, "unit": "tests", "conditions": "HEARTH_LIB = kernels-only DLL rebuilt 12:12 from current quant.c/quant_avx2.c/quant_avx512.c; without native: 162 passed, 13 skipped with a reason", "kind": "measured"},
+    {"metric": "all tests/py passing (all engineers)", "value": 512, "unit": "tests", "conditions": "same DLL; 5 skipped (need the full engine)", "kind": "measured"},
+    {"metric": "Q4 vs F32 conversion rel logit RMSE, replayed routing (worst of 6 archs x 8 seeds)", "value": 0.141, "unit": "ratio", "conditions": "tiny random transformers models, 16 tokens, Q4 experts + Q8 dense, emulating reference; free routing worst is 0.337", "kind": "measured"},
+    {"metric": "Q4 vs F32 conversion logit correlation, replayed routing (worst of 48)", "value": 0.9899, "unit": "pearson r", "conditions": "as above", "kind": "measured"},
+    {"metric": "free-routing decision agreement Q4 vs F32 (worst of 48)", "value": 0.792, "unit": "fraction", "conditions": "as above; (token, MoE layer) top-k sets", "kind": "measured"},
+    {"metric": "Python vs C reader acceptance agreement", "value": 1255, "unit": "of 1255 forged containers", "conditions": "scratch hx_modelfile_open harness built with hxcc from engine/src/modelfile.c state of 2026-10-04; 394 accepted by both", "kind": "measured"},
+    {"metric": "mutation score format.py", "value": 95.0, "unit": "%", "conditions": "--max-mutants 60 --seed 2, test_format.py; 3 survivors equivalent (1-D row-count constant, closed-file write already raises, unreachable negative read)", "kind": "measured"},
+    {"metric": "mutation score reference.py", "value": 92.0, "unit": "%", "conditions": "--max-mutants 50 --seed 2, test_reference.py; 4 survivors equivalent (cache-size default, reshape(-2), KV list index, 2-D-only slicing)", "kind": "measured"},
+    {"metric": "mutation score quant.py", "value": 87.5, "unit": "%", "conditions": "--max-mutants 40 --seed 2, test_format.py + test_reference.py; 5 survivors are thread-split heuristics that cannot change output bytes", "kind": "measured"},
+    {"metric": "mutation score synth.py", "value": 92.5, "unit": "%", "conditions": "--max-mutants 40 --seed 2; survivors: CHECK_TOKENS constant, a top_k check the writer repeats, physical_experts lower bound (since covered by a P=1 test, not re-run)", "kind": "measured"},
+    {"metric": "mutation score convert.py", "value": 85.0, "unit": "%", "conditions": "--max-mutants 40 --seed 2, test_convert.py; 2 survivors since covered by new asserts (scale column shortfall, _ignorable MTP layers; not re-run), 4 equivalent (transformers-config fallbacks, chunk/thread constants)", "kind": "measured"},
+    {"metric": "mutation score _native.py", "value": 92.5, "unit": "%", "conditions": "--max-mutants 40 --seed 2; 3 survivors are macOS/POSIX-only branches or message text, untestable on Windows", "kind": "measured"}
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Real-checkpoint conversion check (at least OLMoE-1B-7B and one FP8 DeepSeek-V3/Kimi-K2 shard) once a model is available locally with the user's permission to download.",
+    "Golden engine tests (test_engine_matches_reference etc.) not run: they need the full engine DLL (hearth_open/hearth_default_options); with the kernels-only DLL they fail with 'native library does not export hearth_default_options'."
+  ]
+}

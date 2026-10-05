@@ -1,0 +1,232 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      with_torch:
+        description: "Also run the torch/transformers cross-check tests (INV-NUM-1)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Golden tests (INV-VERIFY) never run through a plain `pytest tests/golden`: conftest.py or
+# __init__.py files, pytest.ini/pyproject.toml/setup.cfg/tox.ini, PYTEST_ADDOPTS, planted .pyc
+# files or a sitecustomize on PYTHONPATH could skip or neutralise them, and pytest reports skips
+# as success. `check_golden.py --run` verifies the hash lock and runs a temporary copy of only
+# the locked files, failing on any skip. It is started with `python -E` and without PYTHONPATH so
+# nothing from the repository runs before it, and it is taken from the base revision
+# ($GOV_TOOLS) so that a change cannot weaken the check it is judged by.
+# The decision circuit breaker lives in decisions.yml, which also re-runs when PR labels change.
+
+jobs:
+  governance:
+    name: governance (python ${{ matrix.python }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.13"]   # tools promise Python 3.9+ and the standard library only
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install pytest
+      - name: Verification tools from the base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .trusted
+          sparse-checkout: governance/tools
+          persist-credentials: false
+      - name: Select verification tools
+        shell: bash
+        run: |
+          t=.trusted/governance/tools
+          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
+          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - name: Golden-test lock (INV-VERIFY)
+        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root .
+      - name: Task DAG
+        run: python governance/tools/waves.py validate
+      - name: Handover manifests
+        run: python governance/tools/validate_handover.py --engine builtin
+      - name: Decision records
+        run: python governance/tools/adr.py lint
+      - name: Governance tool tests
+        run: python -m pytest tests/py/test_governance.py -q
+
+  linux:
+    name: linux ${{ matrix.cc }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy pytest
+      - name: Verification tools from the base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .trusted
+          sparse-checkout: governance/tools
+          persist-credentials: false
+      - name: Select verification tools
+        shell: bash
+        run: |
+          t=.trusted/governance/tools
+          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
+          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
+      - name: Configure
+        run: >
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          -DCMAKE_C_COMPILER=${{ matrix.cc }} -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Build
+        run: cmake --build build -j 4
+      - name: C tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Python tests
+        env:
+          PYTHONPATH: python
+          HEARTH_LIB: ${{ github.workspace }}/build/libhearth.so
+        run: python -m pytest tests/py -q
+      - name: Golden tests, isolated (INV-VERIFY)
+        env:
+          HEARTH_LIB: ${{ github.workspace }}/build/libhearth.so
+        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root . --run
+
+  linux-asan:
+    name: linux asan+ubsan
+    runs-on: ubuntu-latest
+    env:
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1:strict_string_checks=1
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DHEARTH_ASAN=ON -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Build
+        run: cmake --build build-asan -j 4
+      - name: C tests under ASan/UBSan (INV-SAFE)
+        run: ctest --test-dir build-asan --output-on-failure
+
+  windows:
+    name: windows msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy pytest
+      - name: Verification tools from the base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .trusted
+          sparse-checkout: governance/tools
+          persist-credentials: false
+      - name: Select verification tools
+        shell: bash
+        run: |
+          t=.trusted/governance/tools
+          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
+          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - shell: bash
+        run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
+      - name: Configure (Visual Studio generator, x64)
+        # -A selects the platform of a Visual Studio generator; CMake's default on Windows
+        # is the newest installed Visual Studio, so this fails loudly if that changes.
+        run: cmake -S . -B build -A x64 -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: C tests
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Python tests
+        env:
+          PYTHONPATH: python
+          HEARTH_LIB: ${{ github.workspace }}\build\Release\hearth.dll
+        run: python -m pytest tests/py -q
+      - name: Golden tests, isolated (INV-VERIFY)
+        env:
+          HEARTH_LIB: ${{ github.workspace }}\build\Release\hearth.dll
+        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root . --run
+
+  macos:
+    name: macos arm64
+    runs-on: macos-latest   # Apple silicon
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install numpy pytest
+      - name: Verification tools from the base revision
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          path: .trusted
+          sparse-checkout: governance/tools
+          persist-credentials: false
+      - name: Select verification tools
+        shell: bash
+        run: |
+          t=.trusted/governance/tools
+          [ -f "$t/check_golden.py" ] || t=governance/tools   # the base predates the tools
+          echo "GOV_TOOLS=$t" >> "$GITHUB_ENV"
+      - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_COMPILE_WARNING_AS_ERROR=ON
+      - name: Build
+        run: cmake --build build -j 4
+      - name: C tests
+        run: ctest --test-dir build --output-on-failure
+      - name: Python tests
+        env:
+          PYTHONPATH: python
+          HEARTH_LIB: ${{ github.workspace }}/build/libhearth.dylib
+        run: python -m pytest tests/py -q
+      - name: Golden tests, isolated (INV-VERIFY)
+        env:
+          HEARTH_LIB: ${{ github.workspace }}/build/libhearth.dylib
+        run: python -E ${{ env.GOV_TOOLS }}/check_golden.py --root . --run
+
+  transformers-crosscheck:
+    name: transformers cross-check (manual)
+    if: github.event_name == 'workflow_dispatch' && inputs.with_torch
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install numpy, pytest, CPU torch, transformers
+        run: |
+          python -m pip install numpy pytest safetensors tokenizers transformers
+          python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: echo "HEARTH_DATA=$RUNNER_TEMP/hearth-data" >> "$GITHUB_ENV"
+      - name: Build
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build -j 4
+      - name: Python tests including the cross-checks
+        env:
+          PYTHONPATH: python
+          HEARTH_LIB: ${{ github.workspace }}/build/libhearth.so
+        run: python -m pytest tests/py -q

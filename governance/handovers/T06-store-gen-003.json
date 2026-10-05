@@ -1,0 +1,174 @@
+{
+  "generation_id": "gen-003-store-wakeups-starvation",
+  "parent_generation": "gen-002-store-verifier-fixes",
+  "timestamp": "2026-10-04T18:33:33Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "T06-store",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "aafa8f1",
+    "head_commit": "aafa8f1",
+    "uncommitted_diff_stat": "all four owned files are untracked relative to aafa8f1; changes since gen-002: engine/src/store.c 922 -> 967 lines (wait_any fresh-completion tracking, u64 tokens_observed, pin count as hearth.sim, n_io clamp warning), engine/tests/test_store.c 2222 -> 2694, engine/src/modelfile.c 1 line (qsort guard), engine/tests/test_modelfile.c 5 lines (walk() float cast); new: governance/handovers/T06-store-gen-003.json"
+  },
+  "constraints_touched": [
+    "INV-FMT",
+    "INV-SAFE",
+    "INV-DET-1",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "MAJOR (verifier) fixed: hx_store_wait_any no longer sleeps through a completion that happened before the call. A demand read that completes (or fails) while the caller has not looked at that expert since its miss marks it fresh; wait_any returns at once while anything is fresh, then reports every completion so far (generation counter, O(1)); try_acquire/acquire of an expert clear its flag. With nothing new it still waits for the next completion or out its timeout, so polling a failed expert cannot spin.",
+        "evidence": "Reproduced first: the new tests built against the unmodified gen-002 store.c (saved copy) gave wait_any blocking 1000.4 ms with the demanded slab already resident, 1000.2 ms when a hit on another expert came between the miss and wait_any, and in the ARCHITECTURE step 2-4 decode loop (200 ms timeout) 13 lost wakeups with 1 reader and 11 with 4 over 60 tokens (2.6 s and 2.4 s). Fixed store.c, same tests: 0 lost wakeups over 200 tokens x 2 configs on every seed run (e.g. 1546 waits, 278 of them with a missing expert already resident, longest 0.00 ms; 200 tokens in 0.03 s). wait_any_wakeups also asserts: reported once (an uncollected slab, then wait_any(30 ms) >= 30 ms), a slab collected by try_acquire or by a blocking acquire is no news, a demand that failed before the call returns at once (< 500 ms of a 1 s timeout) and then polling waits, a completion during the call ends it (40-1000 ms for a read released after 50 ms). The verifier's suggested epoch (seen = completions after every try_acquire) was rejected because it loses a completion that lands between the miss and a later hit in the same pass; as mutant W6 it fails the intra-pass check and the decode loop (19 and 23 lost wakeups).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "MAJOR (verifier) fixed: the four surviving targeted mutants are now killed by deterministic, read-hook-gated tests, both with --quick and in full mode.",
+        "evidence": "Scratch driver (each mutant alone on a copy of store.c, against the final test_store.c; --quick --seed 3 and 5, full --seed 4): M1 LRU hot rule off -> hot_rule now runs LRU too ('LRU: a prefetch evicted an expert used this token'); M2 failed read leaks its slot -> starvation(a): 5 injected failures at the minimum slot count, then all 11 slots demanded at once ('only 6 of 11 slots could be filled'), plus top-k bursts; M4 no work_cv broadcast on release -> starvation(b): every slot acquired, a demand starves, a release alone must start its read within 2 s; M9 acquire breaks holds with reads in flight, and M9b the same in wait_any -> starvation(c): two held slabs, one read gated in flight, another demand starved, a blocked acquire / wait_any must not cause a re-read (4 and 3 reads of 2 slabs under the mutants). M11 (hint on a resident expert no longer protects it) also killed by a new protection variant. All KILLED, none by the watchdog. M3a/M3b (stale starved flag) survive and are equivalent by construction: starved is set only while the demand queue is non-empty and the queue only shrinks in the branch that clears it, so the second clear is redundant; without the first, the flag stays stale only while a read is in flight (loading >= 1), and the only readers that act on it with loading == 0 (break_holds) re-evaluate after the reader's next next_job; the remaining effect is spurious broadcasts.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (verifier) fixed: tokens_observed is an exact u64 (seed + ticks, saturating at 2^64-1); the double is used only for the heat-rate division.",
+        "evidence": "Against gen-002: seed 2^60+1 + 3 ticks wrote 1152921504606846976, seeds 2^64-2 and 2^64-1 wrote 9223372036854775808 (MSVC). Fixed: 2^60+4, 2^64-1, 2^64-1, and 0+3 = 3; WSL gcc with -fsanitize=float-cast-overflow (no recover): clean. Saturation mutant T1 KILLED.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (verifier) fixed: the pinned count is int(pin_fraction * slots) computed as hearth.sim does (python/hearth/sim/cache.py:680), on the decimal value the caller wrote: the float option is rounded to 6 decimals (exact recovery, then one correctly rounded double multiply).",
+        "evidence": "New pin_count test, 4x64 container, 100 slots, every expert profiled: 0.7 -> 70 (gen-002: 69), 0.35 -> 35 (gen-002: 34), 0.29 -> 28, 0.57 -> 56, 0.55 -> 55, 0.3 -> 30 (all equal to Python int(x*100), checked with python), 0.9 -> 89 (the cap that keeps 11 minimum slots unpinned). Mutant P1 (gen-002 formula) KILLED.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Minor (verifier) addressed in code within the contract: n_io_threads outside 1..64 is clamped with a WARN log ('n_io_threads %d is outside 1..64, using %d (minimum slots follow)'); the minimum slot count uses the clamped value. Documenting the bound in hx_store.h needs a maintainer edit (contract_issues).",
+        "evidence": "api_edges: n_io_threads 100 -> 2*top_k + 64 + 2 = 74 slots and a slab reads correctly. The log line itself is not captured by the test (hx_log has no sink hook); the test runs at HX_LOG_ERROR.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "governance/tools/mutate.py (seed 1, 80 of 1324 candidates, test_store --quick, MSVC /O2) showed four more real gaps, now covered: a demand must evict an unused prefetch as the last resort (prefetches are protected, not held); read_ns had no upper bound; tokens_observed 0 means raw counts are the heat; a warm-loaded slab must remain evictable. Plus API edges: a bad mirror list reports a message, and a NULL mirror path is rejected without a crash.",
+        "evidence": "First run: 68.8% (52 killed, 3 timeouts, 25 survived). New checks added: protection last resort, LRU and LFU; api_edges read_ns <= ns since the reset; seeded_heat with tokens 0 (80 not hot, 120 hot); pin_cap LRU churn after a warm start: pinned kept, warm-loaded evicted; NULL mirror; err message. Their mutants (S216, S345, S634, S780, S806, S898) are all KILLED by the scratch driver. Second mutate.py run on the same 80 candidates and the final test: 76.2% (58 killed, 3 timeouts, 19 survived). The 19 survivors: 4 equivalent (xorshift constant 17->18, unreachable n <= 0 guard since n_pin <= 0.9*n_slots, pick_file re-checking the first file under a strict <, the cmp_ranked tie-break returning 0, where both MSVC qsort and glibc keep key order on these inputs), 3 memory-only that release builds cannot see but MSVC ASan KILLS (A170 LFU sample range with pins: heap-buffer-overflow; A709 mirror preamble read before pre[]: stack-buffer-overflow; A876 usage_out copy one byte long: heap-buffer-overflow, after the test began passing an exactly sized heap string), 8 log/message-only, 4 leak-only (MSVC has no leak checker; the gcc LeakSanitizer run of the real code is clean).",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Two UBSan findings outside the verifier's list, found by adding -fsanitize=float-cast-overflow with no recover to the WSL gcc build, are fixed: modelfile.c called qsort with a NULL base for containers with zero tensors (C11 7.22.5 requires valid pointers even for a zero count), and test_modelfile.c's walk() cast an arbitrary fuzzed float to uint8_t.",
+        "evidence": "Before: 'src/modelfile.c:721:5: runtime error: null pointer passed as argument 1' (test_modelfile seeds 5 and 6) and 'tests/test_modelfile.c:835:62: runtime error: -8.1905e+36 is outside the range of representable values of type unsigned char'. After the guard (n_tensors > 1) and walking the float's bytes: test_modelfile seeds 5-12 and test_store seeds 2-6 clean under gcc ASan+UBSan+float-cast-overflow+LSan, -Wall -Wextra no warnings.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "No regressions in any earlier property.",
+        "evidence": "Windows MSVC /O2, /W3 (no compiler output): test_store full seeds 1-5 0 failed (409-424k checks each, 13-18 s), --quick seed 3 0 failed; two batches of 8 parallel --quick instances (seeds 11-18, 21-28) all 0 failed (the new timing assertions held under that load); MSVC ASan /Od: test_store full seed 1 and 7, --quick 8 and 9, test_modelfile seeds 9 and 11, all 0 failed with no ASan report; test_modelfile /O2 seeds 1-3 0 failed. Policy check unchanged: LRU 0.000, LFU 0.258 (full) / 0.256 (quick).",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "Recording a caller-observation epoch (seen = completions) at the end of every try_acquire/acquire/wait_any, as the verifier suggested, removes the lost wakeup.",
+        "evidence": "It loses the completion of an expert missed earlier in a pass if a later try_acquire in the same pass hits: wait_any then sleeps until the next completion or the timeout. Mutant W6 (equivalent bookkeeping) fails 'wait_any blocked 1000.4 ms although an expert missed earlier in the pass was resident', and the decode loop loses 19 and 23 wakeups. Hence per-expert fresh flags.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "The verifier's mutant M3 (stale starved flag) points at missing coverage.",
+        "evidence": "Both plausible forms (no clear after a demand gets a slot; no clear when the demand queue is empty) are equivalent by construction: see the second validated hypothesis. They survive every run; no test can tell them apart except by counting condition-variable broadcasts.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "hx_store_acquire still returns NULL (for the rest of the token) when an expert cannot be read on any attempt/mirror, against hx_store.h 'Never NULL for valid ids'; awaiting the maintainer decision (contract_issues). T07/T08 must treat NULL as an I/O error.",
+      "hearth.sim's pin count int(pin_fraction*slots) truncates 0.29*100 = 28.999999999999996 to 28; the store now matches it exactly, so they agree, but both under-pin by one at such values. A shared rule such as int(pin_fraction*slots + 1e-9) would need the sim owner and store.c changed together.",
+      "hearth.sim's engine_min_slots(top_k, io_threads) does not apply store.c's 64-reader clamp; equal for io_threads <= 64.",
+      "The per-layer canonical tensor shapes/dtypes (FORMAT 4.1) are still not validated by modelfile.c, only rope_inv_freq; model.c (T08) must check every tensor it binds (carried over).",
+      "pf_queue_limit asserts the store.c queue bounds (white-box), carried over. Benchmark: the cold direct-read curve for 2.39 MiB slabs is not monotonic in readers and its shape changed between gen-002 and this run (2 readers 7.07 then 3.43 GB/s), so the per-reader-count numbers are dominated by machine noise; to be re-measured on a quiet machine."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o test_store.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c   # add -- --quick (~5 s), --seed N, --dir D; full ~15 s. The 'giving up after 3 read attempts' errors in the output are expected (injected / truncated-file cases)",
+    "python scripts/hxcc.py --platform --run -o test_modelfile.exe engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_modelfile.c   # add -- --quick, --seed N, --iters N",
+    "python scripts/hxcc.py --asan --debug --platform -o test_store_asan.exe <same sources as test_store>; run <build dir>/test_store_asan.exe with C:/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64 (clang_rt.asan_dynamic-x86_64.dll) on PATH; same for test_modelfile. hxcc prints the build dir (<data dir>/build/hxcc; in this app sandbox %LOCALAPPDATA% for python resolves under AppData/Local/Packages/Claude_pzs8sxrjxfjjc/LocalCache/Local/hearth)",
+    "<build dir>/test_store.exe --bench [--gib 6] [--dir D]   # writes ~6 GiB per slab size into the data dir ($HEARTH_DATA, else %LOCALAPPDATA%/hearth or ~/.cache/hearth; must exist), prints the GB/s table, deletes the files (~22 s)",
+    "Linux (WSL2 Ubuntu, gcc 13.3): copy engine/src/*.c *.h *.inc, engine/include/*.h and both tests to a WSL-local dir; F='-std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -O1 -g -fsanitize=address,undefined,float-cast-overflow -fno-sanitize-recover=undefined,float-cast-overflow -Iinclude -Isrc'; gcc $F -mavx2 -mfma -mf16c -c src/quant_avx2.c -o qa2.o; gcc $F -mavx512f -mavx512bw -mavx512vl -mavx512vnni -mavx2 -mfma -mf16c -c src/quant_avx512.c -o qa512.o; gcc $F src/store.c src/modelfile.c src/quant.c src/platform_posix.c tests/test_store.c qa2.o qa512.o -lm -o ts; gcc $F src/modelfile.c src/quant.c src/platform_posix.c tests/test_modelfile.c qa2.o qa512.o -lm -o tm; run both from an empty directory with TMPDIR=/tmp",
+    "python governance/tools/mutate.py --file engine/src/store.c --test \"python scripts/hxcc.py --platform --run -o {tmp}/t06m_store.exe engine/src/store.c engine/src/modelfile.c engine/src/quant.c engine/src/quant_avx2.c engine/src/quant_avx512.c engine/tests/test_store.c -- --quick\" --max-mutants 80 --jobs 4 --seed 1 --timeout 240   # ~30 min; do not edit the tree while it runs"
+  ],
+  "measurements": [
+    {
+      "metric": "lost wait_any wakeups in the ARCHITECTURE step 2-4 decode loop (200 ms timeout)",
+      "value": 0,
+      "unit": "count (gen-002 store.c: 13 with 1 reader, 11 with 4 readers, 60 tokens)",
+      "conditions": "test_store decode_loop, main test container (6 layers, 1 dense, 16 experts, top-4), 24 slots, LFU; 200 tokens x {1, 4} readers on full runs seeds 1-5 and in the MSVC ASan and gcc sanitizer builds; 60 tokens with --quick. With the fix 200 tokens take 0.03 s; gen-002 took 2.6 s for 60 tokens",
+      "kind": "measured"
+    },
+    {
+      "metric": "wait_any latency with an awaited slab already resident",
+      "value": 0.06,
+      "unit": "ms (worst observed; gen-002: 1000.4 ms, i.e. the full 1 s timeout)",
+      "conditions": "worst over the decode-loop waits that had a missing expert already resident (0.00-0.06 ms across the MSVC, ASan and gcc runs); test_store wait_any_wakeups asserts < 10 ms, also after an intervening hit in the same pass (gen-002: 1000.2 ms)",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score store.c",
+      "value": 76.2,
+      "unit": "percent",
+      "conditions": "governance/tools/mutate.py seed 1, 80 of 1324 candidates, test_store --quick, MSVC /O2: 58 killed, 3 timeouts, 19 survived (4 equivalent, 3 memory-only that are killed under MSVC ASan, 8 log/message-only, 4 leak-only). Same candidates before this generation's last test additions: 68.8%. The candidate set differs from gen-002's 70.0% run (store.c changed), so the scores are not directly comparable",
+      "kind": "measured"
+    },
+    {
+      "metric": "targeted store.c mutants killed (verifier M1, M2, M4, M9 + M9b, M11, wait_any W1-W6, tokens T1, pin P1, mutate.py gaps S216/S345/S634/S780/S806/S898, memory A170/A709/A876 under ASan)",
+      "value": 23,
+      "unit": "of 25 (M3a, M3b survive: equivalent)",
+      "conditions": "scratch driver, each mutant alone against the final test_store.c, --quick seeds 3 and 5, the verifier's set also full --seed 4; A* built with --asan --debug",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, direct I/O, 2.39 MiB Q4 slabs (Qwen3-30B-A3B expert 2048x768), readers 1/2/4/8/16",
+      "value": 6.08,
+      "unit": "GB/s (peak, 16 readers)",
+      "conditions": "test_store --bench, Samsung 990 PRO 2TB, Ryzen 9 9950X, Windows 11; 5.98 GiB synthetic container, random order, whole file per point: 4.65/3.43/6.03/5.88/6.08 GB/s. Other engineers' builds and tests were running (noisy; gen-002 measured 4.83/7.07/6.00/5.93/6.13); synthetic weights; read path unchanged since gen-002",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, direct I/O, 22.3 MiB Q4 slabs (DeepSeek-V3/Kimi-K2 expert 7168x2048), readers 1/2/4/8/16",
+      "value": 6.58,
+      "unit": "GB/s (peak, 8 readers)",
+      "conditions": "same run and caveats; 5.58 GiB container: 5.65/4.70/5.12/6.58/6.52 GB/s",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, buffered I/O, 2.39 MiB slabs, readers 1/2/4/8/16",
+      "value": 5.79,
+      "unit": "GB/s (peak, 8 readers)",
+      "conditions": "each point reads a disjoint never-read fifth (1.2 GiB) of a file written unbuffered: 2.51/4.67/4.92/5.79/5.57 GB/s; noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "cold demand-read throughput, buffered I/O, 22.3 MiB slabs, readers 1/2/4/8/16",
+      "value": 6.82,
+      "unit": "GB/s (peak, 8 readers)",
+      "conditions": "disjoint 1.11 GiB fifths: 2.88/5.33/6.39/6.82/6.76 GB/s; noisy",
+      "kind": "measured"
+    },
+    {
+      "metric": "LFU vs LRU hit rate, cyclic layer access, cache 16 slots < 32 slabs/token, Zipf(1.2) routing",
+      "value": 0.258,
+      "unit": "hit rate (LFU); LRU 0.000",
+      "conditions": "test_store policy check, synthetic trace, 800 tokens, first 20% excluded (unchanged)",
+      "kind": "measured"
+    },
+    {
+      "metric": "test runtime test_store full / --quick",
+      "value": 15.0,
+      "unit": "s (full, 13-18 s); --quick 4.5-5.5 s; MSVC ASan full ~17-19 s",
+      "conditions": "MSVC /O2 on a shared machine",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "hx_store_acquire can return NULL for a valid id (unreadable expert, until the next tick) although hx_store.h says it never does; kept as a reported contract issue awaiting a maintainer decision (no zero-filled slab is ever returned, no hang). hx_store_stats has no read-error field (the header is read-only to T06); store.c counts failures internally and logs the count at close.",
+    "hx_store.h's wait_any comment ('Block until some read completes') does not describe returning at once for a completion that happened before the call; the implemented semantics are proposed for the header in contract_issues.",
+    "n_io_threads is clamped to 1..64 (now with a WARN log); hx_store.h documents no upper bound: proposed in contract_issues.",
+    "usage_out is not replaced atomically: hx_platform.h has no rename/replace (carried over).",
+    "POSIX build verified on Linux (WSL2 gcc 13.3) only; macOS/BSD not compiled."
+  ]
+}
