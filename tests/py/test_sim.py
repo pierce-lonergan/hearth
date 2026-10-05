@@ -13,8 +13,8 @@ import pytest
 
 from hearth import presets
 from hearth.sim import (HARDWARE, ONLINE_POLICIES, POLICIES, Calibration, Lossy, Prefetch, Spec, Trace,
-                        build_schedule, calibrate, engine_min_slots, get_hardware, levers, load_usage, main,
-                        model_costs, parse_nvme, retime, run_cache, save_usage, simulate, slab_bytes, sweep,
+                        build_schedule, calibrate, engine_min_slots, feasibility, get_hardware, levers, load_usage,
+                        main, model_costs, parse_nvme, retime, run_cache, save_usage, simulate, slab_bytes, sweep,
                         synthetic, synthetic_for)
 from hearth.sim.timing import COMPONENTS, evaluate
 from hearth.sim.trace import zipf_popularity
@@ -317,6 +317,166 @@ def test_prefetch_accounting():
     assert fast.late_prefetch_rate == 0.0
 
 
+# ---- prefetch byte accounting, hand-computed (H04: council round 1, T04 finding 1) -------------------
+
+def test_prefetch_counters_hand_traced():
+    """Every counter of a 4-token, 3-layer run, traced by hand. E = 2, k = 1, Prefetch(1.0, 1): each layer
+    predicts the next layer's true expert, then the only other one (deterministic). LRU, 3 slots; cold keys
+    2 and 5. Keys: layer 0 = {0, 1}, layer 1 = {2, 3}, layer 2 = {4, 5}.
+      t0: miss 0; prefetch 2, 3. L1 uses 2 (3 wasted); prefetch 4 evicts 0, 5 is dropped (2 is protected).
+          L2 uses 4. Step end releases 3.                                    residents {3, 2, 4}
+      t1: miss 1 evicts 3; prefetch 3 evicts 4 (2 is the true one, already resident). L1 hits 2 (3 wasted);
+          prefetch 5 evicts 1, 4 is dropped. L2 uses 5.                       residents {3, 2, 5}
+      t2: miss 0 evicts 3; prefetch 3 evicts 5. L1 uses 3; prefetch 5 evicts 2, 4 evicts 0. L2 uses 5 (4
+          wasted).                                                           residents {3, 4, 5}
+      t3: miss 0 evicts 3; prefetch 2 evicts 4, 3 evicts 5. L1 uses 2 (3 wasted); prefetch 4 evicts 0, 5 is
+          dropped. L2 uses 4.
+    Admissions: 4 misses + 11 prefetches = 15 into 3 slots, so 12 evictions."""
+    ids = np.array([[0, 0, 0], [1, 0, 1], [0, 1, 1], [0, 0, 0]], dtype=np.uint16).reshape(4, 3, 1)
+    sched = build_schedule(ids, 2)
+    assert sched.acc.tolist() == [0, 2, 4, 1, 2, 5, 0, 3, 5, 0, 2, 4]
+    c = run_cache(sched, "lru", 3, prefetch=Prefetch(1.0, 1), cold_keys=[2, 5])
+    zero = [0] * 12
+    want = dict(hit=[0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0], hit_cold=[0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0],
+                pfhit=[0, 1, 1, 0, 0, 1, 0, 1, 1, 0, 1, 1], pfhit_cold=[0, 1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0],
+                miss=[1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 0], miss_cold=zero, bypass=zero, vram=zero, skip=zero,
+                pf_issued=[2, 1, 0, 1, 1, 0, 1, 2, 0, 2, 1, 0], pf_issued_cold=[1, 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0],
+                pf_wasted=[1, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0, 0], pf_wasted_cold=zero)
+    for name, w in want.items():
+        assert getattr(c, name).tolist() == w, name
+    assert c.evictions == 12 and c.slots == 3 and c.n_pinned == 0
+
+
+def _tiny_prefetch_run(hw, **kw):
+    """2 MoE layers x 2 experts, top-1, 3 tokens: t0 = (0, 2), t1 = (1, 2), t2 = (0, 3). Every expert fits
+    (slots = 4), Prefetch(1.0, 1) predicts both layer-1 experts; the array profile makes keys 1 and 2 (layer 0
+    expert 1, layer 1 expert 0) the cold half. By hand:
+      t0: L0 misses 0 (hot) and prefetches 2 (cold, needed) and 3 (hot, wrong); L1 uses the prefetched 2.
+      t1: L0 misses 1 (cold); nothing left to prefetch; L1 hits 2 (cold).
+      t2: L0 hits 0, L1 hits 3 (both hot)."""
+    shape = dataclasses.replace(presets.get(SMALL), name="tiny-pf", n_layers=2, n_experts=2, top_k=1)
+    tr = Trace(np.array([[0, 0], [1, 0], [0, 1]], dtype=np.uint16).reshape(3, 2, 1), 2)
+    base = dict(trace=tr, policy="lru", cache_gb=1.0, io_threads=1, prefetch=Prefetch(1.0, 1), warmup=0,
+                lossy=Lossy(cold_bits=2.25, cold_frac=0.5), profile=np.array([3.0, 0.0, 0.0, 2.0]), context=0,
+                calib=Calibration(overhead_ms=0.5, layer_overhead_us=10.0))
+    return simulate(shape, hw, **{**base, **kw})
+
+
+def test_prefetch_bytes_per_token_hand_computed():
+    """bytes_per_token, rates and step times of _tiny_prefetch_run, with the prefetch window too short for all
+    prefetched bytes (0 < f < 1, so the needed cold slab is partly promoted to a demand read) and with fast
+    storage (f = 1). nvme_demand + nvme_prefetch - nvme_prefetch_wasted equals the bytes of misses + prefetch
+    hits; dram is every expert computed plus the backbone; all per accepted token."""
+    hw = get_hardware("this-pc", nvme_latency_us=80.0)
+    r = _tiny_prefetch_run(hw)
+    c, cal = r._costs, r.calibration
+    S, Sc = float(c.slab), float(c.slab_cold)
+    assert (c.slab, c.slab_cold) == (3342336, 1769472)            # FORMAT sec. 5 at 4.25 and 2.25 bpw
+    assert r.slots == 4 and r.tokens == 3 and r.steps == 3
+    cnt = r._counts
+    assert cnt.miss.tolist() == [1, 0, 1, 0, 0, 0] and cnt.miss_cold.tolist() == [0, 0, 1, 0, 0, 0]
+    assert cnt.pfhit.tolist() == [0, 1, 0, 0, 0, 0] and cnt.pfhit_cold.tolist() == [0, 1, 0, 0, 0, 0]
+    assert cnt.hit.tolist() == [0, 0, 0, 1, 1, 1] and cnt.hit_cold.tolist() == [0, 0, 0, 1, 0, 0]
+    assert cnt.pf_issued.tolist() == [2, 0, 0, 0, 0, 0] and cnt.pf_issued_cold.tolist() == [1, 0, 0, 0, 0, 0]
+    assert cnt.pf_wasted.tolist() == [1, 0, 0, 0, 0, 0] and cnt.pf_wasted_cold.tolist() == [0] * 6
+
+    bw_d, bw_io, ops, lat = 60e9, 6.5e9, 5e12, 80e-6
+    ch = max(S / bw_d, 2.0 * c.expert_params / ops)
+    cc = max(Sc / bw_d, 2.0 * c.expert_params / ops)
+    A = max(c.layer_bytes / bw_d, 2.0 * c.layer_params / ops)
+    G = max(c.global_bytes / bw_d, 2.0 * c.global_params / ops)
+    assert (cal.overhead_ms, cal.layer_overhead_us) == (0.5, 10.0)
+    F = 0.5e-3 + 10e-6 * 2
+    # t0, L0: one hot miss, nothing computed before it lands; storage is then idle for ch until L1's MoE
+    moe00 = lat + S / bw_io + ch
+    f = (ch + A) * bw_io / (Sc + S)                                   # share of the 2 prefetched slabs in time
+    assert 0.0 < f < 1.0
+    # t0, L1: a share f of the needed (cold) prefetch arrived in time; the rest is promoted to a demand read
+    m = 1 - f                                                         # late share, a demand read
+    moe01 = max(f * cc + m * cc, lat + m * Sc / bw_io + cc, lat + Sc / bw_io + m * cc)   # sec. 3.4, W0 = f * cc
+    steps = [F + G + 2 * A + moe00 + moe01,
+             F + G + 2 * A + (lat + Sc / bw_io + cc) + cc,
+             F + G + 2 * A + ch + ch]
+    assert math.isclose(r.ms_per_token, sum(steps) / 3 * 1e3, rel_tol=1e-12)
+    nvme_wait = (lat + S / bw_io) + (moe01 - cc) + (lat + Sc / bw_io)
+    assert math.isclose(r.time_per_token_ms["nvme"], nvme_wait / 3 * 1e3, rel_tol=1e-12)
+    b = r.bytes_per_token
+    backbone = c.global_bytes + 2 * (c.layer_bytes + c.shared_bytes)
+    assert math.isclose(b["nvme_demand"], (S + (1 - f) * Sc + Sc) / 3, rel_tol=1e-12)
+    assert math.isclose(b["nvme_prefetch"], f * (Sc + S) / 3, rel_tol=1e-12)
+    assert math.isclose(b["nvme_prefetch_wasted"], f * S / 3, rel_tol=1e-12)
+    assert math.isclose(b["nvme"], b["nvme_demand"] + b["nvme_prefetch"], rel_tol=1e-15)
+    assert math.isclose(b["nvme_demand"] + b["nvme_prefetch"] - b["nvme_prefetch_wasted"], (S + 2 * Sc) / 3,
+                        rel_tol=1e-12)                                # misses (S + Sc) + prefetch hit (Sc)
+    assert math.isclose(b["dram"], (3 * S + 3 * Sc) / 3 + backbone, rel_tol=1e-12)
+    assert b["vram"] == 0.0
+    assert (r.hit_rate, r.prefetch_rate, r.miss_rate, r.skip_rate, r.vram_rate, r.bypass_rate) == \
+        (3 / 6, 1 / 6, 2 / 6, 0.0, 0.0, 0.0)
+    assert math.isclose(r.late_prefetch_rate, 1 - f, rel_tol=1e-12)
+    assert (r.loads_per_token, r.tokens_per_step) == (2.0, 1.0)
+
+    fast = _tiny_prefetch_run(get_hardware("this-pc", nvme_gbs=1e4))      # every prefetch in time
+    b = fast.bytes_per_token
+    assert fast._counts.pfhit.tolist() == cnt.pfhit.tolist()
+    assert (b["nvme_demand"], b["nvme_prefetch"], b["nvme_prefetch_wasted"]) == ((S + Sc) / 3, (Sc + S) / 3, S / 3)
+    assert math.isclose(b["dram"], r.bytes_per_token["dram"], rel_tol=1e-12) and fast.late_prefetch_rate == 0.0
+    # warm-up: only t1 and t2 count (2 tokens); t0's prefetch is outside the window
+    w = _tiny_prefetch_run(hw, warmup=1)
+    b = w.bytes_per_token
+    assert (w.tokens, b["nvme_demand"], b["nvme_prefetch"], b["nvme_prefetch_wasted"]) == (2, Sc / 2, 0.0, 0.0)
+    assert math.isclose(b["dram"], (2 * S + 2 * Sc) / 2 + backbone, rel_tol=1e-12)
+    assert (w.hit_rate, w.prefetch_rate, w.miss_rate) == (3 / 4, 0.0, 1 / 4)
+
+
+@pytest.mark.parametrize("kw", [dict(prefetch=Prefetch(0.5, 3), lossy=Lossy(cold_bits=2.25, cold_frac=0.6)),
+                                dict(prefetch=Prefetch(0.8, 1), spec=Spec(3, 0.6),
+                                     lossy=Lossy(skip_miss_rank=6, cold_bits=3.25, cold_frac=0.3)),
+                                dict(prefetch=Prefetch(0.7, 2), gpu="dense+experts",
+                                     hardware=get_hardware("this-pc", vram_gib=3.0))])
+def test_prefetch_byte_identities_on_realistic_runs(kw):
+    """The per-token byte identities on olmoe runs with prefetch, cold slabs, skips, speculative windows, a
+    VRAM tier and a warm-up, from the run's own counters (measured steps only):
+      nvme_demand + nvme_prefetch - nvme_prefetch_wasted = (misses + prefetch hits) x slab / tokens;
+      nvme_prefetch = issued prefetch bytes / tokens when storage is fast enough for all of them;
+      dram = (loads - vram - skips) x slab + backbone per step, / tokens; vram = VRAM-tier loads x slab / tokens."""
+    kw = dict(kw)
+    hw = kw.pop("hardware", get_hardware("this-pc"))
+    r = simulate(SMALL, hw, tokens=600, zipf=1.2, reuse=0.2, seed=3, cache_gb=0.3, **kw)
+    c, cnt, sched = r._costs, r._counts, r._sched
+    L = sched.n_moe_layers
+    g = np.repeat(sched.step_start >= r.warmup_tokens, L)
+    S, Sc = float(c.slab), float(c.slab_cold)
+
+    def nbytes(n, n_cold):
+        return float((n[g] - n_cold[g]).sum()) * S + float(n_cold[g].sum()) * Sc
+    tok = r.tokens
+    assert tok > 400 and r.prefetch_rate > 0.05 and cnt.pf_wasted[g].sum() > 0
+    b = r.bytes_per_token
+    used = nbytes(cnt.miss, cnt.miss_cold) + nbytes(cnt.pfhit, cnt.pfhit_cold)
+    assert math.isclose(b["nvme_demand"] + b["nvme_prefetch"] - b["nvme_prefetch_wasted"], used / tok, rel_tol=1e-9)
+    assert math.isclose(b["nvme"], b["nvme_demand"] + b["nvme_prefetch"], rel_tol=1e-12)
+    bb = c.global_bytes + L * (c.layer_bytes + c.shared_bytes)
+    computed = nbytes(cnt.hit, cnt.hit_cold) + nbytes(cnt.pfhit, cnt.pfhit_cold) + nbytes(cnt.miss, cnt.miss_cold)
+    on_gpu = kw.get("gpu", "off") != "off"
+    assert math.isclose(b["dram"], (computed + (0.0 if on_gpu else bb * r.steps)) / tok, rel_tol=1e-9)
+    assert math.isclose(b["vram"], (float(cnt.vram[g].sum()) * S + (bb * r.steps if on_gpu else 0.0)) / tok,
+                        rel_tol=1e-9)
+    skips = kw.get("lossy") is not None and kw["lossy"].skip_miss_rank is not None
+    assert (cnt.vram[g].sum() > 0) == on_gpu and (cnt.skip[g].sum() > 0) == skips
+    loads = int((cnt.hit + cnt.pfhit + cnt.miss + cnt.vram + cnt.skip)[g].sum())
+    assert math.isclose(r.loads_per_token, loads / tok, rel_tol=1e-12)
+    # fast storage: every prefetch arrives, so prefetch bytes are exactly the issued ones
+    fast = simulate(SMALL, get_hardware(hw, nvme_gbs=1e5), tokens=600, zipf=1.2, reuse=0.2, seed=3, cache_gb=0.3,
+                    **kw)
+    fc = fast._counts
+    assert fc.pf_issued.tolist() == cnt.pf_issued.tolist() and fast.late_prefetch_rate == 0.0
+    fb = fast.bytes_per_token
+    assert math.isclose(fb["nvme_prefetch"], nbytes(fc.pf_issued, fc.pf_issued_cold) / tok, rel_tol=1e-9)
+    assert math.isclose(fb["nvme_prefetch_wasted"], nbytes(fc.pf_wasted, fc.pf_wasted_cold) / tok, rel_tol=1e-9)
+    assert math.isclose(fb["nvme_demand"], nbytes(fc.miss, fc.miss_cold) / tok, rel_tol=1e-9)
+    assert r.prefetch_rate == fast.prefetch_rate
+
+
 def test_speculative_union_amortisation():
     tr = synthetic_for(presets.get(SMALL), 600, zipf=0.0, reuse=1.0, seed=4)   # every token reuses its experts
     plain = simulate(SMALL, trace=tr, cache_gb=0.0)
@@ -385,25 +545,185 @@ def test_gpu_modes_and_feasibility():
     assert k2.n_moe_layers == 60
 
 
-def test_feasibility_numbers():
-    from hearth.sim import feasibility
-    k2 = presets.get("kimi-k2")
-    c = model_costs(k2)
-    f = feasibility(c, HARDWARE["this-pc"], shape=k2)
-    assert f.fits and f.backbone_location == "ram"
-    hw = HARDWARE["this-pc"]
-    assert math.isclose(f.ram_free_for_cache_gib,
-                        hw.ram_gib - hw.os_reserve_gib - 0.5 - f.backbone_gib - f.kv_gib)
-    assert math.isclose(f.min_ram_gib, hw.ram_gib - f.ram_free_for_cache_gib + f.min_cache_gib)
-    assert f.recommended_cache_gib == f.ram_free_for_cache_gib
-    assert 540 < f.file_gb < 570                                   # ~1T params at Q4 experts
-    lap = feasibility(model_costs(k2), HARDWARE["laptop-16gb"], shape=k2)
-    assert not lap.fits
+def _resident_bytes_from_presets(shape, dense_bits=8.25, embed_bits=8.25):
+    """FORMAT.md sec. 4.1 footprint from Shape.dense_params(): the embedding table at embed_bits, routers and
+    norms F32, every other resident matrix (LM head, attention, shared/dense FFN, latent projections) at
+    dense_bits."""
+    D, routers = shape.d_model, shape.n_moe_layers * shape.n_experts * shape.d_model
+    matrices = shape.dense_params() - shape.vocab * D - routers
+    return (shape.vocab * D * embed_bits / 8 + matrices * dense_bits / 8 + routers * 4
+            + shape.n_layers * 2 * D * 4 + D * 4)
+
+
+def test_backbone_accounting_matches_presets_without_double_counting():
+    """Shape.dense_params() includes the latent-MoE projections since commit 8ea46c0; the simulator counts them
+    once. Its resident footprint and parameter totals must equal the presets' for every model."""
+    for name, shape in presets.PRESETS.items():
+        c = model_costs(shape)
+        assert c.resident_params == shape.dense_params(), name
+        assert c.total_params == shape.params_total(), name
+        assert math.isclose(c.resident_bytes, _resident_bytes_from_presets(shape), rel_tol=1e-12), name
+        # what one step reads (KV aside) is the whole backbone except the embedding table
+        per_step = c.global_bytes + c.n_moe_layers * (c.layer_bytes + c.shared_bytes) \
+            - c.n_layers * c.kv_bytes_per_layer
+        assert math.isclose(per_step, c.resident_bytes - c.embed_bytes, rel_tol=1e-12), name
     k3 = presets.get("kimi-k3")
-    lap3 = feasibility(model_costs(k3), HARDWARE["laptop-16gb"], shape=k3)
-    assert not lap3.file_fits_drive
-    q = lap3.disk_gb_by_format
-    assert q["Q3 (3.25 bpw, roadmap R03)"] < q["Q4 (4.25 bpw)"] < q["Q8 (8.25 bpw)"] < q["BF16"]
+    c3 = model_costs(k3, context=0)
+    latent = 2 * 7168 * 3584
+    assert c3.total_params == 2_752_693_600_256                     # ~2.75e12; 2.748e12 without the projections
+    assert c3.resident_params == 29_952_770_048 and k3.n_moe_layers * latent == 4_726_980_608
+    assert c3.layer_params == k3.attn_params() + latent + 896 * 7168
+    assert any("latent MoE: experts in 3584-d, 51.4M projection params" in n for n in c3.notes)
+    # an explicit expert_d equal to d_model still has projections in Shape.dense_params(), so here too
+    same = dataclasses.replace(presets.get(SMALL), name="explicit-d", expert_d=2048)
+    want = presets.get(SMALL).dense_params() + 16 * 2 * 2048 ** 2
+    assert model_costs(same).resident_params == same.dense_params() == want
+
+
+def test_feasibility_exact_kimi_k2_on_this_pc():
+    k2, hw, GiB = presets.get("kimi-k2"), HARDWARE["this-pc"], 2.0 ** 30
+    c = model_costs(k2)
+    f = feasibility(c, hw)
+    assert (f.model, f.hardware, f.gpu_mode, f.fits, f.reasons, f.backbone_location) == \
+        ("kimi-k2", "this-pc", "off", True, [], "ram")
+    resident = _resident_bytes_from_presets(k2)
+    kv = (512 + 64) * 4.0 * 4096 * 61                                  # MLA latent + rope, f32, max_seq, all layers
+    slab = 23_396_352                                                  # FORMAT sec. 5, 7168 x 2048 at Q4
+    assert c.slab == slab and kv == 575_668_224
+    assert math.isclose(f.backbone_gib, resident / GiB, rel_tol=1e-12) and round(f.backbone_gib, 4) == 11.7172
+    assert f.kv_gib == kv / GiB
+    free = 61.6 - 6.0 - 0.5 - resident / GiB - kv / GiB
+    assert math.isclose(f.ram_free_for_cache_gib, free, rel_tol=1e-12) and round(free, 4) == 42.8466
+    assert f.min_cache_gib == (2 * 8 + 8 + 2) * slab / GiB                # 26 slots, 0.5665 GiB
+    assert math.isclose(f.min_ram_gib, 6.0 + 0.5 + (resident + kv + 26 * slab) / GiB, rel_tol=1e-12)
+    assert round(f.min_ram_gib, 4) == 19.3199
+    assert f.recommended_cache_gib == f.ram_free_for_cache_gib
+    assert f.expert_total_gib == 502.03125 == 60 * 384 * slab / GiB
+    assert f.vram_expert_slots == 0 and f.file_fits_drive
+    assert math.isclose(f.file_gb, (resident + 60 * 384 * slab) / 1e9, rel_tol=1e-12)
+    want = {"Q3 (3.25 bpw, roadmap R03)": 424.79748096, "Q4 (4.25 bpw)": 551.63323392,
+            "Q8 (8.25 bpw)": 1058.97624576, "BF16": 2041.9533312}
+    assert list(f.disk_gb_by_format) == list(want)
+    for label, gb in want.items():
+        assert math.isclose(f.disk_gb_by_format[label], gb, rel_tol=1e-12), label
+    assert f.disk_gb_by_format["Q4 (4.25 bpw)"] == f.file_gb
+    for label, bits in (("Q3 (3.25 bpw, roadmap R03)", 3.25), ("Q8 (8.25 bpw)", 8.25), ("BF16", 16.0)):
+        assert math.isclose(f.disk_gb_by_format[label], (resident + 23040 * slab_bytes(7168, 2048, bits)) / 1e9,
+                            rel_tol=1e-12)
+    assert (f.params_total, f.params_resident) == (k2.params_total(), k2.dense_params()) == \
+        (1_026_407_202_816, 11_721_179_136)
+    d = f.to_dict()
+    assert d == dataclasses.asdict(f) and d["disk_gb_by_format"]["BF16"] == f.disk_gb_by_format["BF16"]
+
+
+def test_feasibility_exact_kimi_k3_latent_experts():
+    """Kimi-K3's experts are sized at expert_d = 3584; disk sizes are exact and the file does not fit 1 TB."""
+    k3 = presets.get("kimi-k3")
+    c = model_costs(k3)
+    f = feasibility(c, HARDWARE["laptop-16gb"])
+    resident = _resident_bytes_from_presets(k3)
+    assert c.slab == slab_bytes(3584, 3072, 4.25) == 17_547_264
+    want = {"Q3 (3.25 bpw, roadmap R03)": 1138.761771008, "Q4 (4.25 bpw)": 1479.104374784,
+            "Q8 (8.25 bpw)": 2840.474789888, "BF16": 5478.129969152}
+    for label, gb in want.items():
+        assert math.isclose(f.disk_gb_by_format[label], gb, rel_tol=1e-12), label
+    assert math.isclose(f.disk_gb_by_format["Q4 (4.25 bpw)"], (resident + 92 * 896 * 17_547_264) / 1e9, rel_tol=1e-12)
+    assert f.file_gb == f.disk_gb_by_format["Q4 (4.25 bpw)"] and not f.file_fits_drive and not f.fits
+    assert f.reasons[-1] == "model file 1479 GB exceeds one drive (1000 GB); each mirror is a full copy"
+    assert f.reasons[0].startswith("only -19.7 GiB RAM left for experts") and len(f.reasons) == 2
+    assert f.recommended_cache_gib == f.min_cache_gib == (2 * 16 + 8 + 2) * 17_547_264 / 2 ** 30
+    assert f.params_total == 2_752_693_600_256
+    big = feasibility(c, get_hardware("laptop-16gb", nvme_capacity_gb=f.file_gb))   # exactly the file: it fits
+    assert big.file_fits_drive and len(big.reasons) == 1
+
+
+def test_feasibility_gpu_modes_exact():
+    ol, GiB = presets.get(SMALL), 2.0 ** 30
+    c = model_costs(ol)
+    bb, emb, kv = c.resident_bytes / GiB, c.embed_bytes / GiB, c.kv_resident_bytes / GiB
+    # no GPU: a GPU mode is a reason on its own (olmoe otherwise fits the laptop)
+    lap = HARDWARE["laptop-16gb"]
+    assert feasibility(c, lap).fits
+    for mode in ("dense", "dense+experts"):
+        f = feasibility(c, lap, gpu_mode=mode)
+        assert not f.fits and f.reasons == [f"gpu_mode={mode} but laptop-16gb has no GPU"]
+        assert f.backbone_location == "ram" and f.vram_expert_slots == 0
+        assert f.ram_free_for_cache_gib == feasibility(c, lap).ram_free_for_cache_gib
+    # discrete GPU: the backbone minus the embedding table (and the KV cache) moves to VRAM
+    pc = HARDWARE["this-pc"]
+    dense, both = feasibility(c, pc, gpu_mode="dense"), feasibility(c, pc, gpu_mode="dense+experts")
+    for f in (dense, both):
+        assert f.fits and f.backbone_location == "vram"
+        assert f.ram_free_for_cache_gib == 61.6 - (6.0 + 0.5 + emb)
+        assert f.min_ram_gib == 6.0 + 0.5 + emb + f.min_cache_gib
+    assert dense.vram_expert_slots == 0                                # only dense+experts has a VRAM tier
+    assert both.vram_expert_slots == int((12.0 - (bb - emb + kv + 1.0)) * GiB // c.slab) == 3095
+    assert feasibility(c, pc).ram_free_for_cache_gib == 61.6 - (6.0 + 0.5 + (bb + kv))
+    assert feasibility(c, pc).recommended_cache_gib == c.expert_total_bytes / GiB == 3.1875   # all experts fit
+    # unified memory: the backbone stays in (shared) RAM, no VRAM tier
+    mac = HARDWARE["mac-studio-192gb"]
+    for mode in ("dense", "dense+experts"):
+        f = feasibility(c, mac, gpu_mode=mode)
+        assert f.fits and f.backbone_location == "unified" and f.vram_expert_slots == 0
+        assert f.ram_free_for_cache_gib == 192.0 - (8.0 + 0.5 + (bb + kv)) == feasibility(c, mac).ram_free_for_cache_gib
+    # VRAM boundary: exactly enough for backbone + KV + headroom fits (with no tier); a byte less does not
+    need = bb - emb + kv + 1.0
+    edge = feasibility(c, get_hardware("this-pc", vram_gib=need), gpu_mode="dense+experts")
+    assert edge.fits and edge.vram_expert_slots == 0
+    short = feasibility(c, get_hardware("this-pc", vram_gib=need - 2.0 ** -30), gpu_mode="dense")
+    assert short.reasons == [f"backbone {bb - emb:.1f} GiB + KV {kv:.1f} GiB + 1.0 GiB headroom does not fit "
+                             f"{need - 2.0 ** -30:.0f} GiB VRAM"]
+    k2 = feasibility(model_costs(presets.get("kimi-k2")), pc, gpu_mode="dense")
+    assert k2.reasons == ["backbone 10.6 GiB + KV 0.5 GiB + 1.0 GiB headroom does not fit 12 GiB VRAM"]
+
+
+def test_feasibility_ram_boundary_and_hint():
+    """Synthetic costs in powers of two, so the boundary is exact: RAM left == engine minimum fits."""
+    GiB = 2.0 ** 30
+    c = dataclasses.replace(model_costs(presets.get(SMALL)), top_k=1, resident_bytes=2 * GiB, embed_bytes=0.5 * GiB,
+                            kv_resident_bytes=0.25 * GiB, slab=int(GiB / 8), expert_total_bytes=64 * GiB)
+    min_cache = (2 * 1 + 1 + 2) / 8                                    # 5 slots of 1/8 GiB at io_threads=1
+    hw = get_hardware("laptop-16gb", ram_gib=1.0 + 0.5 + 2.25 + min_cache, os_reserve_gib=1.0)
+    f = feasibility(c, hw, io_threads=1)
+    assert f.ram_free_for_cache_gib == min_cache == f.min_cache_gib and f.fits
+    assert f.min_ram_gib == hw.ram_gib and f.recommended_cache_gib == min_cache
+    tight = feasibility(c, get_hardware(hw, ram_gib=hw.ram_gib - 1 / 64), io_threads=1)
+    assert not tight.fits and tight.recommended_cache_gib == min_cache
+    assert tight.reasons == ["only 0.6 GiB RAM left for experts after backbone/KV/OS reserve (a Q4 backbone, "
+                             "--dense-bits 4.25, roughly halves it; LOSSY vs the Q8 default); engine minimum cache "
+                             "is 0.62 GiB"]
+    q4 = feasibility(dataclasses.replace(c, dense_bits=4.25), get_hardware(hw, ram_gib=hw.ram_gib - 1 / 64),
+                     io_threads=1)
+    assert q4.reasons == ["only 0.6 GiB RAM left for experts after backbone/KV/OS reserve; engine minimum cache is "
+                          "0.62 GiB"]
+    # io_threads raise the minimum like hx_store_open, up to the 64-thread clamp
+    assert feasibility(c, hw, io_threads=64).min_cache_gib == feasibility(c, hw, io_threads=500).min_cache_gib \
+        == (2 + 64 + 2) / 8
+    # the file boundary: a drive exactly the size of the file holds it
+    file_gb = (2 * GiB + 64 * GiB) / 1e9
+    assert feasibility(c, get_hardware(hw, nvme_capacity_gb=file_gb), io_threads=1).file_fits_drive
+    assert not feasibility(c, get_hardware(hw, nvme_capacity_gb=file_gb * (1 - 1e-12)), io_threads=1).file_fits_drive
+
+
+def test_cli_feasibility_output_and_json(capsys):
+    assert main(["--model", SMALL, "--hw", "laptop-16gb", "--gpu", "dense", "--feasibility"]) == 0
+    out = capsys.readouterr().out
+    assert out.splitlines()[0] == "olmoe-1b-7b on laptop-16gb:"
+    assert "fits                       NO - gpu_mode=dense but laptop-16gb has no GPU" in out
+    assert main(["--model", "kimi-k2", "--feasibility", "--json"]) == 0
+    js = json.loads(capsys.readouterr().out)["feasibility"]
+    want = feasibility(model_costs(presets.get("kimi-k2")), HARDWARE["this-pc"]).to_dict()
+    assert js == json.loads(json.dumps(want))
+    assert js["disk_gb_by_format"]["Q4 (4.25 bpw)"] == 551.63323392 and js["params_total"] == 1_026_407_202_816
+    # every encoding flag reaches the feasibility path
+    assert main(["--model", "kimi-k2", "--feasibility", "--json", "--dense-bits", "4.25", "--embed-bits", "4.25",
+                 "--max-seq", "1024", "--kv-bytes", "2", "--expert-bits", "3.25", "--io-threads", "4"]) == 0
+    js = json.loads(capsys.readouterr().out)["feasibility"]
+    c = model_costs(presets.get("kimi-k2"), dense_bits=4.25, embed_bits=4.25, max_seq=1024, kv_elem_bytes=2.0,
+                    expert_bits=3.25)
+    assert js == json.loads(json.dumps(feasibility(c, HARDWARE["this-pc"], io_threads=4).to_dict()))
+    assert main(["--model", "kimi-k2", "--feasibility"]) == 0
+    assert "parameters                 1026 B, of which 11.72 B resident" in capsys.readouterr().out
 
 
 def test_slab_bytes_follow_format():
@@ -794,6 +1114,11 @@ def test_exact_step_cpu_vs_gpu_backbone():
                 + max(costs.shared_bytes / bw, 2.0 * costs.shared_params / ops) + k * c)
     cpu = evaluate(_counts(hit=[k]), sched, costs, hw, cal)
     assert math.isclose(float(cpu.step_s[0]), cpu_want, rel_tol=1e-12)
+    # attribution with shared experts: the parts add up, and dram is every byte streamed at DRAM bandwidth
+    assert math.isclose(float(cpu.parts[0].sum()), cpu_want, rel_tol=1e-12)
+    streamed = costs.global_bytes + costs.layer_bytes + costs.shared_bytes + k * costs.slab
+    assert costs.shared_bytes > 0 and math.isclose(float(cpu.parts[0, COMPONENTS.index("dram")]), streamed / bw,
+                                                   rel_tol=1e-12)
     gpu_want = (fixed + (costs.global_bytes + costs.layer_bytes + costs.shared_bytes) / vbw
                 + 2 * (hw.gpu_sync_us * 1e-6 + 4.0 * shape.d_model / (hw.pcie_gbs * 1e9)) + k * c)
     gpu = evaluate(_counts(hit=[k]), sched, costs, hw, cal, "dense")
@@ -1501,3 +1826,245 @@ def test_cache_beyond_free_ram_is_infeasible(capsys):
     rows = [ln for ln in capsys.readouterr().out.splitlines() if ln.startswith(("40GiB", "200GiB"))]
     assert [("INFEASIBLE" in ln) for ln in rows] == [False, True], rows
 
+
+# ---- H04: engine parity, profiles, CLI and input checks (council round 1, T04 minor findings) --------
+
+def test_io_threads_clamped_to_64_like_store_c():
+    assert engine_min_slots(8, 64) == 2 * 8 + 64 + 2 == engine_min_slots(8, 65) == engine_min_slots(8, 10 ** 6)
+    assert engine_min_slots(8, 63) == 2 * 8 + 63 + 2 and engine_min_slots(1, 1) == 5
+    with pytest.raises(ValueError):
+        engine_min_slots(8, 0)
+    r = small(tokens=60, cache_gb=0.0, io_threads=100)
+    assert r.slots == 2 * 8 + 64 + 2
+    assert any(w.startswith("io_threads 100 > 64: the engine clamps it to 64") for w in r.warnings)
+    assert not any("clamps" in w for w in small(tokens=60, cache_gb=0.0, io_threads=64).warnings)
+    assert small(tokens=60, cache_gb=0.0, io_threads=64).slots == r.slots
+
+
+def test_lfu_pinned_heat_is_seeded_like_the_engine(tmp_path):
+    """store.c seeds LFU heat with count / tokens_observed / (1 - decay); raw counts recorded over 6000 tokens
+    would dwarf the live heat (the council's case: hit rate 0.487 simulated vs 0.611 engine-like)."""
+    from hearth.sim.core import lfu_seed_scale
+    assert lfu_seed_scale(6000, 0.995) == 1.0 / 6000 / (1.0 - 0.995)
+    assert lfu_seed_scale(0, 0.995) == 1.0 and lfu_seed_scale(6000, 1.0) == 1.0
+    shape = presets.get(SMALL)
+    other = synthetic_for(shape, 6000, zipf=1.2, reuse=0.2, seed=9).frequencies().astype(np.float32)
+    path = save_usage(tmp_path / "o.usage", other, tokens_observed=6000)
+    tr = synthetic_for(shape, 600, zipf=1.2, reuse=0.2, seed=3)
+    sched = build_schedule(tr.ids, 64)
+    counts = other.ravel().astype(np.float64)
+    for pf, prof in ((0.0, str(path)), (0.5, path)):                  # a str or a Path
+        r = simulate(SMALL, trace=tr, policy="lfu-pinned", cache_gb=0.4, profile=prof, pin_fraction=pf)
+        engine = run_cache(sched, "lfu-pinned", r.slots, profile=counts * lfu_seed_scale(6000, 0.995), pin_fraction=pf)
+        raw = run_cache(sched, "lfu-pinned", r.slots, profile=counts, pin_fraction=pf)
+        assert r._counts.hit.tolist() == engine.hit.tolist(), pf
+        assert r.settings["profile"] == str(path)
+        assert int(engine.hit.sum()) > 1.5 * int(raw.hit.sum()), pf
+    # a profile without a token count (an array) seeds raw values; warm-up and oracle profiles their window
+    r = simulate(SMALL, trace=tr, policy="lfu-pinned", cache_gb=0.4, profile=counts)
+    assert r._counts.hit.tolist() == run_cache(sched, "lfu-pinned", r.slots, profile=counts).hit.tolist()
+    warm = tr.ids[:60]
+    wc = np.bincount((warm.astype(np.int64) + (np.arange(16) * 64)[None, :, None]).ravel(), minlength=1024)
+    r = simulate(SMALL, trace=tr, policy="lfu-pinned", cache_gb=0.4, warmup=60, lfu_decay=0.98)
+    seed = wc * lfu_seed_scale(60, 0.98)
+    assert r._counts.hit.tolist() == run_cache(sched, "lfu-pinned", r.slots, profile=seed, lfu_decay=0.98).hit.tolist()
+    r = simulate(SMALL, trace=tr, policy="lfu-pinned", cache_gb=0.4, profile="oracle", lfu_decay=0.98)
+    whole = tr.frequencies().ravel() * lfu_seed_scale(600, 0.98)
+    assert r._counts.hit.tolist() == run_cache(sched, "lfu-pinned", r.slots, profile=whole, lfu_decay=0.98).hit.tolist()
+
+
+def test_profiles_must_be_finite_and_non_negative(tmp_path):
+    shape = presets.get(SMALL)
+    good = np.ones((shape.n_layers, shape.n_experts), np.float32)
+    for bad in (np.nan, -1.0, np.inf, -1e30):
+        h = good.copy()
+        h[3, 7] = bad
+        p = save_usage(tmp_path / "bad.usage", h, tokens_observed=100)
+        for pol in ("pinned", "lfu-pinned"):
+            with pytest.raises(ValueError, match="heat entry 199 is not a finite non-negative number"):
+                small(tokens=60, policy=pol, cache_gb=0.3, profile=str(p))
+        with pytest.raises(ValueError, match="heat entry 199"):
+            small(tokens=60, policy="pinned", cache_gb=0.3, profile=h.ravel())
+    with pytest.raises(ValueError, match="heat entry 0"):
+        small(tokens=60, cache_gb=0.3, lossy=Lossy(cold_bits=2.25), profile=np.full(1024, np.nan))
+    assert small(tokens=60, policy="pinned", cache_gb=0.3, profile=np.zeros(1024)).n_pinned > 0   # zeros are fine
+    # profiles are only read when something uses them
+    assert small(tokens=60, policy="lru", cache_gb=0.3, profile=np.full(1024, np.nan)).hit_rate >= 0
+    assert main(["--model", SMALL, "--tokens", "60", "--policy", "pinned", "--profile",
+                 str(tmp_path / "bad.usage")]) == 2
+
+
+def test_oracle_and_array_profiles_pin_the_hottest_slabs():
+    tr = synthetic_for(presets.get(SMALL), 600, zipf=1.2, reuse=0.0, seed=3)
+    freq = tr.frequencies().ravel().astype(np.float64)
+    oracle = small(policy="pinned", cache_gb=0.5, profile="oracle")
+    assert any("oracle profile" in w for w in oracle.warnings) and oracle.settings["profile"] == "oracle"
+    arr = small(policy="pinned", cache_gb=0.5, profile=freq)
+    assert arr.settings["profile"] == "array" and not any("oracle" in w for w in arr.warnings)
+    assert arr._counts.hit.tolist() == oracle._counts.hit.tolist()            # same heat, same pins
+    sched = build_schedule(tr.ids, 64)
+    assert oracle._counts.hit.tolist() == run_cache(sched, "pinned", oracle.slots, profile=freq).hit.tolist()
+    warm = small(policy="pinned", cache_gb=0.5)
+    assert oracle.hit_rate > warm.hit_rate                                   # it sees the future
+    with pytest.raises(ValueError, match="entries"):
+        small(policy="pinned", cache_gb=0.5, profile=freq[:-1])
+
+
+def test_cli_empty_sweep_lists_exit_2(capsys):
+    for opt in (["--sweep-cache", ","], ["--sweep-zipf", ","], ["--sweep-cache", " "]):
+        assert main(["--model", SMALL, "--tokens", "60"] + opt) == 2, opt
+        assert "hearth sim: error: empty list" in capsys.readouterr().err, opt
+
+
+def test_cli_overrides_every_hardware_and_encoding_field(capsys):
+    args = ["--model", SMALL, "--tokens", "60", "--cache-gb", "0.3", "--json", "--gpu-sync-us", "40",
+            "--cpu-cores", "6", "--embed-bits", "4.25", "--max-seq", "1024", "--gpu", "dense"]
+    assert main(args) == 0
+    r = json.loads(capsys.readouterr().out)["result"]
+    s = r["settings"]
+    assert (s["hw"]["gpu_sync_us"], s["hw"]["cpu_cores"], s["embed_bits"], s["max_seq"]) == (40.0, 6, 4.25, 1024)
+    want = simulate(SMALL, get_hardware("this-pc", gpu_sync_us=40.0, cpu_cores=6), tokens=60, cache_gb=0.3,
+                    embed_bits=4.25, max_seq=1024, gpu="dense")
+    assert r["tok_s"] == want.tok_s and r["feasibility"]["kv_gib"] == want.feasibility.kv_gib
+    assert any("LOSSY embeddings" in x for x in r["lossy"])
+    assert main(["--model", SMALL, "--tokens", "60", "--json", "--hw", "laptop-16gb", "--unified", "--vram-gbs",
+                 "200", "--gpu", "dense"]) == 0
+    s = json.loads(capsys.readouterr().out)["result"]["settings"]
+    assert s["hw"]["unified"] is True and s["gpu"] == "dense"
+    assert main(["--model", SMALL, "--tokens", "60", "--json", "--hw", "mac-studio-192gb", "--no-unified",
+                 "--gpu", "dense"]) == 2                                   # no GPU left
+    assert "has no GPU" in capsys.readouterr().err
+
+
+def test_hardware_dicts_round_trip():
+    r = small(tokens=60, cache_gb=0.3, hw_overrides={"nvme_count": 2, "io_cap_gbs": 9.0})
+    hw = get_hardware(r.settings["hw"])
+    assert hw == r._hw and hw.io_gbs == 9.0
+    again = simulate(SMALL, r.settings["hw"], tokens=600, zipf=1.2, reuse=0.0, seed=3, cache_gb=0.3)
+    assert again.tok_s == simulate(SMALL, r._hw, tokens=600, zipf=1.2, reuse=0.0, seed=3, cache_gb=0.3).tok_s
+    with pytest.raises(ValueError, match="io_gbs"):
+        get_hardware({**r.settings["hw"], "io_gbs": 13.0})
+    with pytest.raises(KeyError, match="warp_drive"):
+        get_hardware({**r.settings["hw"], "warp_drive": 1})
+
+
+@pytest.mark.parametrize("make", [
+    lambda: Spec(math.inf, 0.5), lambda: Spec(math.nan, 0.5), lambda: Spec(2.5, 0.5), lambda: Spec(True, 0.5),
+    lambda: Spec(2, math.nan), lambda: Spec(2, "0.5"), lambda: Prefetch(0.5, math.inf), lambda: Prefetch(0.5, 1.5),
+    lambda: Prefetch(math.nan, 0), lambda: Prefetch("0.5", 0), lambda: Lossy(topk=6.5), lambda: Lossy(topk=math.inf),
+    lambda: Lossy(topk=0), lambda: Lossy(skip_miss_rank=math.nan), lambda: Lossy(cold_bits="3"),
+    lambda: Lossy(cold_frac=None)])
+def test_feature_specs_reject_non_finite_and_fractional_values(make):
+    with pytest.raises(ValueError):
+        make()
+
+
+def test_feature_specs_normalise_integral_floats():
+    assert Lossy(topk=6.0).topk == 6 and type(Lossy(topk=6.0).topk) is int
+    assert type(Lossy(skip_miss_rank=np.int64(5)).skip_miss_rank) is int
+    assert Prefetch(1, 2.0).extra == 2 and type(Prefetch(1, 2.0).extra) is int and Prefetch(1, 0).recall == 1.0
+    assert small(tokens=60, cache_gb=0.3, lossy=Lossy(topk=6.0)).loads_per_token == 16 * 6     # was a TypeError
+    with pytest.raises(ValueError):
+        small(tokens=60, warmup=math.inf)
+
+
+def test_gpu_expert_tier_decides_the_step_exactly():
+    """dense+experts on a discrete GPU with slow VRAM: the GPU's expert tier, not the CPU, sets T_moe."""
+    shape = dataclasses.replace(presets.get(SMALL), name="one-layer", n_layers=1)
+    k = shape.top_k
+    sched = build_schedule(np.arange(k, dtype=np.uint16).reshape(1, 1, k), shape.n_experts)
+    costs = model_costs(shape, context=0)
+    hw = get_hardware("this-pc", vram_gbs=2.0)
+    cal = Calibration(overhead_ms=0.0, layer_overhead_us=0.0)
+    v, h = 6, 2
+    tm = evaluate(_counts(hit=[h], vram=[v]), sched, costs, hw, cal, "dense+experts")
+    S, vbw = costs.slab, 2e9
+    sync = 2 * (15e-6 + 4.0 * shape.d_model / 50e9)
+    c = max(S / 60e9, 2.0 * costs.expert_params / 5e12)
+    t_gpu, t_cpu = v * S / vbw + sync, h * c
+    assert t_gpu > t_cpu
+    bb = (costs.global_bytes + costs.layer_bytes + costs.shared_bytes) / vbw
+    assert math.isclose(float(tm.step_s[0]), bb + sync + t_gpu, rel_tol=1e-12)
+    assert math.isclose(float(tm.parts[0, COMPONENTS.index("gpu")]), bb + sync + t_gpu - t_cpu, rel_tol=1e-12)
+    assert math.isclose(float(tm.vram_bytes[0]), v * S + costs.global_bytes + costs.layer_bytes + costs.shared_bytes)
+    assert float(tm.dram_bytes[0]) == h * S
+    cpu_only = evaluate(_counts(hit=[h], vram=[0]), sched, costs, hw, cal, "dense+experts")
+    assert math.isclose(float(cpu_only.step_s[0]), bb + sync + t_cpu, rel_tol=1e-12)
+
+
+def test_ranks_beyond_int16_are_kept():
+    """Schedule.minrank is int32: a 1-layer top-40000 trace (valid geometry) must not wrap ranks >= 32768."""
+    k, E = 40_000, 40_001
+    perm = np.random.default_rng(0).permutation(E)[:k].astype(np.uint16)
+    ids = np.tile(perm, (3, 1)).reshape(3, 1, k)
+    for spec in ((0, 0.0), (1, 1.0)):
+        sched = build_schedule(ids, E, *spec)
+        assert sched.minrank.dtype == np.int32 and int(sched.minrank.max()) == k - 1
+        c = run_cache(sched, "lru", 10, skip_rank=1)
+        # only the rank-0 expert is ever loaded: missed once, then a hit in every later step
+        assert int(c.skip.sum()) == sched.n_steps * (k - 1)
+        assert (int(c.miss.sum()), int(c.hit.sum())) == (1, sched.n_steps - 1)
+
+
+def test_synthetic_refill_rows_keep_reused_experts():
+    """Each previous expert is kept with probability `reuse`, so P(e in token t | e in token t-1) >= reuse for
+    every expert, also when the row needs the exact refill (extreme skew, many rows). Expert 0 is one of the
+    rarest here (rank 8 of 12): dropping it from refilled rows (`> 0` for `>= 0`) gave 0.35."""
+    E, k, reuse, seed = 12, 6, 0.5, 6
+    tr = synthetic(12000, 1, E, k, zipf=3.0, reuse=reuse, seed=seed)
+    p = zipf_popularity(E, 1, 3.0, np.random.default_rng(seed))[0]
+    assert int((p > p[0]).sum()) == 8
+    inn = np.stack([(tr.ids[:, 0, :] == e).any(-1) for e in range(E)])        # [E, T]
+    prev, nxt = inn[:, :-1], inn[:, 1:]
+    n = prev.sum(axis=1)
+    stay = (prev & nxt).sum(axis=1) / np.maximum(n, 1)
+    assert n[0] > 1500
+    assert (stay[n > 500] > reuse - 0.03).all(), stay
+
+
+def test_simulate_boundaries_and_default_warmup():
+    """Boundary values of simulate()'s own checks, and the documented default warm-up (10% of the trace)."""
+    from hearth.sim.core import lfu_seed_scale
+    r = small()
+    assert r.warmup_tokens == 60 == r.settings["warmup"] and small(tokens=599).warmup_tokens == 59
+    for kw in (dict(lfu_decay=1.0), dict(pin_fraction=0.9, policy="lfu-pinned"), dict(lossy=Lossy(topk=1)),
+               dict(lossy=Lossy(skip_miss_rank=1))):
+        assert small(tokens=60, cache_gb=0.3, **kw).tokens > 0, kw            # accepted
+    assert small(tokens=60, cache_gb=0.3, lossy=Lossy(topk=1)).loads_per_token == 16
+    with pytest.raises(ValueError, match="lfu_decay"):
+        small(tokens=60, policy="lru", lfu_decay=0.0)                          # also when no LFU runs
+    with pytest.raises(ValueError, match="io_threads must be an integer >= 1"):
+        small(tokens=60, io_threads=0)
+    assert lfu_seed_scale(1, 0.5) == 2.0
+    # a one-token warm-up is the profile's source; only warm-up 0 falls back to the whole trace
+    assert not any("WHOLE trace" in w for w in small(tokens=60, policy="pinned", cache_gb=0.3, warmup=1).warnings)
+
+
+def test_rates_with_bypasses_and_one_load_windows():
+    """bypass_rate = bypassed / demand misses; tokens_per_step; the rates of windows small enough to do by hand."""
+    shape = dataclasses.replace(presets.get(SMALL), name="tiny-bypass", n_layers=1, n_experts=6, top_k=1)
+    ids = np.array([0, 1, 2, 3, 4, 5] * 2, dtype=np.uint16).reshape(12, 1, 1)
+    # windows of 6 tokens, 5 slots (engine minimum at top-1, one I/O thread): in each window the 6th expert finds
+    # every slot held by the window's own experts and is read into a scratch buffer
+    r = simulate(shape, trace=Trace(ids, 6), spec=Spec(5, 1.0), cache_gb=0.0, io_threads=1, warmup=6)
+    assert (r.slots, r.steps, r.tokens, r.tokens_per_step, r.loads_per_token) == (5, 1, 6, 6.0, 1.0)
+    assert (r.hit_rate, r.miss_rate, r.bypass_rate) == (5 / 6, 1 / 6, 1.0)
+    one = simulate(shape, trace=Trace(ids[:2], 6), cache_gb=0.0, io_threads=1, warmup=1)   # a single load
+    assert (one.tokens, one.loads_per_token, one.miss_rate, one.hit_rate, one.bypass_rate) == (1, 1.0, 1.0, 0.0, 0.0)
+    # many misses, some bypassed: olmoe verification windows wider than the engine-minimum cache
+    big = small(cache_gb=0.0, spec=Spec(4, 0.9))
+    c, g = big._counts, np.repeat(big._sched.step_start >= big.warmup_tokens, 16)
+    byp, miss = int(c.bypass[g].sum()), int(c.miss[g].sum())
+    assert 0 < byp < miss and big.bypass_rate == byp / miss
+
+
+def test_public_defaults():
+    """The documented defaults of the cache-level API: 8 I/O threads, no prefetch extras, seed 0 and measuring
+    from the first step."""
+    assert engine_min_slots(8) == engine_min_slots(8, 8) == 26
+    assert Prefetch(0.8) == Prefetch(0.8, 0)
+    sched = build_schedule(synthetic(40, 2, 8, 2, seed=1).ids, 8)
+    pf = Prefetch(0.5, 2)
+    assert run_cache(sched, "lfu", 5, prefetch=pf).pf_issued.tolist() == \
+        run_cache(sched, "lfu", 5, prefetch=pf, seed=0).pf_issued.tolist()
+    assert run_cache(sched, "belady", 5).hit.tolist() == run_cache(sched, "belady", 5, measure_step=0).hit.tolist()

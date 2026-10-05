@@ -1,0 +1,66 @@
+name: golden
+
+# Golden-test gate (INV-VERIFY). The pull request's tests/golden/ must match the lock of the BASE
+# revision: every file the base locked, with the base's hash, nothing added, and an unchanged
+# MANIFEST.sha256. A change that edits golden tests and re-locks them fails here until a maintainer
+# (CODEOWNERS) has reviewed it and added the 'golden-reviewed' label. A merge commit with paths that
+# are one file on Windows or macOS (case or Unicode twins, NTFS 8.3 short names) fails whatever the
+# label says.
+#
+# pull_request_target runs this file and the tools as they are on the default branch, main (since
+# 2025-12-08 GitHub takes both from the default branch whatever the pull request's base, and
+# github.sha is that branch's head), so a pull request cannot edit the gate that judges it. The gate
+# runs for pull requests into main only. That event is only safe because nothing from the pull
+# request is executed or even checked out: merge_ref.py fetches its merge commit as git objects into
+# an empty repository (no working tree, so links and twins in it never reach the disk), the
+# read-only token is visible to that fetch alone, and no secret is used. actions/checkout is not used
+# for the pull request: it refuses fork pull requests under pull_request_target (since 2026-07-20)
+# unless allow-unsafe-pr-checkout is set. Keep it that way: no pip install, no pytest, no --run, no
+# build in this workflow. The golden suite itself runs in ci.yml. Residual trust assumptions:
+# governance/README.md, "CI".
+
+on:
+  pull_request_target:
+    branches: [main]
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: golden-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  golden:
+    name: golden lock vs base
+    runs-on: ubuntu-latest
+    steps:
+      - name: Base revision (the tools and the lock)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}            # pull_request_target: the head of main, the default branch
+          path: base
+          fetch-depth: 0                    # history: merge_ref.py checks the merge's first parent against it
+          sparse-checkout: |
+            governance/tools
+            tests/golden
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Merge commit of this event's head into this base (git objects only)
+        env:
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GITHUB_TOKEN: ${{ github.token }}
+        run: >
+          python -I -S base/governance/tools/merge_ref.py --fetch "$REPO_URL" --pr "$PR_NUMBER"
+          --merge pr --head "$HEAD_SHA" --base base
+      - name: Golden lock against the base revision
+        env:
+          ACK: ${{ contains(github.event.pull_request.labels.*.name, 'golden-reviewed') && '--acknowledged' || '' }}
+        run: >
+          python -I -S base/governance/tools/check_golden.py --root pr --rev HEAD
+          --base-manifest base/tests/golden/MANIFEST.sha256 $ACK

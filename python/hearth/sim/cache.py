@@ -27,6 +27,8 @@ measured window is an upper bound for all of them; see _Belady.
 """
 from __future__ import annotations
 
+import math
+import numbers
 import random
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -45,13 +47,14 @@ POLICY_HELP = {
     "belady": "offline optimum of a relaxed problem (no protection, bypass, warm start): upper bound, not a policy",
 }
 REJECT, FREE = -2, -1
+MAX_IO_THREADS = 64           # hx_store_opts.n_io_threads range is 1..64; store.c clamps larger values
 
 
 def engine_min_slots(top_k: int, io_threads: int = 8) -> int:
-    """hx_store_open's floor on the slot count (hx_store.h)."""
+    """hx_store_open's floor on the slot count (hx_store.h), with n_io_threads clamped to 64 as store.c does."""
     if io_threads < 1:
         raise ValueError(f"io_threads must be >= 1, got {io_threads}")
-    return 2 * top_k + io_threads + 2
+    return 2 * top_k + min(int(io_threads), MAX_IO_THREADS) + 2
 
 
 # ---- schedule -------------------------------------------------------------
@@ -60,7 +63,7 @@ def engine_min_slots(top_k: int, io_threads: int = 8) -> int:
 class Schedule:
     acc: np.ndarray        # int64 keys, all groups concatenated
     ptr: np.ndarray        # int64 [G+1] group boundaries
-    minrank: np.ndarray    # int16 per access: best rank at which the expert was routed in the window
+    minrank: np.ndarray    # int32 per access: best rank at which the expert was routed in the window
     pairs: np.ndarray      # int32 [G] (token, expert) routings in the group (compute work)
     step_start: np.ndarray # int64 [S] first trace position of each forward step
     step_npos: np.ndarray  # int32 [S] positions evaluated by the step (1 = plain decode)
@@ -103,7 +106,7 @@ def build_schedule(ids: np.ndarray, n_experts: int, spec_k: int = 0, spec_alpha:
     if spec_k <= 0:
         acc = (ids.astype(np.int64) + offs[None, :, None]).ravel()
         ptr = np.arange(0, T * L * k + 1, k, dtype=np.int64)
-        minrank = np.tile(np.arange(k, dtype=np.int16), T * L)
+        minrank = np.tile(np.arange(k, dtype=np.int32), T * L)
         ones = np.ones(T, dtype=np.int32)
         return Schedule(acc, ptr, minrank, np.full(T * L, k, dtype=np.int32), np.arange(T, dtype=np.int64),
                         ones, ones.copy(), L, E, k)
@@ -136,7 +139,7 @@ def build_schedule(ids: np.ndarray, n_experts: int, spec_k: int = 0, spec_alpha:
     ptr = np.zeros(len(starts) * L + 1, dtype=np.int64)
     np.cumsum(np.concatenate(lens), out=ptr[1:])
     pairs = np.repeat(np.asarray(npos, dtype=np.int32) * k, L)
-    return Schedule(acc, ptr, np.concatenate(mrs).astype(np.int16), pairs, np.asarray(starts, dtype=np.int64),
+    return Schedule(acc, ptr, np.concatenate(mrs).astype(np.int32), pairs, np.asarray(starts, dtype=np.int64),
                     np.asarray(npos, dtype=np.int32), np.asarray(nacc, dtype=np.int32), L, E, k)
 
 
@@ -643,11 +646,21 @@ class Prefetch:
     extra: int = 0
 
     def __post_init__(self):
-        if not 0.0 <= self.recall <= 1.0:
-            raise ValueError(f"prefetch recall must be in [0, 1], got {self.recall}")
-        if int(self.extra) != self.extra or self.extra < 0:
-            raise ValueError(f"prefetch extra must be an integer >= 0, got {self.extra}")
-        self.extra = int(self.extra)
+        if not (is_real(self.recall) and 0.0 <= self.recall <= 1.0):
+            raise ValueError(f"prefetch recall must be in [0, 1], got {self.recall!r}")
+        self.recall = float(self.recall)
+        self.extra = as_count("prefetch extra", self.extra)
+
+
+def is_real(v) -> bool:
+    return isinstance(v, numbers.Real) and not isinstance(v, bool)
+
+
+def as_count(name: str, v, lo: int = 0) -> int:
+    """v as an int >= lo: integral reals (4.0) are accepted; inf, NaN, 4.5, True and strings are not."""
+    if not (is_real(v) and math.isfinite(v) and v == int(v) and v >= lo):
+        raise ValueError(f"{name} must be an integer >= {lo}, got {v!r}")
+    return int(v)
 
 
 def profile_order(heat: np.ndarray, exclude=None) -> np.ndarray:
@@ -660,7 +673,7 @@ def profile_order(heat: np.ndarray, exclude=None) -> np.ndarray:
 
 def make_policy(name: str, slots: int, sched: Schedule, acc: list, *, profile=None, vram=None,
                 lfu_decay: float = 0.995, lfu_samples: int = 0, pin_fraction: float = 0.5,
-                io_threads: int = 8, seed: int = 0, measure_step: int = 0):
+                io_threads: int = 8, seed: int = 0, measure_step: int = 0, heat_scale: float = 1.0):
     nk = sched.n_moe_layers * sched.n_experts
     scratch = min(slots, max(engine_min_slots(sched.top_k, io_threads), sched.max_union + sched.top_k))
     if name == "lru":
@@ -680,7 +693,7 @@ def make_policy(name: str, slots: int, sched: Schedule, acc: list, *, profile=No
         n_pin = max(0, min(int(pin_fraction * slots), slots - scratch))
         pins = order[:n_pin].tolist()
         return _LFU(slots - n_pin, acc, nk, decay=lfu_decay, samples=lfu_samples, seed=seed,
-                    heat0=np.asarray(profile, dtype=np.float64), pinned=pins)
+                    heat0=np.asarray(profile, dtype=np.float64) * heat_scale, pinned=pins)
     if name == "belady":
         start = int(sched.ptr[min(max(int(measure_step), 0), sched.n_steps) * sched.n_moe_layers])
         return _Belady(slots, sched.acc, acc, nk, start=start, vram=vram)
@@ -690,8 +703,9 @@ def make_policy(name: str, slots: int, sched: Schedule, acc: list, *, profile=No
 def run_cache(sched: Schedule, policy: str, slots: int, *, profile=None, vram_keys=None, cold_keys=None,
               prefetch: Prefetch | None = None, skip_rank: int | None = None, popularity=None,
               lfu_decay: float = 0.995, lfu_samples: int = 0, pin_fraction: float = 0.5,
-              io_threads: int = 8, seed: int = 0, measure_step: int = 0) -> CacheCounts:
-    """Simulate one policy over the schedule. `profile`: heat per key (pinned policies, VRAM tier).
+              io_threads: int = 8, seed: int = 0, measure_step: int = 0, heat_scale: float = 1.0) -> CacheCounts:
+    """Simulate one policy over the schedule. `profile`: heat per key (pinned policies, VRAM tier); pins
+    are ranked by it and lfu-pinned seeds its LFU heat with profile * heat_scale.
     `vram_keys` / `cold_keys`: iterables of keys in the static VRAM tier / stored at low precision.
     `popularity`: [L, E] weights for drawing wrong predictions (defaults to uniform).
     `measure_step`: first forward step whose hits count; Belady optimises hits from there on."""
@@ -711,7 +725,7 @@ def run_cache(sched: Schedule, policy: str, slots: int, *, profile=None, vram_ke
             cold[int(key)] = 1
     pol = make_policy(policy, slots, sched, acc, profile=profile, vram=vram if vram_keys is not None else None,
                       lfu_decay=lfu_decay, lfu_samples=lfu_samples, pin_fraction=pin_fraction,
-                      io_threads=io_threads, seed=seed, measure_step=measure_step)
+                      io_threads=io_threads, seed=seed, measure_step=measure_step, heat_scale=heat_scale)
     fut = pol.needs_future
     nxt = pol.nxt if fut else None
     admit, touch, last_resort = pol.admit, pol.touch, pol.admit_last_resort

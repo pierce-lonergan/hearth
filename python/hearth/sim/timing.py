@@ -62,14 +62,19 @@ class ModelCosts:
     context: int
     act_bytes: float = 0.0       # one position's hidden state (F32) crossing PCIe in a GPU hand-off
     notes: tuple = ()
+    expert_d: int = 0            # expert input/output width (d_model, or the latent width)
+    expert_ffn: int = 0
+    resident_params: int = 0     # backbone parameters incl. embeddings and F32 routers (== Shape.dense_params())
+    total_params: int = 0        # resident_params + every expert (== Shape.params_total())
 
 
 def model_costs(shape, *, expert_bits: float = 4.25, dense_bits: float = 8.25, embed_bits: float = 8.25,
                 cold_bits: float | None = None, context: int = 1024, max_seq: int = 4096,
                 kv_elem_bytes: float = 4.0) -> ModelCosts:
     """Byte/parameter accounting from a hearth.presets.Shape. Matrices at dense_bits, routers and
-    norms F32 (FORMAT.md sec. 4.1). For latent MoE (expert_d != d_model) the per-layer down/up projections
-    into the expert space (2*D*expert_d) are added to the backbone - Shape.dense_params() omits them."""
+    norms F32 (FORMAT.md sec. 4.1). Latent MoE (expert_d set): experts are sized at expert_d and each MoE
+    layer's two projections into and out of that space (2*D*expert_d) are backbone matrices, counted once,
+    exactly as Shape.dense_params() counts them."""
     for name, v in (("expert_bits", expert_bits), ("dense_bits", dense_bits), ("embed_bits", embed_bits)):
         if not 0.0 < v <= 32.0:
             raise ValueError(f"{name} must be in (0, 32], got {v}")
@@ -89,9 +94,10 @@ def model_costs(shape, *, expert_bits: float = 4.25, dense_bits: float = 8.25, e
         kv_per_pos = 2 * shape.n_kv_heads * shape.head_dim * kv_elem_bytes
     norms = 2 * D * 4
     router = shape.n_experts * D * 4
-    latent = 2 * D * De if De != D else 0
+    latent = 2 * D * shape.expert_d if shape.expert_d else 0      # the rule of Shape.dense_params()
     if latent:
-        notes.append(f"latent MoE: +{2 * D * De / 1e6:.1f}M projection params per MoE layer (not in Shape.dense_params)")
+        notes.append(f"latent MoE: experts in {De}-d, {latent / 1e6:.1f}M projection params per MoE layer "
+                     "in the backbone")
     shared = 3 * D * shape.shared_ffn
     dense_ffn = 3 * D * shape.dense_ffn
     head_params = 0 if shape.tie_embeddings else shape.vocab * D
@@ -105,6 +111,8 @@ def model_costs(shape, *, expert_bits: float = 4.25, dense_bits: float = 8.25, e
                 + shape.n_moe_layers * (router + (latent + shared) * b) + shape.n_dense_layers * dense_ffn * b + D * 4)
     slab = slab_bytes(De, shape.expert_ffn, expert_bits)
     slab_cold = slab_bytes(De, shape.expert_ffn, cold_bits) if cold_bits else slab
+    resident_params = (shape.vocab * D + head_params + shape.n_layers * attn + shape.n_dense_layers * dense_ffn
+                       + shape.n_moe_layers * (shape.n_experts * D + latent + shared))
     if shape.arch == "kimi_k3":
         notes.append("kimi-k3: KV term assumes MLA in every layer (69 of 93 are KDA linear attention) - overstates KV")
     return ModelCosts(
@@ -115,7 +123,9 @@ def model_costs(shape, *, expert_bits: float = 4.25, dense_bits: float = 8.25, e
         layer_params=layer_params, shared_bytes=shared * b, shared_params=shared, kv_bytes_per_layer=kv_layer,
         resident_bytes=resident, embed_bytes=embed_bytes, kv_resident_bytes=kv_per_pos * max_seq * shape.n_layers,
         expert_total_bytes=float(slab) * shape.n_moe_layers * shape.n_experts, context=context,
-        act_bytes=4.0 * D, notes=tuple(notes))
+        act_bytes=4.0 * D, notes=tuple(notes), expert_d=De, expert_ffn=shape.expert_ffn,
+        resident_params=resident_params,
+        total_params=resident_params + shape.n_moe_layers * shape.n_experts * 3 * De * shape.expert_ffn)
 
 
 # ---- calibration scalars -----------------------------------------------------

@@ -1,0 +1,243 @@
+{
+  "generation_id": "gen-001-h02-platform-pool",
+  "parent_generation": null,
+  "timestamp": "2026-10-05T07:19:27Z",
+  "lifecycle_status": "TASK_COMPLETE",
+  "trigger": "MILESTONE_VERIFIED",
+  "task_id": "H02-platform-pool",
+  "workspace": {
+    "branch": "main",
+    "base_commit": "4a6cb80",
+    "head_commit": "4a6cb80",
+    "uncommitted_diff_stat": "modified: engine/src/{pool.c, platform_win.c, platform_posix.c, platform_common.inc}, engine/tests/{test_pool.c, test_platform.c}; new: governance/handovers/H02-platform-pool-gen-001.json. (HEAD moved to 10f6542 during the session through unrelated commits: docs/results, scripts/record_traces.py, ARCHITECTURE.md routing text; no engine or contract file.)"
+  },
+  "constraints_touched": [
+    "INV-SAFE",
+    "INV-DEP",
+    "INV-DATA",
+    "INV-DET-1",
+    "INV-HONEST",
+    "INV-VERIFY"
+  ],
+  "epistemic_ledger": {
+    "hypotheses_validated": [
+      {
+        "claim": "Root cause of the ~1 ms 32-thread dispatch: when a pool has as many threads as logical CPUs, any other runnable thread displaces a pool thread, and the displaced thread gets a CPU back only when some spinner reaches its spin_us deadline and goes to sleep (spinners never gave the CPU up). Each dispatch therefore took ~spin_us.",
+        "evidence": "Original pool.c, 32 threads on 32 logical CPUs: p50 round trip 237 / 1031 / 3034 us at spin_us 200 / 1000 / 3000, i.e. it tracks spin_us. 16 and 24 threads: p50 0.7-0.8 us under the same load; 30 threads p50 1.1 us but p90 1033 us. Machine shared with other engineers' builds (~40% CPU), so this is the loaded regime.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Yielding spinners (SwitchToThread / sched_yield every 2 us, workers and the waiting caller) remove the spin_us-bound regime on Windows.",
+        "evidence": "Scratch bench (empty task, 5000 dispatches, interleaved A/B runs, loaded machine): 32 threads spin_us=1000 p50 1014-1031 us (original, and the new protocol with yields compiled out) -> 6.5-12.6 us; 16 threads unchanged at p50 0.6-0.7 us. Uneven-work regions (128 chunks, ~1 ms serial): 32 threads 1105 us per region (slower than serial) -> 60-88 us; 16 threads 74-76 us both. 64 threads (2x oversubscribed) spin 100 ms: p50 45-54 ms -> 0.81 ms. Pinned to one CPU (start /affinity), 4 threads, spin 200 ms: p50 2.1 ms original / 9.4 ms new protocol without yields / 0.7 ms with worker-only yields -> 12-15 us with caller yields too. Yield interval 1/2/4/20 us: 32-thread p50 6.5-8.9 / 8.1-8.4 / 12-16 / 28-43 us; 2 us chosen.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "Per-worker condvars (instead of one condvar + mutex shared by all sleepers) make waking a sleeping pool faster and let hx_pool_for_n wake only its own threads.",
+        "evidence": "spin_us=0 pools, p50: 16 threads 54 -> 34 us, 32 threads 106 -> 57 us (Windows); WSL 16 threads 484 -> 302 us. for_n(2) on a sleeping 32-thread pool: 0.8-1.3 us vs hx_pool_run 54-86 us; the wake-all mutant raises for_n(2) to ~50 us and is caught by test_pool.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "hx_pool_for_n is correct: chunks exactly once, tids < min(max_threads, n), exactly min(k, chunks) threads run concurrently, non-participants are never woken and never waited for, and arbitrary interleavings with hx_pool_run and idle gaps neither lose nor duplicate work.",
+        "evidence": "test_pool: 900 (threads, max_threads, n, chunk) coverage cases incl. INT_MIN/-1/0/1/INT_MAX-1 and n=INT64_MAX; concurrency barrier for k in {2,3,n-1,n} at 4/16/33 threads; 2700-op random mixed sequences at spin 0/3/200; passes on MSVC /O2, MSVC ASan, gcc -O2, gcc ASan+UBSan+LSan and gcc TSan (no race reports). Hand-made mutants (wake-all, no chunk cap, no spin-window refresh, no worker yield, no caller yield) are each caught.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "hx_file_replace is atomic for concurrent readers and works while dst is open through hx_file handles, on Windows as on Linux.",
+        "evidence": "test_platform: 300 replaces of a 64 KiB file while a reader thread reopens and reads dst: 0 failed replaces, 0 torn reads, 0 open failures (Windows ~1000-1900 reads, Linux ~112000). On Windows MoveFileExW(REPLACE_EXISTING) fails with ERROR_ACCESS_DENIED whenever any handle has dst open (even FILE_SHARE_DELETE ones); the POSIX-semantics rename (FileRenameInfoEx) succeeds and the old handle keeps reading the old data.",
+        "verdict": "CONFIRMED"
+      },
+      {
+        "claim": "The T01 council's minor findings are fixed: empty env value on Windows, early timedwait timeouts, affinity-blind CPU counts (also on Linux for cores), unbounded env cache, locale-dependent hx_env_double, missing INT64_MAX boundary test, HEARTH_LOG whitespace in the test parser, sanitizer timing failures in test_pool.",
+        "evidence": "New test_platform run against the ORIGINAL platform_win.c fails 25 checks: empty var read as NULL (2), 2000 lookups 0.56 -> 221 ms after 30000 values of another variable, \"0.25\" -> default and \"0,25\" -> 0.25 under LC_NUMERIC=de_DE.UTF-8, timedwait early 2 of 24, and start /affinity masks 1/5/3 reported 32 cpus / 16 cores. New code: all pass (Windows 273 checks, Linux 244 with a localedef-generated de_DE locale via LOCPATH). The INT64_MAX boundary test uses a 1 GiB + 4 KiB request (committed, never touched) because a 10-byte read past INT64_MAX is rejected by the OS anyway; it kills the council's surviving mutant. test_pool turns timing checks off under ASan/TSan (or --no-timing); full ASan run 1746 checks / TSan --quick 1746 checks pass.",
+        "verdict": "CONFIRMED"
+      }
+    ],
+    "hypotheses_falsified": [
+      {
+        "claim": "The waiting caller should not yield (giving its CPU to another process only delays the next dispatch).",
+        "evidence": "Under external load the caller-without-yield variant was ~2-3 us better at 32-thread p50 (5.0-7.7 vs 7.4-11.4 us), but pinned to one CPU it made every dispatch take ~0.5-0.7 ms instead of ~14 us, because the caller held the only CPU its workers needed. A 20/50 us grace before the caller's first yield bought nothing measurable at 32 threads and made the pinned case 31/62 us. The caller yields every 2 us like the workers.",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "Yielding also fixes 32-thread dispatch on Linux (WSL2).",
+        "evidence": "WSL2 gcc -O2, host loaded by other engineers: 32 threads spin_us=1000 p50 850-1060 us with yields vs 300-650 us without (both unusable: vCPUs are descheduled by the host and sched_yield only reaches the local runqueue; 24 threads were already 150-230 us). Yields still win where pool threads share a runqueue: pinned to one CPU 16 ms -> 16.6 us, 3 CPUs 4.0 ms -> 3.8 us, 64 threads spin 100 ms 34 -> 16 ms. 16 threads unchanged (p50 0.67-0.73 us).",
+        "verdict": "REJECTED"
+      },
+      {
+        "claim": "MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) is enough for hx_file_replace on Windows (task text).",
+        "evidence": "It fails with ERROR_ACCESS_DENIED for as long as any handle has dst open, including hx_file handles that share delete access (measured: 250 ms of retries, then failure). Implemented the POSIX-semantics rename first and kept MoveFileExW as the fallback for volumes without FileRenameInfoEx; the fallback was exercised manually on the WSL 9P share (\\\\wsl.localhost\\..., FileRenameInfoEx -> ERROR_INVALID_PARAMETER, MoveFileExW then succeeded) but has no automated test.",
+        "verdict": "REJECTED"
+      }
+    ],
+    "open_questions": [
+      "Quiet-machine numbers were not obtainable: the machine was shared all session (other engineers' builds, 4-job mutation runs, a 23 GB Python job). The '32-thread within a small multiple of 16-thread' target is met under load only as 6.5-12.6 us vs 0.6-0.7 us (10-20x); on a quiet machine it should be closer, unverified.",
+      "Under external load, idle-spinning workers that yield can lose their CPU to other processes, so the next region waits for them: 16 threads, spin_us=1000, 20 us of caller-only work between regions: 33-41 us per iteration vs 29 us with the original pool. With the engine's POOL_SPIN_US=50 the new pool is at parity or better (100 us gaps: 136 vs 180 us). The amended hx_pool.h asks for the yields; the trade-off is recorded here.",
+      "Windows machines with several processor groups (> 64 logical CPUs): hx_num_cpus / hx_num_physical_cores ignore the affinity mask there (it only describes one group) and count every active processor. Not testable here (32 CPUs, one group).",
+      "macOS code written but never compiled: hw.optional.avx512f sysctl for Darwin's lazily-enabled AVX-512 state, the relative pthread_cond_timedwait_relative_np re-wait loop, <xlocale.h> for uselocale/newlocale.",
+      "The council's f16 sNaN finding (hx_f16_to_f32 keeps signalling NaNs signalling; F16C quiets them) is not in H02's list and was left unchanged; test_model.c uses hx_f16_to_f32 in a reference path.",
+      "Windows refuses to replace a read-only dst (rename(2) on POSIX does replace it). Tested and kept as a platform difference.",
+      "tests/py/test_runtime.py fails 3 hearth_stats layout checks with any DLL built from this tree: hearth.h gained read_errors in 8ea46c0, python/hearth/engine.py (H03) not yet updated. Not related to H02 files.",
+      "Incident during exploration (no lasting effect): a scratch call hx_file_replace(tmp, <%TEMP% itself>) with the first, MoveFileExW-only version returned success; inside this Store-app container the rename was virtualized into Packages/Claude_*/LocalCache/Local, so for ~5 minutes the container's view of %LOCALAPPDATA%/Temp was a 4-byte file (other agent sessions in the same container may have seen TEMP fail then). Renaming that shadow away restored the view; the real Temp directory (21,625 entries) was never touched, and the 4-byte file was deleted. hx_file_replace now refuses directories on both platforms, with tests."
+    ]
+  },
+  "procedures": [
+    "python scripts/hxcc.py --platform --run -o h02/test_pool.exe engine/src/pool.c engine/tests/test_pool.c            # full: correctness + latency table, ~8 s",
+    "python scripts/hxcc.py --platform --run -o h02/test_pool.exe engine/src/pool.c engine/tests/test_pool.c -- --quick # ~1 s; --no-timing skips timing checks (automatic under ASan/TSan)",
+    "python scripts/hxcc.py --platform --run -o h02/test_platform.exe engine/tests/test_platform.c -- --expect-cpu sse42,avx,avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512bf16,avxvnni,-neon,-dotprod,cores=16,cpus=32",
+    "MSVC ASan: PATH must include VC/Tools/MSVC/14.44.35207/bin/Hostx64/x64; python scripts/hxcc.py --asan --debug --platform --run -o h02/test_platform_asan.exe engine/tests/test_platform.c ; same for pool.c + test_pool.c",
+    "WSL: cp -r engine ~/h02b/ && cd ~/h02b/engine && gcc -std=c11 -ffp-contract=off -Wall -Wextra -Wno-unused-parameter -pthread -O2 -Isrc -Iinclude tests/test_platform.c src/platform_posix.c -lm -o ~/h02b/tp   (add -O1 -g -fsanitize=address,undefined or -fsanitize=thread; run TSan binaries under setarch $(uname -m) -R)",
+    "WSL locale for the LC_NUMERIC check: localedef -i de_DE -f UTF-8 ~/h02b/loc/de_DE.UTF-8 ; LOCPATH=~/h02b/loc ~/h02b/tp ...   (without a comma locale the check is skipped and says so)",
+    "cmake -S . -B %LOCALAPPDATA%/hearth/build/h02 -G \"Visual Studio 17 2022\" -A x64 ; cmake --build <dir> --config Release ; ctest --test-dir <dir> -C Release --output-on-failure",
+    "python governance/tools/mutate.py --file engine/src/pool.c --since 4a6cb80 --max-mutants 0 --jobs 2 --seed 1 --test \"python scripts/hxcc.py --platform --run -o {tmp}/mut_pool.exe engine/src/pool.c engine/tests/test_pool.c -- --quick\"",
+    "python governance/tools/mutate.py --file engine/src/platform_win.c --since 4a6cb80 --max-mutants 0 --jobs 2 --seed 1 --test \"python scripts/hxcc.py --platform --run -o {tmp}/mut_win.exe engine/tests/test_platform.c -- --expect-cpu sse42,avx,avx2,fma,f16c,avx512f,avx512bw,avx512vl,avx512vnni,avx512bf16,avxvnni,-neon,-dotprod,cores=16,cpus=32\"",
+    "platform_posix.c mutation: same with --pp-model gnu -U __APPLE__ -D __linux__ and a --test wrapper that runs wslpath on {root}, builds tests/test_platform.c + src/platform_posix.c with gcc inside WSL and runs it with LOCPATH set"
+  ],
+  "measurements": [
+    {
+      "metric": "hx_pool_run round trip, empty task, 32 threads, spin_us=1000, p50 (before -> after: before)",
+      "value": 1013.3,
+      "unit": "us",
+      "conditions": "test_pool latency table, original pool.c; mean 539 us, p99 1099 us; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, empty task, 32 threads, spin_us=1000, p50 (after)",
+      "value": 8.3,
+      "unit": "us",
+      "conditions": "test_pool latency table, final pool.c, same session; mean 9.65 us, p99 38.4 us; interleaved scratch A/B (5000 dispatches x3): 8.1-8.5 us vs original 1028-1038 us; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, empty task, 16 threads, spin_us=1000, p50 (after; before identical)",
+      "value": 0.6,
+      "unit": "us",
+      "conditions": "mean 0.68 us after vs 0.71 us before; interleaved A/B p50 0.6-0.7 both; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_for(4*nt items, chunk 1), empty body, 32 threads, spin_us=1000, mean (before 845.6 us)",
+      "value": 12.87,
+      "unit": "us",
+      "conditions": "test_pool latency table; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_run round trip, 32 threads, spin_us=1000, p50 at spin_us 200/1000/3000 with the original pool (root-cause evidence; value = the 200 us case)",
+      "value": 237.4,
+      "unit": "us",
+      "conditions": "1031 us at spin_us=1000, 3034 us at 3000: dispatch time tracks the spinners' deadline; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "uneven-work region (128 chunks of ~5-50 us, ~1 ms serial), 32 threads, per region (before 1105 us)",
+      "value": 60.3,
+      "unit": "us",
+      "conditions": "scratch bench; after: 60-88 us over runs; 16 threads 74-76 us before and after; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "pinned to one CPU (start /affinity), 4 threads, spin_us=200000, p50 dispatch (before 2124 us)",
+      "value": 14.3,
+      "unit": "us",
+      "conditions": "test_pool pinned child, 12-16 us over runs; caller not yielding: 520-706 us; no yields: 9.4 ms; WSL taskset: 16.0 ms -> 16.6 us",
+      "kind": "measured"
+    },
+    {
+      "metric": "64 threads (2x logical CPUs), spin_us=100000, p50 dispatch (before 45.5 ms)",
+      "value": 0.81,
+      "unit": "ms",
+      "conditions": "scratch bench, Windows; WSL2 34.2 -> 16.0 ms",
+      "kind": "measured"
+    },
+    {
+      "metric": "sleeping pool (spin_us=0), 16 threads, p50 round trip (before 61.8 us)",
+      "value": 36.3,
+      "unit": "us",
+      "conditions": "test_pool latency table; scratch: 32 threads 106 -> 57 us; per-worker condvars",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_pool_for_n(2) on a sleeping 32-thread pool, p50 (hx_pool_run on the same pool: 54-86 us)",
+      "value": 1.2,
+      "unit": "us",
+      "conditions": "test_pool 'small regions on a sleeping pool'; 0.8-1.3 us over runs",
+      "kind": "measured"
+    },
+    {
+      "metric": "WSL2 Linux, 32 threads, spin_us=1000, p50 with yields (without: 300-650 us)",
+      "value": 1020,
+      "unit": "us",
+      "conditions": "gcc 13.3 -O2, host loaded; 850-1060 us over runs; regression vs no-yield on a host-loaded VM, see falsified hypotheses",
+      "kind": "measured"
+    },
+    {
+      "metric": "16 threads, spin_us=1000, 20 us serial gap between 64-chunk regions, per iteration (before 28.6-29.7 us)",
+      "value": 35.0,
+      "unit": "us",
+      "conditions": "scratch gap bench, 33-41 us over runs; with spin_us=50 (engine default) about parity: original 9.2-12.7 vs new 10.4-10.9 us at 5 us gaps, 180-182 vs 136 us at 100 us gaps; Windows 11, Ryzen 9 9950X, MSVC /O2; machine shared with other engineers' builds and mutation runs (~35-40% CPU, noisy)",
+      "kind": "measured"
+    },
+    {
+      "metric": "2000 hx_env_str lookups after 30000 values of another variable (original: 221 ms)",
+      "value": 0.35,
+      "unit": "ms",
+      "conditions": "test_platform env churn check, Windows; before the churn 0.33 ms (original 0.56 ms)",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_cond_timedwait timeouts reported early (original: 2 of 24 in this test, council 5-8 of 40)",
+      "value": 0,
+      "unit": "count",
+      "conditions": "24 waits of 1.0/1.5/2.0 ms, Windows; elapsed measured with hx_now_ns",
+      "kind": "measured"
+    },
+    {
+      "metric": "hx_file_replace under a concurrent reader: torn or missing reads",
+      "value": 0,
+      "unit": "count",
+      "conditions": "300 replaces of a 64 KiB file; reader ~1000-1900 opens (Windows), ~112000 (Linux); 0 failed replaces",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score pool.c (lines changed since 4a6cb80, all 168 mutants)",
+      "value": 65.9,
+      "unit": "percent",
+      "conditions": "test_pool --quick, MSVC, seed 1, 2 jobs on a loaded machine: killed 54, timeout 56, survived 57. Survivors: equivalent (slot padding, spin-check counts, >= vs >, init calls already covered by memset), perf-only (yield interval, caller sleeping early), release-path destroy calls that are no-ops on Windows. Linux ASan+LSan on the release-path lines kills the free/started mutants (11 destroy-call survivors remain). One equivalent mutant (M0001) was killed in this run but survived the first: a timing flake.",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_win.c (lines changed since 4a6cb80, all 248 mutants)",
+      "value": 63.6,
+      "unit": "percent",
+      "conditions": "test_platform --expect-cpu ..., MSVC, seed 1: killed 144, timeout 13, survived 90. Survivors: deadline-loop-masked sleep/timedwait constants (33), multi-group/failure-only branches (7), allocation-size and alloc-failure mutants (22; the overflow/use-after-free ones die under MSVC ASan: 76.5% on those lines), MoveFileExW fallback and its ACCESS_DENIED-busy branch, unreachable on NTFS (10), debug logging and leaks (8), equivalent constants.",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_posix.c (lines changed since 4a6cb80, all 132 mutants, run in WSL)",
+      "value": 62.6,
+      "unit": "percent",
+      "conditions": "gcc -O1 test_platform with LOCPATH de_DE, --pp-model gnu: killed 80, timeout 2, survived 49. Survivors: sleep/timedwait ns constants masked by deadline loops (16), parent-directory fsync (durability, not observable: 20), CPU_SETSIZE clamps and sysfs fallbacks (7), debug logs, zmm_lazy constant, glibc newlocale fast path.",
+      "kind": "measured"
+    },
+    {
+      "metric": "mutation score platform_common.inc (changed lines, 7 mutants)",
+      "value": 85.7,
+      "unit": "percent",
+      "conditions": "6 killed; survivor: ymm_ok && -> || in the XCR0 test, equivalent on a CPU whose OS enables every state bit",
+      "kind": "measured"
+    },
+    {
+      "metric": "test_pool full run time (before 40.6 s)",
+      "value": 6.2,
+      "unit": "s",
+      "conditions": "Windows MSVC /O2; mostly the 32-thread latency section",
+      "kind": "measured"
+    }
+  ],
+  "active_blockers": [],
+  "unfulfilled_mandates": [
+    "Task text asked for MoveFileExW(MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH) on Windows. Implemented a POSIX-semantics rename (SetFileInformationByHandle, FileRenameInfoEx) first, with that MoveFileExW call as the fallback, because MoveFileExW fails whenever dst is open (see ledger). Director should confirm; the hx_platform.h comment still says MoveFileExW.",
+    "32-thread dispatch 'within a small multiple of 16-thread dispatch on a quiet machine': no quiet machine was available. Measured under ~35-40% external load: 8.1-8.5 us vs 0.6-0.7 us (~13x). On WSL2 (host-loaded VM) 32 threads stay ~0.5-1 ms with or without yields.",
+    "macOS branches (lazy AVX-512 detection via hw.optional.avx512f, relative timedwait re-wait loop, xlocale) are written but not compiled anywhere."
+  ]
+}

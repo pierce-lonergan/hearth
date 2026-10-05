@@ -29,11 +29,15 @@ python -m hearth sim --list                                           # presets,
 ```
 
 `python -m hearth.sim` works too. The runtime wires `python -m hearth sim` to
-`hearth.sim.main(argv)`. Hardware fields can be overridden from the CLI
-(`--ram-gib`, `--dram-gbs`, `--nvme 2x6.5`, `--nvme-latency-us`, `--io-cap-gbs`,
-`--int8-tops`, `--os-reserve-gib`, `--vram-gib`, `--vram-gbs`, `--pcie-gbs`), as can the
-model encoding (`--expert-bits`, `--dense-bits`, `--context`, `--kv-bytes`).
-`--json` emits everything machine-readably.
+`hearth.sim.main(argv)`. Every hardware field except the names and notes can be
+overridden from the CLI: `--ram-gib`, `--dram-gbs`, `--nvme 2x6.5` (drive count and GB/s),
+`--nvme-latency-us`, `--nvme-capacity-gb`, `--io-cap-gbs`, `--int8-tops`, `--cpu-cores`,
+`--os-reserve-gib`, `--vram-gib`, `--vram-gbs`, `--pcie-gbs`, `--gpu-sync-us` and
+`--unified`/`--no-unified`. So can the model encoding: `--expert-bits`, `--dense-bits`,
+`--embed-bits`, `--context`, `--max-seq` (KV capacity for feasibility) and `--kv-bytes`.
+`--json` emits everything machine-readably. In Python, `get_hardware` and
+`simulate(hardware=...)` also take a `Hardware.to_dict()`, such as a result's
+`settings["hw"]`; its derived `io_gbs` must agree with the other fields.
 
 Out-of-range inputs are rejected with an error rather than simulated:
 
@@ -43,13 +47,22 @@ Out-of-range inputs are rejected with an error rather than simulated:
   (`--spec-alpha 1.5` without `--spec-k`);
 * negative cache, context, sample counts, draft length (`--spec-k`) or prefetch
   extras, and fewer than one I/O thread;
-* non-integer draft length, I/O threads, sample count or warm-up (`4.0` is accepted
-  as 4);
+* non-integer draft length, I/O threads, sample count, warm-up, prefetch extras or
+  lossy top-k / skip rank (`4.0` is accepted as 4), and infinite or NaN values for
+  any of them or for acceptance and recall (`Spec(inf)`, `Prefetch(0.5, inf)` and
+  `Lossy(topk=6.5)` raise `ValueError`);
 * a warm-up after which no forward step starts, so nothing would be measured;
+* a heat profile (`.usage` file or array) with an entry that is not a finite,
+  non-negative number, which `store.c` also rejects;
+* an empty `--sweep-cache` or `--sweep-zipf` list;
 * bits/weight outside (0, 32];
 * a trace whose `n_layers` is below its MoE layer count or does not fit the
   file's u32 field;
 * calibration points whose measured tok/s is not a finite number > 0 (§4).
+
+More than 64 I/O threads is not an error: the engine clamps `n_io_threads` to 64
+(`hx_store_opts`), so the simulator does the same for the minimum slot count and adds a
+warning.
 
 ```python
 from hearth.sim import simulate, sweep, calibrate, Spec, Prefetch, Lossy
@@ -87,8 +100,13 @@ Backbone bytes are counted per FORMAT.md §4.1:
 
 For latent MoE (Kimi-K3, `expert_d = 3584`) experts are sized in the latent width.
 The two per-layer projections into and out of that space (2·D·expert_d parameters
-per MoE layer) are **added** to the backbone, because `Shape.dense_params()` omits
-them (see the handover's contract issues).
+per MoE layer) are backbone matrices at `--dense-bits`. `Shape.dense_params()` counts
+them since commit 8ea46c0, and the simulator counts them once, by the same rule (any
+nonzero `expert_d`). `ModelCosts.resident_params` equals `Shape.dense_params()` and
+`ModelCosts.total_params` equals `Shape.params_total()` for every preset; the tests
+check both, and the resident bytes, against the presets. Kimi-K3 has
+2 752 693 600 256 parameters in the preset (about 2.75 T, of which 4.7 B are latent
+projections), and Kimi-K2 has 1 026 407 202 816.
 
 ### 2.2 Hardware profiles
 
@@ -198,8 +216,8 @@ the window (INV-DET-2 makes this legal).
 ### 3.2 Cache simulation
 
 Keys are `(moe_layer, expert)` slabs. The slot count is `floor(cache_GiB · 2³⁰ / slab)`.
-It is raised to the engine minimum `2·top_k + io_threads + 2` (hx_store.h) and
-capped at the total number of experts.
+It is raised to the engine minimum `2·top_k + io_threads + 2` (hx_store.h, with
+`io_threads` clamped to 64 as in `store.c`) and capped at the total number of experts.
 
 For every group, each needed expert is classified as:
 
@@ -284,7 +302,22 @@ bound for every online policy:
 
 The **profile** for `pinned`, `lfu-pinned`, the VRAM tier and cold experts is the
 access count over the warm-up prefix by default. Alternatives are `--profile oracle`
-(the whole trace, flagged as seeing the future) or a `.usage` file (FORMAT.md §8).
+(the whole trace, flagged as seeing the future), a `.usage` file (FORMAT.md §8) or, in
+Python, an array with one entry per (MoE layer, expert). Every entry must be a finite
+number ≥ 0.
+
+Pins, the VRAM tier and cold experts are ranked by the counts. `lfu-pinned` also seeds
+its LFU heat from them, the way `store.c` seeds heat from `usage_in`: count / tokens /
+(1 − decay), the steady state of the decayed counter at that per-token rate. The token
+count is `tokens_observed` for a `.usage` file, the warm-up length for the default
+profile, and the trace length for `oracle` (or for a warm-up of 0). An array has no
+token count, so its values seed the heat as they are, as `store.c` does for
+`tokens_observed = 0`; with decay 1 the counts are used as they are too. Generation 3
+seeded raw counts, which matched the engine only at the default 200-token warm-up
+(200 × (1 − 0.995) = 1). With a usage file recorded over 6000 tokens, a 600-token
+olmoe trace and 128 slots, raw seeding gives a measured-window hit rate of 0.20 where
+engine-style seeding gives 0.465 (pin fraction 0) or 0.379 (0.5); the raw counts dwarf
+the live heat, so LFU cannot adapt.
 
 ### 3.3 Prefetch
 
@@ -363,6 +396,21 @@ the largest part.
 * `dram` = every expert computed on the CPU, plus the backbone and KV.
 * `vram` = what the GPU read.
 
+These identities hold for every run, with prefetch, cold slabs, skips, speculative
+windows and the VRAM tier. Sums are over the measured steps, cold slabs count S_c, and
+everything is divided by the accepted tokens:
+
+```
+nvme_demand + nvme_prefetch − nvme_prefetch_wasted = (misses + prefetch hits) · S
+nvme_prefetch        = Σ_l f_l · (bytes prefetched for layer l)    (all of them when every f_l = 1)
+nvme_prefetch_wasted = Σ_l f_l · (bytes of wrong guesses for layer l)
+dram                 = (loads − VRAM-tier loads − skips) · S    [+ backbone per step, gpu off]
+vram                 = VRAM-tier loads · S                      [+ backbone per step, GPU modes]
+```
+
+The late part (1 − f) of a needed prefetch is in `nvme_demand`, and the late part of a
+wrong guess is cancelled, so it is in no counter.
+
 `hit_rate + prefetch_rate + miss_rate + skip_rate = 1` over expert loads. `hit_rate`
 counts loads that needed no storage read, VRAM tier included.
 
@@ -374,11 +422,19 @@ counts loads that needed no storage read, VRAM tier included.
   plus 1 GiB of VRAM headroom); or unified memory.
 * **Expert cache.** RAM left for it = RAM − OS reserve − 0.5 GiB workspace − backbone − KV.
   The KV cache is sized at `max_seq` = 4096.
-* **Minimum.** The engine-minimum cache, and the minimum RAM to run at all.
+* **Parameters.** `Shape.params_total()` and its resident part (`dense_params()`),
+  from the simulator's own accounting (§2.1).
+* **Minimum.** The engine-minimum cache (I/O threads clamped to 64), and the minimum
+  RAM to run at all.
 * **Recommended cache.** All of the RAM left. On every trace simulated here the hit
   rate kept rising with cache size, so no smaller "knee" is recommended.
-* **Disk.** The model file size at Q3/Q4/Q8/BF16 experts, and whether it fits one
-  drive.
+* **Disk.** The model file size at Q3/Q4/Q8/BF16 experts (slabs per FORMAT.md §5,
+  at the latent width for latent MoE: Kimi-K3 is 1139 / 1479 / 2840 / 5478 GB), and
+  whether the file at `--expert-bits` fits one drive. The backbone is counted at
+  `--dense-bits` in every column.
+* **VRAM tier.** Only `dense+experts` on a discrete GPU gets one: the slabs that fit
+  in the VRAM left after the backbone (without the embedding table), the KV cache and
+  1 GiB of headroom.
 
 `simulate` always runs. An infeasible configuration is flagged in `Result.feasible`
 and in the warnings with the reason, and the report suggests a Q4 backbone where
@@ -458,8 +514,8 @@ json.dump(cal.to_dict(), open("calib-this-pc.json", "w"))
 
 ## 5. Validation
 
-`tests/py/test_sim.py` has 112 tests and runs in about 21–26 s under moderate
-machine load (§9). It checks:
+`tests/py/test_sim.py` has 152 tests and runs in about 35 s under the machine load
+of §9. It checks:
 
 * **Belady is the optimum of the relaxed problem (§3.2).**
   * It equals an exhaustive search on 80 random small schedules: top-k from 1 to 4,
@@ -504,12 +560,62 @@ machine load (§9). It checks:
 * **LRU cyclic pathology.** With the cache below one token's working set, global LRU
   has a hit rate below 0.5% while LFU is above 20%. LRU recovers once the cache holds
   the working set.
-* **Byte accounting.** The NVMe and DRAM equalities hold. Evictions equal admissions
-  minus slots, with prefetch on. Time attributions sum to the step time in every
-  mode. A hand-computed all-hit DRAM-bound step time matches.
+* **Byte accounting with prefetch** (generation H04). Generation 3's prefetch test
+  checked only `nvme = nvme_demand + nvme_prefetch`, which is how `nvme` is defined.
+  The verifier showed that per-token prefetch bytes could be off by a factor of
+  3.2 × 10⁶ (`/ tok` → `* tok`, i.e. 1800² tokens), wasted bytes by 7×, and DRAM
+  bytes could leave out the prefetched slabs, with every test passing. Now:
+  * **Every counter, by hand.** A 4-token, 3-layer, 3-slot LRU run with
+    `Prefetch(1.0, 1)` over two experts per layer (so the wrong guess is
+    deterministic) and two cold slabs. All 13 per-group counters (hits, prefetch hits,
+    misses, bypasses, VRAM, skips, issued and wasted prefetches, each cold part) and
+    the 12 evictions are derived by hand in the test's docstring.
+  * **Bytes and times, by hand.** A 2-layer, 2-expert, 3-token `simulate` run with a
+    cold half: every `bytes_per_token` entry, every rate and the per-token time
+    (step times from §3.4), with the prefetch window too short (0 < f < 1, so the
+    needed cold slab is partly promoted to a demand read), with fast storage
+    (f = 1) and with a one-token warm-up.
+  * **Identities on realistic runs.** The identities of §3.4, from each run's own
+    counters, on 600-token olmoe runs with prefetch plus cold slabs, skips and
+    speculative windows, or a VRAM tier, and again with fast storage.
+  * The verifier's three hand-made mutants each fail 3–4 of these tests (scratch
+    run), and so do the two cold-slab late-prefetch mutants it found surviving in
+    `timing.py`.
+* **Rates.** `bypass_rate` (bypassed / demand misses) and `tokens_per_step` on a
+  hand-worked 6-token verification window with 5 slots, in which the window's 6th
+  expert is bypassed; a window with a single load; and an olmoe run where wide
+  verification windows bypass part of their misses.
+* **Other byte accounting.** Without prefetch, the NVMe and DRAM equalities hold.
+  Evictions equal admissions minus slots, with prefetch on. Time attributions sum to
+  the step time in every mode. A hand-computed all-hit DRAM-bound step time matches.
+* **Feasibility, exact** (generation H04; generation 3's test checked Kimi-K3 disk
+  sizes only by their order).
+  * Kimi-K2 on this-pc: every field against first-principles values (the FORMAT §5
+    slab, the MLA KV size, the presets' parameter counts) and against printed
+    literals, such as disk sizes of 424.80 / 551.63 / 1058.98 / 2041.95 GB.
+  * Kimi-K3: disk sizes at the latent width, and the drive and RAM reasons.
+  * GPU modes: the no-GPU reason on its own, RAM vs VRAM vs unified placement of the
+    backbone, and a VRAM tier only for `dense+experts` on a discrete GPU (3095 slabs
+    for olmoe on this-pc).
+  * Boundaries, in exact power-of-two arithmetic: RAM left equal to the engine
+    minimum fits; a drive exactly the file's size holds it; exactly enough VRAM
+    fits, with no tier. The Q4-backbone hint appears only above 4.25 bpw.
+  * The CLI: the `--json` payload equals `Feasibility.to_dict()`, every encoding flag
+    reaches it, and `--feasibility --gpu dense --hw laptop-16gb` prints NO.
+* **Presets.** For every preset, the simulator's resident parameters equal
+  `Shape.dense_params()`, its total equals `params_total()` (Kimi-K3:
+  2 752 693 600 256), and its resident bytes equal a footprint computed from
+  `dense_params()`. One step's backbone read equals that footprint minus the
+  embedding table. An explicit `expert_d` equal to `d_model` is counted as in the
+  presets.
+* **Engine parity.** The minimum slot count clamps `io_threads` at 64, with a warning.
+  `lfu-pinned` seeds its heat as `store.c` does, for usage files, the warm-up profile
+  and the oracle profile (exact hit lists), and the oracle and array profiles pin
+  the same slabs as `run_cache` given the counts.
 * **Timing formulas.** `T_moe` matches §3.4 exactly in each of its three regimes,
-  as do the GPU step with its PCIe hand-off and a compute-bound step at half
-  `compute_eff`.
+  as do the GPU step with its PCIe hand-off, a `dense+experts` step in which the GPU's
+  expert tier decides `T_moe`, and a compute-bound step at half `compute_eff`. With
+  shared experts, the `dram` part is exactly every byte streamed at DRAM bandwidth.
 * **Prefetch.**
   * Accounting: no wrong-guess bytes at recall 1 with no extras, and no late
     prefetches with unlimited storage.
@@ -523,27 +629,43 @@ machine load (§9). It checks:
   at low acceptance on independent tokens. The geometric acceptance statistics are
   checked.
 * **Input validation.**
-  * 31 bad `simulate` inputs raise `ValueError`.
+  * 31 bad `simulate` inputs raise `ValueError`, and so do 16 non-finite, fractional
+    or non-numeric `Spec` / `Prefetch` / `Lossy` values. `Lossy(topk=6.0)` works
+    (generation 3 failed with a slicing `TypeError`).
   * 24 bad CLI flag combinations exit with code 2 and an error line, without a
     traceback. These include negative `--spec-k` and `--prefetch-extra`, which
-    generation 2 silently treated as "off".
+    generation 2 silently treated as "off". Empty sweep lists exit 2 as well
+    (generation 3: `IndexError`).
+  * Heat profiles with a NaN, infinite or negative entry are rejected, from a file or
+    an array, and only when a policy or knob reads the profile.
+  * Every new CLI override reaches the result. `Hardware.to_dict()` round-trips
+    through `get_hardware` and `simulate`; an inconsistent `io_gbs` is an error.
   * A warm-up that leaves no measured step is an error. The "noisy" warning counts
     the tokens actually measured.
   * Integral floats (`Spec(4.0)`, `io_threads=8.0`) become ints.
+  * Boundary values are accepted: LFU decay 1, `pin_fraction` 0.9, lossy top-k 1 and
+    skip rank 1, a one-token warm-up (which, unlike warm-up 0, does not fall back to
+    a whole-trace profile). LFU decay 0 is rejected also when no LFU policy runs. The
+    default warm-up is 10% of the trace.
   * `calibrate` names the bad point.
   * `Trace` rejects an `n_layers` that it could not save or load back.
   * A cache larger than the RAM left is infeasible and flagged in tables.
 * **Traces.**
   * Files round-trip.
+  * Ranks above 32767 survive the schedule (`minrank` is int32; it was int16, so a
+    valid top-40000 trace wrapped).
+  * Refilled rows keep their reused experts: P(e in token t | e in token t−1) ≥
+    reuse for every expert under extreme skew, including a rare expert 0 (dropping
+    it from refill rows gave 0.35 at reuse 0.5).
   * Malformed files, duplicate, negative or non-integer ids, and oversized
     geometries (each bound separately) are rejected.
   * The sampler matches Gumbel-top-k marginals, and entropy, reuse, mass and union
     are checked.
 * **Labels.** Encodings below the converter defaults are LOSSY, and `levers()` labels
   follow the actual baseline.
-* **Other.** Determinism for a given seed, feasibility arithmetic, FORMAT §5 slab
-  sizes, calibration recovery, usage-file round trip, hardware overrides and CLI
-  smoke tests.
+* **Other.** Determinism for a given seed, FORMAT §5 slab sizes, calibration
+  recovery, usage-file round trip, hardware overrides, the documented defaults of
+  `engine_min_slots`, `Prefetch` and `run_cache`, and CLI smoke tests.
 
 **Mutation testing** (`governance/tools/mutate.py`). Generation 1 sampled 30 mutants
 per whole file with seed 1: `cache.py` 86.7%, `timing.py` 86.7%, `trace.py` 93.3%,
@@ -615,6 +737,58 @@ The survivors were inspected. None changes a hit count or a timing:
   which is sampling without replacement proportional to popularity either way.
 * **Placeholder** (1 mutant). `Result(tokens=0)` before `_aggregate` overwrites it.
 
+**Generation H04** (hardening, 2026-10-05). The verifier measured 70.8% on 24 sampled
+`feasibility.py` mutants and found the prefetch byte-accounting mutants above alive in
+`core.py` and `timing.py`. Same test command, seed 11, and every candidate in the
+lines given unless a sample size is shown:
+
+| file: region (line numbers of this version) | mutants | score | survivors |
+|---|---|---|---|
+| `feasibility.py`: whole file | 61 | 95.1% | 3 |
+| `core.py`: changed lines and `_aggregate` (13-14, 39-41, 60-70, 183-220, 282-289, 299-301, 306, 323, 343, 362, 371, 390-422) | 127 | 96.1% (85.8% first run) | 5 |
+| `cache.py`: changed lines (50-57, 646-663, 676, 696, 706-708, 728) | 47 | 91.5% (80.9% first run) | 4 |
+| `timing.py`: changed lines (65-68, 97-100, 114-115, 126-128) | 29 | 86.2% | 4 |
+| `timing.py`: the byte-accounting loop of `evaluate` (213-253), 24 sampled | 24 | 95.8% (91.7% first run) | 1 |
+| `hardware.py`: `get_hardware` (120-145) | 11 | 100% | 0 |
+| `cli.py`: changed lines (18-22, 42-56, 102-107, 153-167) | 22 | 100% (95.5% first run) | 0 |
+| `report.py`: changed lines (97-102) | 1 | 100% | 0 |
+
+The first runs found real gaps, now tested:
+
+* `core.py` (13 mutants): boundary values that were accepted but never tried (lossy
+  top-k and skip rank 1, a one-token warm-up, LFU decay 1, `pin_fraction` 0.9, the
+  seed scale at one token); LFU decay 0 under a non-LFU policy; simulate's own error
+  for zero I/O threads; the default 10% warm-up, which no test asserted; and
+  `bypass_rate`, `tokens_per_step` and the rates of a window with a single load;
+* `cache.py` (5): the public defaults of `engine_min_slots`, `Prefetch` and
+  `run_cache`;
+* `timing.py` (1): the `dram` attribution of shared experts, since every attribution
+  test used olmoe, which has none;
+* `cli.py` (1): the header line of `--feasibility`.
+
+The remaining survivors were inspected; none can change a result:
+
+* **Defaults that are always overwritten** (11): the `Feasibility` fields
+  `vram_expert_slots`, `params_total` and `params_resident`, set by `check()`; the
+  four new `ModelCosts` fields, set by `model_costs()`; and `make_policy`'s
+  `io_threads`, `seed` and `measure_step` (two mutants for the first), which
+  `run_cache` always passes.
+* **Guards on values that are always positive** (4, `core.py`): `max(loads, 1)`,
+  `max(tokens, 1)` and `max(steps, 1)` lowered to 0, and `tsum > 0` → `>= 0`. Every
+  run measures at least one step, with at least one token, one load and a positive
+  time.
+* **The seed scale of a run without a profile** (1, `core.py`): only `lfu-pinned`
+  reads it, and `lfu-pinned` always has a profile.
+* **`pf_b > 0` → `>= 0`** (1, `timing.py`): with no prefetched bytes the formula
+  gives f = 1 anyway.
+
+A second `core.py` run reported 99.2% and is not used. The temporary directory that
+this machine's tool processes inherit (under `AppData\Local\Packages\Claude_…`)
+disappeared during that run. From then on, every mutant "failed" within 3–5 s at
+pytest's `tmp_path` setup, so equivalent mutants counted as killed. All runs in the
+table set `TEMP` and `TMP` to a directory under `%LOCALAPPDATA%\hearth`. Run them the
+same way if the default temporary directory is unreliable.
+
 ## 6. Limitations
 
 The simulator is deliberately simple.
@@ -658,7 +832,8 @@ geometric, and rejected positions use the true tokens' routing.
 * Attention is approximated as MLA in every layer, as in the preset. 69 of its 93
   layers are linear attention (KDA), so the KV term is overstated, and is small at
   context 1024.
-* The latent projections are an addition the simulator makes itself.
+* The latent projections are stored at the backbone's bits/weight. FORMAT.md does
+  not define their tensors yet; the parameter count follows `Shape.dense_params()`.
 
 **Other.**
 
@@ -667,7 +842,7 @@ geometric, and rejected positions use the true tokens' routing.
   these, so Belady is a bound, not a policy.
 * Feasibility uses a fixed OS reserve and no swap.
 
-## 7. Example outputs (real runs of this code, 2026-10-04)
+## 7. Example outputs (real runs of this code, 2026-10-05)
 
 ```
 $ python -m hearth sim --model kimi-k2 --hw this-pc --cache-gb 40 --policy lfu --zipf 1.1 --tokens 2000 --spec-k 4 --spec-alpha 0.6
@@ -700,6 +875,7 @@ belady           40.0  76.6%      0.0%  23.4%         2.62        22.74   1.66  
 $ python -m hearth sim --model kimi-k2 --hw this-pc --feasibility
 kimi-k2 on this-pc:
 fits                       yes
+parameters                 1026 B, of which 11.72 B resident (backbone incl. embeddings)
 backbone                   11.7 GiB in ram; KV 0.54 GiB
 RAM left for expert cache  42.8 GiB (engine minimum 0.57 GiB)
 minimum RAM                19.3 GiB
@@ -1036,7 +1212,7 @@ same day.
 | Kimi-K2, `Prefetch(0.5, 64)`, 4 GiB: LRU / sampled LFU (8) / exact LFU | 6.9 s / 14.9 s / 6.1 s |
 | Kimi-K3, one simulation including trace generation | 4.6 s |
 | `--compare-policies` (6 policies, CLI, wall) | 4.5 s |
-| `tests/py/test_sim.py` (112 tests) | 21 s |
+| `tests/py/test_sim.py` (152 tests, generation H04, 2026-10-05) | 35 s; 56–132 s while the machine was at 100% CPU (mutation runs) |
 | all of §8 regenerated in generation 2 (about 160 simulations, 6 processes) | 155 s |
 
 **Protected prefetches.** Engine-style protection keeps wrong guesses resident and

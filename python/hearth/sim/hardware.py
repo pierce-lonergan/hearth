@@ -118,17 +118,25 @@ def parse_nvme(spec: str) -> tuple[int, float]:
 
 
 def get_hardware(name_or_hw="this-pc", **overrides) -> Hardware:
-    """A built-in profile (or a Hardware / dict) with field overrides applied (None values ignored)."""
+    """A built-in profile (or a Hardware / dict, e.g. Hardware.to_dict() or Result.settings["hw"]) with field
+    overrides applied (None values ignored)."""
+    valid = {f.name for f in fields(Hardware)}
     if isinstance(name_or_hw, Hardware):
         hw = name_or_hw
     elif isinstance(name_or_hw, dict):
-        hw = Hardware(**name_or_hw)
+        d = dict(name_or_hw)
+        io = d.pop("io_gbs", None)                 # derived (to_dict adds it); must agree with the fields
+        bad = set(d) - valid
+        if bad:
+            raise KeyError(f"unknown hardware field(s): {', '.join(sorted(bad))}")
+        hw = Hardware(**d)
+        if io is not None and not math.isclose(io, hw.io_gbs, rel_tol=1e-12):
+            raise ValueError(f"io_gbs {io} does not match nvme_count x nvme_gbs (capped by io_cap_gbs) = {hw.io_gbs}")
     else:
         key = str(name_or_hw).lower()
         if key not in HARDWARE:
             raise KeyError(f"unknown hardware {name_or_hw!r}; known: {', '.join(HARDWARE)}")
         hw = HARDWARE[key]
-    valid = {f.name for f in fields(Hardware)}
     ov = {k: v for k, v in overrides.items() if v is not None}
     bad = set(ov) - valid
     if bad:

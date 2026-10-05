@@ -1,0 +1,153 @@
+{
+ "generation_id": "gen-001-sim-hardening",
+ "parent_generation": null,
+ "timestamp": "2026-10-05T05:28:29Z",
+ "lifecycle_status": "TASK_COMPLETE",
+ "trigger": "MILESTONE_VERIFIED",
+ "task_id": "H04-sim",
+ "workspace": {
+  "branch": "main",
+  "base_commit": "4a6cb80",
+  "head_commit": "4a6cb80",
+  "uncommitted_diff_stat": "uncommitted (never committed, per the round's rules): python/hearth/sim/{cache,cli,core,feasibility,hardware,report,timing}.py, tests/py/test_sim.py (112 -> 152 tests), docs/SIMULATOR.md (sec. 1, 2.1, 3.2, 3.4, 3.5, 5, 6, 7, 9); 9 files changed, 926 insertions(+), 122 deletions(-); new: governance/handovers/H04-sim-gen-001.json; all edited files LF. Lineage: continues T04-sim gen-003 (governance/handovers/T04-sim-gen-003.json). python/hearth/sim/trace.py had CRLF line endings in the working tree (left by an earlier generation; git saw no change); normalised to LF, content unchanged (git diff is empty; git status may list it until the index is refreshed)."
+ },
+ "constraints_touched": [
+  "INV-HONEST",
+  "INV-LOSSLESS-DEFAULT",
+  "INV-DEP",
+  "INV-DATA",
+  "INV-VERIFY"
+ ],
+ "epistemic_ledger": {
+  "hypotheses_validated": [
+   {
+    "claim": "Council T04 finding (major) 1: byte accounting with prefetch on is now pinned by exact tests. (1) test_prefetch_counters_hand_traced: a 4-token, 3-layer, 3-slot LRU run, Prefetch(1.0, 1) over E=2 (deterministic wrong guess), 2 cold keys; all 13 per-group counters and the 12 evictions are derived by hand in the docstring. (2) test_prefetch_bytes_per_token_hand_computed: a 2-layer x 2-expert x 3-token simulate() run with a cold half; every bytes_per_token entry, every rate, ms/token and the nvme time part from the sec. 3.4 formulas, with 0 < f < 1 (needed cold prefetch partly promoted to demand), with f = 1 and with a 1-token warm-up. (3) test_prefetch_byte_identities_on_realistic_runs: the council's identities (a)-(c) from each run's own counters on 600-token olmoe runs with prefetch + cold slabs / skips + speculative windows / a VRAM tier, plus fast-storage runs for (b). No production bug was found: the hand-computed values agreed with the code (one mismatch was an arithmetic slip in my test, corrected: misses S + Sc plus prefetch hit Sc = S + 2 Sc).",
+    "evidence": "Ran: all pass. Scratch copies of the current code with the council's three hand mutants (core.py nv_p '/ tok' -> '* tok'; nvme_prefetch_wasted / 7; timing.py dram_b minus frac*ph_h*sh) fail 4, 4 and 3 of these tests; the timing.py cold-late mutants ('(1 - frac)' -> '(0 - frac)' for ph_c, '+' -> '-' in Mb) fail 3 each; t_gpu 'vram > 0' -> '< 0' fails test_gpu_expert_tier_decides_the_step_exactly (ran, scratch/hand_mutants.py). mutate.py on core.py incl. _aggregate: 96.1% (122/127).",
+    "verdict": "CONFIRMED"
+   },
+   {
+    "claim": "Council T04 finding (major) 2: feasibility.py tests are exact; mutation score 95.1% (58/61) over ALL candidates (council: 70.8% on 24 sampled). feasibility.check() now takes the expert geometry from ModelCosts (new fields expert_d, expert_ffn), so the disk-per-format output no longer depends on an optional shape argument (removed; only internal callers).",
+    "evidence": "Ran: test_feasibility_exact_kimi_k2_on_this_pc (every field vs first principles + literals, disk 424.80/551.63/1058.98/2041.95 GB), test_feasibility_exact_kimi_k3_latent_experts (1138.76/1479.10/2840.47/5478.13 GB at expert_d=3584), test_feasibility_gpu_modes_exact (no-GPU reason alone, vram/unified placement, VRAM tier 3095 slabs only for dense+experts on a discrete GPU, VRAM boundary), test_feasibility_ram_boundary_and_hint (power-of-two costs: RAM == engine minimum fits, file == drive fits, hint only above 4.25 bpw, 64-thread clamp), test_cli_feasibility_output_and_json (--json == to_dict, encoding flags, --gpu dense --hw laptop-16gb prints NO). mutate.py all 61 candidates seed 11: 95.1% (58/61); survivors M0004/M0005/M0006: the Feasibility field defaults vram_expert_slots, params_total, params_resident (always set by check(); equivalent).",
+    "verdict": "CONFIRMED"
+   },
+   {
+    "claim": "Latent-MoE reconciliation after commit 8ea46c0: the simulator counts the 2*d_model*expert_d projections once, by the rule of Shape.dense_params() (any nonzero expert_d). New ModelCosts.resident_params / total_params equal Shape.dense_params() / params_total() for every preset; Kimi-K3 total 2 752 693 600 256 (~2.75e12), resident 29 952 770 048, latent 4.73e9.",
+    "evidence": "test_backbone_accounting_matches_presets_without_double_counting (ran): equality for all presets, resident bytes == a footprint computed from dense_params(), per-step backbone read == footprint minus embeddings, explicit expert_d == d_model counted as in the presets. sec. 8 spot checks unchanged (kimi-k2 1.203 tok/s 62.3% 4.23 GB/tok; kimi-k3 0.361 tok/s 39.2% 15.70 GB/tok, 1461 slots; ran).",
+    "verdict": "CONFIRMED"
+   },
+   {
+    "claim": "Engine parity and minor findings fixed, each with a test that fails on the base code (25 of the 152 tests fail on 4a6cb80's sim, ran in a scratch copy): io_threads clamped to 64 in engine_min_slots (warning in simulate); lfu-pinned seeds LFU heat with count / tokens / (1 - decay) as store.c does (tokens_observed for .usage, W for the warm-up profile, T for oracle, raw for arrays and decay 1), pins still ranked by raw counts; heat profiles with NaN/inf/negative entries rejected (file or array); empty --sweep-cache/--sweep-zipf exit 2; new CLI flags --cpu-cores --gpu-sync-us --unified/--no-unified --embed-bits --max-seq (feasibility path too); get_hardware accepts Hardware.to_dict() (io_gbs checked, unknown keys KeyError); Spec / Prefetch / Lossy reject inf, NaN, fractional and non-numeric values with ValueError and normalise integral floats (Lossy(topk=6.0) works); Schedule.minrank int32; settings['profile'] records a pathlib.Path profile as its path (was 'array').",
+    "evidence": "Tests (ran, pass): test_io_threads_clamped_to_64_like_store_c, test_lfu_pinned_heat_is_seeded_like_the_engine (exact hit lists vs run_cache with the engine-scaled seed; raw seeding gives 0.20 vs 0.465/0.379 hit rate at 128 slots), test_profiles_must_be_finite_and_non_negative, test_cli_empty_sweep_lists_exit_2, test_cli_overrides_every_hardware_and_encoding_field, test_hardware_dicts_round_trip, test_feature_specs_reject_non_finite_and_fractional_values (16 cases), test_feature_specs_normalise_integral_floats, test_ranks_beyond_int16_are_kept.",
+    "verdict": "CONFIRMED"
+   },
+   {
+    "claim": "Council test gaps closed: dense+experts step decided by the GPU tier (test_gpu_expert_tier_decides_the_step_exactly), cold + prefetch late path (hand-computed test), oracle and array profile success paths (test_oracle_and_array_profiles_pin_the_hottest_slabs), synthetic refill keeps reused experts incl. expert 0 (test_synthetic_refill_rows_keep_reused_experts: P(stay) 0.558 vs 0.349 with the council's '>= 0' -> '> 0' mutant at reuse 0.5). The first core.py mutation run (85.8%, 18 survivors) showed 13 real boundary gaps, now tested: Lossy topk/skip_miss_rank = 1, warm-up 1, lfu_seed_scale(1, d), lfu_decay 1.0 and 0.0 under lru, pin_fraction 0.9, the default 10% warm-up (never asserted before), io_threads=0 message, bypass_rate and tokens_per_step (test_simulate_boundaries_and_default_warmup, test_rates_with_bypasses_and_one_load_windows). Later first runs: cache.py 80.9% -> test_public_defaults (engine_min_slots, Prefetch, run_cache defaults); timing.py loop 91.7% -> exact dram attribution with shared experts (every attribution test used olmoe, which has none); cli.py 95.5% -> --feasibility header.",
+    "evidence": "mutate.py core.py seed 11, same 127 candidates: 85.8% (first run) -> 96.1% (122/127) after the tests; survivors M0278 (seed-scale token count of a run without a profile; only lfu-pinned reads it and it always has a profile), M0319/M0321/M0349 (max(loads|tokens|steps, 1) lowered to 0; always >= 1), M0331 (tsum > 0 -> >= 0; always > 0) - all equivalent. Other changed code: cache.py 91.5% (43/47), timing.py changed lines 86.2% (25/29), timing.py byte-accounting loop (213-253, 24 sampled) 95.8% (23/24), hardware.py 100.0% (11/11), cli.py 100.0% (22/22), report.py 100.0% (1/1).",
+    "verdict": "CONFIRMED"
+   }
+  ],
+  "hypotheses_falsified": [
+   {
+    "claim": "After commit 8ea46c0 the simulator double counts the latent-MoE projections.",
+    "evidence": "model_costs never called Shape.dense_params(); it builds the backbone from components, so preset numbers did not change (sec. 8 spot checks identical). What was wrong: the cost note and SIMULATOR.md said dense_params() omits them, and the rule differed for an explicit expert_d == d_model (simulator 0, presets 2*D^2). Both fixed; the new test guards it.",
+    "verdict": "REJECTED"
+   },
+   {
+    "claim": "The prefetch byte accounting hides a production bug (orders of magnitude off).",
+    "evidence": "Every hand-computed counter, byte, rate and step time matched the code; the defect was test coverage, as the council's own scratch check suggested.",
+    "verdict": "REJECTED"
+   },
+   {
+    "claim": "A mutation re-run of core.py at 00:33-00:40 gave 99.2%.",
+    "evidence": "Invalid and not reported: the temp directory the Bash tool's processes inherit (...\\Packages\\Claude_*\\LocalCache\\Local\\Temp) vanished mid-run; later mutants failed at pytest's tmp_path setup in 3-5 s (the following queue's baselines failed the same way). All reported runs set TEMP/TMP to %LOCALAPPDATA%\\hearth\\tmp-h04.",
+    "verdict": "REJECTED"
+   }
+  ],
+  "open_questions": [
+   "Shape.dense_params() counts latent projections whenever expert_d is nonzero, also when expert_d == d_model (no projection needed). The simulator mirrors the presets; see contract_issues.",
+   "FORMAT.md defines no tensors for latent-MoE projections; the simulator stores them at --dense-bits.",
+   "The default warm-up profile both seeds lfu-pinned heat and is replayed as live traffic (as before); the engine analogue is a usage file recorded in an earlier session. Kept as is.",
+   "Carried over from T04: real routing skew of Kimi/DeepSeek unknown (sec. 8 SIMULATED on synthetic traces); recall of the engine's SHARED predictor unknown; store.c's hot-victim prefetch refusal and LFU tie-breaks not modelled; LFU decay default (0.995 vs ~0.9) needs real traces."
+  ]
+ },
+ "procedures": [
+  "python -m pytest tests/py/test_sim.py -q -p no:cacheprovider",
+  "python -m ruff check python/hearth/sim tests/py/test_sim.py",
+  "set TEMP/TMP to an existing directory first (e.g. %LOCALAPPDATA%\\hearth\\tmp-h04): the Claude app's virtualised Temp disappeared mid-run once",
+  "python governance/tools/mutate.py --file python/hearth/sim/feasibility.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --max-mutants 200 --jobs 4 --seed 11",
+  "python governance/tools/mutate.py --file python/hearth/sim/core.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --lines 13-14,39-41,60-70,183-220,282-289,299-301,306-306,323-323,343-343,362-362,371-371,390-422 --max-mutants 200 --jobs 4 --seed 11",
+  "python governance/tools/mutate.py --file python/hearth/sim/cache.py --test \"{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py\" --lines 50-57,646-663,676-676,696-696,706-708,728-728 --max-mutants 200 --jobs 4 --seed 11   # likewise timing.py 65-68,97-100,114-115,126-128 and 213-253 (--max-mutants 24), hardware.py 120-145, cli.py 18-22,42-56,102-107,153-167, report.py 97-102",
+  "PYTHONPATH=python python -m hearth.sim --model kimi-k2 --hw this-pc --feasibility   # sec. 7 example",
+  "PYTHONPATH=python python -m hearth.sim --model kimi-k2 --hw this-pc --cache-gb 40 --compare-policies"
+ ],
+ "measurements": [
+  {
+   "metric": "mutation score, python/hearth/sim/feasibility.py (all 61 candidates)",
+   "value": 95.1,
+   "unit": "%",
+   "conditions": "mutate.py seed 11, test '{python} -m pytest -q -x -p no:cacheprovider tests/py/test_sim.py', TEMP=%LOCALAPPDATA%\\hearth\\tmp-h04; 58 killed, 3 equivalent survivors (dataclass defaults); same result in an earlier run; verifier measured 70.8% on 24 sampled gen-3 mutants",
+   "kind": "measured"
+  },
+  {
+   "metric": "mutation score, python/hearth/sim/core.py changed lines + _aggregate (127 candidates)",
+   "value": 96.1,
+   "unit": "%",
+   "conditions": "seed 11, lines 13-14,39-41,60-70,183-220,282-289,299-301,306,323,343,362,371,390-422; first run 85.8% (18 survivors, 13 real gaps then tested); 5 equivalent survivors; a 99.2% run is void (temp directory vanished mid-run)",
+   "kind": "measured"
+  },
+  {
+   "metric": "mutation score, python/hearth/sim/cache.py changed lines (47 candidates)",
+   "value": 91.5,
+   "unit": "%",
+   "conditions": "seed 11, lines 50-57,646-663,676,696,706-708,728; first run 80.9%; 4 equivalent survivors (make_policy defaults run_cache always passes)",
+   "kind": "measured"
+  },
+  {
+   "metric": "mutation score, python/hearth/sim/timing.py changed lines (29 candidates)",
+   "value": 86.2,
+   "unit": "%",
+   "conditions": "seed 11, lines 65-68,97-100,114-115,126-128; 4 equivalent survivors (ModelCosts field defaults model_costs always sets)",
+   "kind": "measured"
+  },
+  {
+   "metric": "mutation score, python/hearth/sim/timing.py evaluate byte-accounting loop (24 sampled of 95)",
+   "value": 95.8,
+   "unit": "%",
+   "conditions": "seed 11, lines 213-253; first run 91.7%; 1 equivalent survivor (pf_b > 0 -> >= 0)",
+   "kind": "measured"
+  },
+  {
+   "metric": "mutation score, python/hearth/sim/hardware.py get_hardware (11 candidates)",
+   "value": 100.0,
+   "unit": "%",
+   "conditions": "seed 11, lines 120-145",
+   "kind": "measured"
+  },
+  {
+   "metric": "mutation score, python/hearth/sim/cli.py changed lines (22 candidates)",
+   "value": 100.0,
+   "unit": "%",
+   "conditions": "seed 11, lines 18-22,42-56,102-107,153-167; first run 95.5%",
+   "kind": "measured"
+  },
+  {
+   "metric": "tests/py/test_sim.py",
+   "value": 152,
+   "unit": "tests passed",
+   "conditions": "34.6 s wall on this-pc at ~80% CPU load from other engineers' jobs (noisy; 56-132 s seen at 100% load); 25 of the 152 fail against the base commit's sim package (scratch copy)",
+   "kind": "measured"
+  },
+  {
+   "metric": "lfu-pinned measured-window hit rate, usage file over 6000 tokens, 128 slots: engine-style seed vs raw counts",
+   "value": 0.465,
+   "unit": "hit rate",
+   "conditions": "olmoe-1b-7b, synthetic 600 tokens zipf 1.2 reuse 0.2 seed 3, profile from a 6000-token seed-9 trace, pin_fraction 0; raw seeding 0.20; pin_fraction 0.5: 0.379 vs 0.200",
+   "kind": "simulated"
+  }
+ ],
+ "active_blockers": [],
+ "unfulfilled_mandates": [
+  "Calibration against engine measurements still cannot be done (no full engine run of a MoE model yet); calibrate()/retime() and the procedure in docs/SIMULATOR.md sec. 4 are ready for T09.",
+  "No real routing traces exist yet; every analysis number in docs/SIMULATOR.md sec. 8 is SIMULATED on synthetic traces."
+ ]
+}
