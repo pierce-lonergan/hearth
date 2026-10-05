@@ -80,12 +80,21 @@ Because each expert's output lands in its own buffer and the final sum follows
 rank order, completion order, cache state and thread count cannot change the
 result (INV-DET-1).
 
-## Why LFU beats LRU here
+## Eviction policy: what the evidence says
 
-Layers are visited cyclically: token t touches layer 0..L-1, then token t+1 does
-it again. If the cache holds fewer slabs than one token's working set
-(`L_moe·k`), global LRU always evicts exactly the slab that will be needed
-soonest — hit rate collapses to ~0 even though activation frequencies are
-highly skewed. A frequency (heat) policy keeps the hot experts of every layer
-resident regardless of cycle length. `hearth.sim` quantifies this on real
-routing traces.
+The original design argued that a frequency policy must beat LRU because layers are
+visited cyclically: if the cache holds fewer slabs than one token's working set
+(`L_moe·k`), global LRU evicts exactly the slab needed soonest. That pathology is real
+(see `tests/py/test_sim.py`) but on **real routing** (Qwen3-30B-A3B, 1,280 tokens,
+docs/results/qwen3-routing-and-cache-policy.md) it does not bite once the cache exceeds
+one token's working set, and temporal locality is high (≈45% of a token's experts are
+reused by the next token). Measured in simulation on the real trace:
+
+* LRU beat the original LFU default (decay 0.995) by 8–13 points of hit rate;
+* LFU with fast decay (0.8–0.9 per token) matches or slightly beats LRU;
+* static pinning from a heat profile goes stale when the task changes;
+* one-layer-ahead prefetch arrives late ~70% of the time on NVMe-bound runs, so
+  multi-layer lookahead is the next lever; Belady still leaves 15–20 points of
+  head-room at small caches.
+
+The engine default is chosen from the real-engine ablation in docs/BENCHMARKS.md.
