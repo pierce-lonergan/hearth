@@ -348,6 +348,19 @@
         "a PR cannot weaken its own golden check"
       ],
       "status": "done"
+    },
+    {
+      "id": "R07-landscape",
+      "title": "Landscape review: top GitHub MoE / local-inference projects (topics/mixture-of-experts etc., e.g. FareedKhan-dev/kimi-k3-in-c, Colibri, KTransformers); identify reusable code (license-compatible only) and techniques; plan the breakout roadmap",
+      "deps": [],
+      "owns": [
+        "docs/LANDSCAPE.md"
+      ],
+      "accept": [
+        "every surveyed project: what it does better, measured claims, license, what we reuse or adapt",
+        "prioritised roadmap update"
+      ],
+      "status": "todo"
     }
   ]
 }
